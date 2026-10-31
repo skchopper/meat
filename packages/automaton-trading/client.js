@@ -255,6 +255,26 @@ window.__ModuleLoader__.load({
       shortPos: 'SHORT',
       callPos: 'CALL',
       putPos: 'PUT',
+      lastCycle: 'Last cycle',
+      lastCycleEmpty: 'no cycle data yet',
+      marketOpen: 'market open',
+      marketClosed: 'market closed',
+      marketUnknown: 'market state unknown',
+      tradingSkipped: 'trading skipped',
+      executions: 'executions',
+      orders: 'orders',
+      denied: 'denied',
+      topSkipReasons: 'top skips',
+      botReviews: 'bot reviews',
+      reviewed: 'reviewed',
+      deferred: 'deferred',
+      paused: 'paused',
+      brokerRestricted: 'Broker account restricted',
+      brokerRestrictedUnavailable: 'unavailable (paper equity below margin minimum)',
+      brokerRestrictedRemain: 'long stock and long options remain available',
+      accountFacts: 'account',
+      onLabel: 'on',
+      offLabel: 'off',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -574,6 +594,26 @@ window.__ModuleLoader__.load({
       shortPos: '空头',
       callPos: '看涨',
       putPos: '看跌',
+      lastCycle: '上一周期',
+      lastCycleEmpty: '暂无周期数据',
+      marketOpen: '市场开盘',
+      marketClosed: '市场收盘',
+      marketUnknown: '市场状态未知',
+      tradingSkipped: '跳过交易',
+      executions: '执行',
+      orders: '订单',
+      denied: '拒绝',
+      topSkipReasons: '主要跳过原因',
+      botReviews: '机器人复盘',
+      reviewed: '已复盘',
+      deferred: '延后',
+      paused: '已暂停',
+      brokerRestricted: '券商账户受限',
+      brokerRestrictedUnavailable: '不可用（纸面权益低于保证金最低要求）',
+      brokerRestrictedRemain: '多头股票与多头期权仍可用',
+      accountFacts: '账户',
+      onLabel: '开启',
+      offLabel: '关闭',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -1719,7 +1759,7 @@ window.__ModuleLoader__.load({
           : looksLikeAgent
             ? {}
             : candidate;
-      const permissions = instrumentPermissionsMapping(permissionsSource);
+      const permissions = effectiveInstrumentBadges(permissionsSource);
       const playbook = playbookMapping(candidate.playbook);
       const playbookHint = playbook.available
         ? structureList(playbook.bullish).map((structure) => `↑ ${structure.label}`).join(', ')
@@ -1728,8 +1768,9 @@ window.__ModuleLoader__.load({
         available: permissions.available,
         badges: permissions.badges,
         tooltip: permissions.tooltip,
-        allowedStructures: permissions.allowedStructures,
-        permissions,
+        disabled: permissions.disabled,
+        allowedStructures: permissions.permissions?.allowedStructures ?? [],
+        permissions: permissions.permissions,
         playbookHint,
       };
     }
@@ -1919,12 +1960,14 @@ window.__ModuleLoader__.load({
           optionDataFeed: null,
           account: accountFields,
           hasAccount: false,
+          effective: { available: false, longStock: null, shortStock: null, margin: null, creditOptions: null, structures: [] },
           playbookCount: 0,
           playbooks: {},
         };
       }
       const booleanOrNull = (value) => (value === true ? true : value === false ? false : null);
       const playbooks = plainObject(raw.playbooks);
+      const effectiveRaw = plainObject(raw.effective);
       return {
         available: true,
         enabled: booleanOrNull(raw.enabled),
@@ -1945,8 +1988,173 @@ window.__ModuleLoader__.load({
         optionDataFeed: typeof raw.optionDataFeed === 'string' ? raw.optionDataFeed : null,
         account: accountFields,
         hasAccount,
+        effective: {
+          available: Object.keys(effectiveRaw).length > 0,
+          longStock: booleanOrNull(effectiveRaw.longStock),
+          shortStock: booleanOrNull(effectiveRaw.shortStock),
+          margin: booleanOrNull(effectiveRaw.margin),
+          creditOptions: booleanOrNull(effectiveRaw.creditOptions),
+          structures: structureList(effectiveRaw.structures),
+        },
         playbookCount: Object.keys(playbooks).length,
         playbooks,
+      };
+    }
+
+    /**
+     * "Last cycle" diagnostics projection (`status.engine.lastCycle`): market state,
+     * executions/orders/errors and the top-3 skip reasons that explain why bots did not trade.
+     * @param {object|null} lastCycle engine.lastCycle
+     */
+    function lastCycleMapping(lastCycle) {
+      const raw = plainObject(lastCycle);
+      const empty = {
+        available: false,
+        at: null,
+        marketOpen: null,
+        tradingSkipped: null,
+        executions: null,
+        orders: null,
+        denied: null,
+        errors: null,
+        topSkipReasons: [],
+        topSkipText: '',
+        botReviews: null,
+        research: null,
+        hasActivity: false,
+        marketStateKey: 'lastCycleEmpty',
+      };
+      if (Object.keys(raw).length === 0) return empty;
+      const reasons = [];
+      const reasonsRaw = raw.topSkipReasons;
+      if (Array.isArray(reasonsRaw)) {
+        for (const item of reasonsRaw) {
+          const reason = typeof item === 'string'
+            ? item
+            : typeof item?.reason === 'string'
+              ? item.reason
+              : typeof item?.key === 'string'
+                ? item.key
+                : null;
+          if (!reason) continue;
+          reasons.push({ reason, count: toNumber(item?.count) ?? 0 });
+        }
+      } else {
+        for (const [reason, count] of Object.entries(plainObject(reasonsRaw))) {
+          reasons.push({ reason, count: toNumber(count) ?? 0 });
+        }
+      }
+      const topSkipReasons = reasons
+        .filter((entry) => entry.count > 0)
+        .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason))
+        .slice(0, 3);
+      const booleanOrNull = (value) => (value === true ? true : value === false ? false : null);
+      const botRaw = plainObject(raw.botReviews);
+      const botReviews = Object.keys(botRaw).length === 0
+        ? null
+        : {
+          available: true,
+          enabled: booleanOrNull(botRaw.enabled),
+          configured: booleanOrNull(botRaw.configured),
+          due: toNumber(botRaw.due),
+          reviewed: toNumber(botRaw.reviewed),
+          deferred: toNumber(botRaw.deferred),
+          skipped: toNumber(botRaw.skipped),
+          errors: toNumber(botRaw.errors),
+          budgetUsd: toNumber(botRaw.budgetUsd),
+          note: typeof botRaw.note === 'string' ? botRaw.note : null,
+          paused: botRaw.paused === true,
+        };
+      const executions = toNumber(raw.executions);
+      const orders = toNumber(raw.orders);
+      return {
+        available: true,
+        at: raw.at ?? null,
+        marketOpen: booleanOrNull(raw.marketOpen),
+        tradingSkipped: booleanOrNull(raw.tradingSkipped),
+        executions,
+        orders,
+        denied: toNumber(raw.denied),
+        errors: toNumber(raw.errors),
+        topSkipReasons,
+        topSkipText: topSkipReasons.map((entry) => `${entry.reason} ${entry.count}`).join(' · '),
+        botReviews,
+        research: plainObject(raw.research).available === undefined ? (raw.research ?? null) : raw.research,
+        hasActivity: (executions ?? 0) > 0 || (orders ?? 0) > 0,
+        marketStateKey: raw.marketOpen === true ? 'marketOpen' : raw.marketOpen === false ? 'marketClosed' : 'marketUnknown',
+      };
+    }
+
+    /**
+     * Broker capability warning from `engine.instruments.effective`: the paper account can
+     * restrict shorting/margin (below the $2k margin minimum) while long stock/options work.
+     * Accepts the raw instruments object or an `instrumentsHeader()` projection.
+     */
+    function instrumentsCapabilityWarning(instruments) {
+      const raw = plainObject(instruments);
+      const effective = plainObject(raw.effective);
+      const account = plainObject(raw.account);
+      const booleanOrNull = (value) => (value === true ? true : value === false ? false : null);
+      if (Object.keys(effective).length === 0) {
+        return {
+          show: false,
+          restricted: false,
+          shortStockDisabled: false,
+          marginDisabled: false,
+          creditOptionsDisabled: false,
+          disabled: [],
+          longStockAvailable: null,
+          optionsAvailable: null,
+          account: { shortingEnabled: null, marginMultiplier: null, optionsTradingLevel: null },
+          unknown: true,
+        };
+      }
+      const shortStockDisabled = effective.shortStock === false;
+      const marginDisabled = effective.margin === false;
+      const creditOptionsDisabled = effective.creditOptions === false;
+      const disabled = [];
+      if (shortStockDisabled) disabled.push('shortStock');
+      if (marginDisabled) disabled.push('margin');
+      if (creditOptionsDisabled) disabled.push('creditOptions');
+      return {
+        show: disabled.length > 0,
+        restricted: disabled.length > 0,
+        shortStockDisabled,
+        marginDisabled,
+        creditOptionsDisabled,
+        disabled,
+        longStockAvailable: effective.longStock !== false,
+        optionsAvailable: creditOptionsDisabled !== true,
+        account: {
+          shortingEnabled: booleanOrNull(account.shortingEnabled),
+          marginMultiplier: toNumber(account.marginMultiplier),
+          optionsTradingLevel: toNumber(account.optionsTradingLevel),
+        },
+        unknown: false,
+      };
+    }
+
+    /**
+     * Instruments badges honoring per-agent permissions: disabled short/margin capabilities
+     * omit their badge and are spelled out in the tooltip ("disabled by broker account").
+     */
+    function effectiveInstrumentBadges(permissions) {
+      const mapped = instrumentPermissionsMapping(permissions);
+      if (mapped.available !== true) {
+        return { available: false, badges: [], disabled: [], tooltip: '', permissions: mapped };
+      }
+      const disabled = [];
+      if (mapped.shortStock === false) disabled.push({ key: 'short', labelKey: 'badgeShort', label: 'Short' });
+      if (mapped.margin === false) disabled.push({ key: 'margin', labelKey: 'badgeMargin', label: 'Margin' });
+      const disabledText = disabled.length > 0
+        ? `${disabled.map((entry) => entry.label).join('/')} disabled by broker account`
+        : '';
+      return {
+        available: true,
+        badges: mapped.badges,
+        disabled,
+        tooltip: [mapped.tooltip, disabledText].filter((part) => part.length > 0).join(' · '),
+        permissions: mapped,
       };
     }
 
@@ -2131,7 +2339,7 @@ window.__ModuleLoader__.load({
         lastError: engine.lastError ?? null,
         ticks: toNumber(engine.ticks),
         reaper: engine.reaper ?? null,
-        brakesCount: toNumber(status?.brakes?.count) ?? 14,
+        brakesCount: toNumber(status?.brakes?.count) ?? 18,
         obituaryStats: status?.obituaries?.stats ?? null,
         at: status?.at ?? null,
         research: researchStatusSummary(status),
@@ -2139,7 +2347,12 @@ window.__ModuleLoader__.load({
         rankings: status?.rankings ?? null,
         strategyMix: status?.strategyMix ?? null,
         engineAgents: botAgentEngineStatus(engine.agents ?? status?.engine?.agents),
-        instruments: instrumentsHeader(status?.instruments, status?.account ?? status?.instruments?.account ?? null),
+        lastCycle: lastCycleMapping(engine.lastCycle),
+        instruments: instrumentsHeader(
+          engine.instruments ?? status?.instruments ?? null,
+          status?.account ?? engine.instruments?.account ?? status?.instruments?.account ?? null,
+        ),
+        brokerCapability: instrumentsCapabilityWarning(engine.instruments ?? status?.instruments ?? null),
         control: status?.control ?? null,
       };
     }
@@ -2554,6 +2767,8 @@ window.__ModuleLoader__.load({
 .atm-botagent-card{display:flex;flex-direction:column;gap:4px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px;padding:7px 9px}
 .atm-botagent-metrics{display:flex;gap:8px;flex-wrap:wrap;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
 .atm-botagent-metric b{color:var(--dsw-alias-label-primary,inherit);font-variant-numeric:tabular-nums;font-weight:600}
+.atm-cap-warning{display:flex;gap:5px;flex-wrap:wrap;align-items:baseline;margin:0;font-size:10.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);border:.5px solid var(--dsw-alias-state-warning-primary,var(--dsw-alias-border-l2,currentColor));border-left-width:3px;border-radius:8px;padding:4px 9px;background:var(--dsw-alias-bg-l2,transparent)}
+.atm-cap-warning b{font-weight:600;color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit))}
 .atm-bridge-line{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit);display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
 .atm-bridge-line b{color:var(--dsw-alias-label-primary,inherit);font-weight:600}
 .atm-operator-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
@@ -3337,6 +3552,62 @@ window.__ModuleLoader__.load({
       return h('p', { className: 'atm-bridge-line' }, parts);
     }
 
+    /** "Last cycle" diagnostic line: why the bots did or did not trade this cycle. */
+    function LastCycleLine({ t, lastCycle }) {
+      if (!lastCycle || lastCycle.available !== true) {
+        return h('p', { className: 'atm-bridge-line atm-muted' }, t('lastCycleEmpty'));
+      }
+      const parts = [h('b', { key: 'title' }, t('lastCycle'))];
+      parts.push(h('span', { key: 'market' }, t(lastCycle.marketStateKey)));
+      if (lastCycle.at) parts.push(h('span', { key: 'at', className: 'atm-muted' }, fmtAgo(lastCycle.at)));
+      if (lastCycle.tradingSkipped === true && (lastCycle.orders ?? 0) === 0) {
+        parts.push(h('span', { key: 'skip', className: 'atm-warn' }, t('tradingSkipped')));
+      }
+      parts.push(h('span', { key: 'exec' }, `${t('executions')} ${fmtNum(lastCycle.executions ?? 0)}`));
+      parts.push(h('span', { key: 'orders' }, `${t('orders')} ${fmtNum(lastCycle.orders ?? 0)}`));
+      if ((lastCycle.denied ?? 0) > 0) parts.push(h('span', { key: 'denied' }, `${t('denied')} ${fmtNum(lastCycle.denied)}`));
+      if ((lastCycle.errors ?? 0) > 0) {
+        parts.push(h('span', { key: 'errors', className: 'atm-warn' }, `${t('errors')} ${fmtNum(lastCycle.errors)}`));
+      }
+      if (lastCycle.topSkipText) {
+        parts.push(h('span', { key: 'skips' }, `${t('topSkipReasons')}: ${lastCycle.topSkipText}`));
+      }
+      if (lastCycle.botReviews) {
+        const reviews = lastCycle.botReviews;
+        const reviewParts = [];
+        if (reviews.due !== null) reviewParts.push(`${fmtNum(reviews.reviewed ?? 0)}/${fmtNum(reviews.due)}`);
+        if (reviews.deferred !== null) reviewParts.push(`${t('deferred')} ${fmtNum(reviews.deferred)}`);
+        if (reviews.errors !== null && reviews.errors > 0) reviewParts.push(`${t('errors')} ${fmtNum(reviews.errors)}`);
+        if (reviews.paused) reviewParts.push(t('paused'));
+        if (reviewParts.length > 0) parts.push(h('span', { key: 'reviews' }, `${t('botReviews')}: ${reviewParts.join(' · ')}`));
+        if (reviews.note) parts.push(h('span', { key: 'note', className: 'atm-muted' }, reviews.note));
+      }
+      return h('p', { className: 'atm-bridge-line' }, parts);
+    }
+
+    /** Informational broker capability warning (shorting/margin restricted on the paper account). */
+    function CapabilityWarningLine({ t, capability }) {
+      if (!capability || capability.show !== true) return null;
+      const disabled = [];
+      if (capability.shortStockDisabled) disabled.push(t('shortEnabled'));
+      if (capability.marginDisabled) disabled.push(t('marginEnabled'));
+      if (capability.creditOptionsDisabled) disabled.push(t('badgeOptions'));
+      const accountParts = [];
+      if (capability.account.shortingEnabled !== null) {
+        accountParts.push(`${t('shortEnabled')} ${capability.account.shortingEnabled ? t('onLabel') : t('offLabel')}`);
+      }
+      if (capability.account.marginMultiplier !== null) accountParts.push(`${t('marginEnabled')} ${fmtNum(capability.account.marginMultiplier)}x`);
+      if (capability.account.optionsTradingLevel !== null) accountParts.push(`${t('optionsLevel')} L${fmtNum(capability.account.optionsTradingLevel)}`);
+      return h('p', { className: 'atm-cap-warning' }, [
+        h('span', { key: 'icon', 'aria-hidden': true }, '⚠ '),
+        h('b', { key: 'title' }, t('brokerRestricted')),
+        h('span', { key: 'detail' }, `: ${disabled.join('/')} ${t('brokerRestrictedUnavailable')} — ${t('brokerRestrictedRemain')}`),
+        accountParts.length > 0
+          ? h('span', { key: 'account', className: 'atm-muted' }, ` · ${t('accountFacts')}: ${accountParts.join(' · ')}`)
+          : null,
+      ]);
+    }
+
     /** "Instrument playbook" block: family + bullish/bearish/neutral structures. */
     function InstrumentPlaybookSection({ t, playbook }) {
       if (!playbook || playbook.available !== true) {
@@ -3989,6 +4260,8 @@ window.__ModuleLoader__.load({
         h(HeaderStats, { key: 'stats', t, summary }),
         h(BotAgentBridgeLine, { key: 'bot-agents', t, engineAgents: summary.engineAgents }),
         h(InstrumentsLine, { key: 'instruments', t, instruments: summary.instruments }),
+        h(CapabilityWarningLine, { key: 'capability', t, capability: summary.brokerCapability }),
+        h(LastCycleLine, { key: 'last-cycle', t, lastCycle: summary.lastCycle }),
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
         h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
         h(OperatorPanel, {
@@ -4192,6 +4465,9 @@ window.__ModuleLoader__.load({
         playbookMapping,
         instrumentPolicyMapping,
         instrumentsHeader,
+        lastCycleMapping,
+        instrumentsCapabilityWarning,
+        effectiveInstrumentBadges,
         describeReaper,
         mapResearchBriefing,
         researchBadge,

@@ -93,6 +93,22 @@ createBotAgents({ config, paths, clock, registry, ledger, broker, researcher, ge
 
 ## Orchestrator / engine (Lead)
 
+### v3.1 prompt/context hardening
+
+- The review prompt now carries `TRADING_RULES` (fractional long stock allowed, min order notional,
+  dollar `sizeBudgetUsd`, whole-share-only shorts, broker `shortingEnabled`/`marginMultiplier`) and an
+  account-adjusted `INSTRUMENT_CONTEXT` (credit/covered structures hidden while margin is unavailable).
+- The system prompt explicitly forbids `stand_down` merely because one whole share/contract is
+  unaffordable, a quote is stale, or the market is closed; the executor sizes entries from the mandate
+  and falls back to fractional stock when options do not fit. Stand-down is reserved for weak or
+  conflicting evidence / unacceptable risk.
+- Policies persist for the dashboard, but every process start marks reviews due (`lastReviewAt=0`) so
+  an old stand-down decision cannot silently block entries for up to an hour after a restart.
+- Bot reviews run after the executor pass on trading cycles only; the fallback remains deterministic
+  when no policy is fresh (missing/stale policy = neutral, auto playbook).
+
+## Orchestrator / engine (Lead)
+
 - Create the bot-agent brain alongside the researcher; `createAutomaton` accepts
   `agentGenerate` (same bridge as researchGenerate by default).
 - Tick: after the executor pass (so policies apply next cycle) run `botAgents.tick({marketClock})`;

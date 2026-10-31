@@ -427,7 +427,10 @@ describe('tiered cadence (day every minute, swing every hour) and trading-hours 
           cycleIntervalSec: 60,
           paths: { stateDir: dir },
           population: { initial: 2, cap: 5 },
-          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120 },
+          // Two symbols whose simulated edges cover this population's strategy families
+          // (the coherent-spec rule now waits instead of trading another bot's hypothesis).
+          symbols: ['SOFI', 'BAC'],
+          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120, maxHypothesesPerCycle: 60 },
           cadence: { day: { intervalSec: 60, timeframe: '1Min' }, swing: { intervalSec: 3600, timeframe: '1Hour' } },
           research: { enabled: false },
           rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
@@ -588,6 +591,12 @@ describe('strategy categories and per-bot agent status', () => {
         assert.ok(agent.strategy.estimatedIntervalSec >= 60);
         assert.ok(['1Min', '1Hour'].includes(agent.strategy.timeframe));
         assert.equal(agent.strategy.family, agent.genome.family);
+        // v3.1: a compiled spec must always match the bot's own genome family+symbol; the old
+        // unrelated-hypothesis fallback (e.g. Momentum F trading AMD breakout) is gone.
+        if (agent.spec) {
+          assert.equal(agent.spec.family, agent.genome.family, `${agent.name} spec family must match genome`);
+          assert.equal(agent.spec.symbol, agent.genome.symbol, `${agent.name} spec symbol must match genome`);
+        }
       }
       const reviewed = status.agents.filter((agent) => agent.policy && agent.policy.at);
       assert.equal(reviewed.length >= 1, true, 'bot reviews run after the execution pass');
@@ -604,6 +613,61 @@ describe('strategy categories and per-bot agent status', () => {
       assert.equal(status.engine.agents.configured, true);
       assert.equal(status.engine.agents.provider, 'fake');
       assert.equal(status.engine.agents.runs >= 1, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.1 broker capability gating: restricted paper account (no margin/shorting)
+// ---------------------------------------------------------------------------
+
+describe('broker capability gating', () => {
+  it('removes short/margin/credit-option permissions when the paper account is restricted', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-capability-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-30T15:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 2, cap: 5 },
+          symbols: ['SOFI', 'BAC'],
+          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120, maxHypothesesPerCycle: 60 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+          agents: { enabled: false },
+        },
+      }).config;
+      const baseBroker = createSimBroker(config, { seed: 17, accountEquityUsd: 100000 });
+      const restrictedBroker = Object.create(baseBroker);
+      restrictedBroker.getAccount = async () => ({
+        ...(await baseBroker.getAccount()),
+        buyingPowerUsd: 100000,
+        shortingEnabled: false,
+        marginMultiplier: 1,
+      });
+      const automaton = await createAutomaton({ config, broker: restrictedBroker, clock });
+      await automaton.init();
+      await automaton.tick();
+      const status = await automaton.status();
+      assert.equal(status.engine.instruments.effective.shortStock, false);
+      assert.equal(status.engine.instruments.effective.margin, false);
+      assert.equal(status.engine.instruments.effective.structures.includes('covered_call'), false);
+      assert.equal(status.engine.instruments.effective.structures.includes('call_credit_spread'), false);
+      assert.equal(status.engine.instruments.effective.structures.includes('long_call'), true);
+      for (const agent of status.agents) {
+        assert.equal(agent.instrumentPermissions.shortStock, false, 'no short permission on a restricted account');
+        assert.equal(agent.instrumentPermissions.margin, false, 'no margin permission on a restricted account');
+        assert.equal(agent.instrumentPermissions.allowedStructures.includes('covered_call'), false);
+        assert.equal(agent.instrumentPermissions.allowedStructures.includes('call_credit_spread'), false);
+        assert.equal(agent.instrumentPermissions.allowedStructures.includes('long_call'), true);
+        assert.equal(agent.playbook.structures.includes('covered_call'), false);
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -683,7 +747,11 @@ describe('capital top-up for multi-instrument paper trading', () => {
       const snapshot = automaton._internals.ledger.snapshot('atm-topup0001');
       assert.equal(snapshot.cashUsd, 50);
       assert.equal(snapshot.marginDebtUsd, 0);
-      assert.equal(snapshot.creditsUsd >= 50, true, 'top-up is recorded as capital, not trading P&L');
+      // The +$30 came from the unallocated treasury pool (reallocation), not newly minted cash:
+      // total ledger equity must still equal broker equity.
+      const pool = automaton._internals.ledger.pool();
+      assert.equal(Math.abs(pool.totalUsd - 100000) <= 0.01, true, `top-up must conserve account equity (total ${pool.totalUsd})`);
+      assert.equal(snapshot.creditsUsd, 20, 'only the seeded credit was minted; the top-up is a transfer');
       assert.equal(snapshot.realizedPlUsd, 0);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

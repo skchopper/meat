@@ -431,6 +431,16 @@ async function defaultEngineFactory(row, research) {
   // The row may carry a nested `config` object with deeper overrides (engine.normalizeOverrides).
   if (row.config && typeof row.config === 'object' && !Array.isArray(row.config)) overrides.config = row.config;
   const options = { overrides, envFile: row.envFile };
+  // Prefer the workspace-level automaton.config.json next to the state directory when it exists.
+  // The state dir also carries a mutable copy, but keeping the workspace file authoritative avoids
+  // "I edited the config and nothing changed" drift after upgrades (v3.1 fix).
+  const stateDir = typeof overrides.stateDir === 'string' && overrides.stateDir.length > 0
+    ? overrides.stateDir
+    : row.stateDir;
+  if (typeof stateDir === 'string' && stateDir.length > 0) {
+    const workspaceConfig = path.join(path.dirname(path.resolve(stateDir)), 'automaton.config.json');
+    if (fileExists(workspaceConfig)) options.configFile = workspaceConfig;
+  }
   if (research && typeof research.generate === 'function') {
     options.researchGenerate = research.generate;
     options.researchProvider = research.provider;
@@ -625,7 +635,7 @@ async function buildState(holder, row) {
     agents: Array.isArray(status?.agents) ? status.agents : [],
     rankings: status?.rankings ?? null,
     strategyMix: status?.strategyMix ?? null,
-    instruments: status?.instruments ?? null,
+    instruments: status?.instruments ?? status?.engine?.instruments ?? null,
     rewards: status?.rewards ?? (status?.engine?.rewards ? { ...status.engine.rewards, history: [] } : null),
     obituaries: {
       stats: obituaries.stats ?? status?.obituaries ?? null,

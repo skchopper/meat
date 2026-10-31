@@ -103,23 +103,31 @@ function positiveOrInfinity(value, fallback = Infinity) {
  *   allowedStructures: string[], maxShortNotionalUsd: number, maxOptionPremiumUsd: number,
  *   maxContracts: number, maxMarginUsd: number }}
  */
-export function deriveInstrumentPermissions(config, equityUsd = 0) {
+export function deriveInstrumentPermissions(config, equityUsd = 0, account = null) {
   const raw = config?.instruments ?? {};
   const enabled = raw.enabled !== false;
-  const allowMargin = enabled && raw.allowMargin === true;
-  const allowShort = enabled && raw.allowShort === true;
-  const allowOptions = enabled && raw.allowOptions === true;
-  const allowCoveredCalls = allowOptions && raw.allowCoveredCalls !== false;
-  const allowSpreads = allowOptions && raw.allowSpreads !== false;
   const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
   const equity = Math.max(0, Number(equityUsd) || 0);
+  // Broker capability facts intersect the config: a paper account below the margin minimum (or
+  // with shorting switched off) must not receive short/margin/short-option permissions, otherwise
+  // the executor would keep constructing orders the broker rejects.
+  const brokerShortDisabled = account ? account.shortingEnabled === false : false;
+  const brokerMarginMultiplier = account ? Number(account.marginMultiplier) : NaN;
+  const brokerMarginDisabled = account && Number.isFinite(brokerMarginMultiplier) && brokerMarginMultiplier <= 1;
+  const allowShort = enabled && raw.allowShort === true && !brokerShortDisabled;
+  const allowMargin = enabled && raw.allowMargin === true && !brokerMarginDisabled;
+  const allowOptions = enabled && raw.allowOptions === true;
+  const allowCoveredCalls = allowOptions && raw.allowCoveredCalls !== false && !brokerMarginDisabled;
+  // Debit verticals are long-option structures and need no margin; credit verticals do.
+  const allowCreditSpreads = allowOptions && raw.allowSpreads !== false && !brokerMarginDisabled;
+  const allowDebitSpreads = allowOptions && raw.allowSpreads !== false;
+  const allowSpreads = allowDebitSpreads || allowCreditSpreads;
 
   const allowedStructures = [];
   if (allowOptions) allowedStructures.push('long_call', 'long_put');
   if (allowCoveredCalls) allowedStructures.push('covered_call');
-  if (allowSpreads) {
-    allowedStructures.push('call_credit_spread', 'put_credit_spread', 'bull_call_spread', 'bear_put_spread');
-  }
+  if (allowDebitSpreads) allowedStructures.push('bull_call_spread', 'bear_put_spread');
+  if (allowCreditSpreads) allowedStructures.push('call_credit_spread', 'put_credit_spread');
 
   const maxShortNotionalUsd = round2(
     Math.min(
@@ -296,9 +304,9 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
     return candidates.length === 0 ? 0 : round2(Math.min(...candidates));
   }
 
-  function buildMandate(view, { allowExitOnly, at, atMs, ordersToday, accountEquityUsd, allocatedEquityUsd }) {
+  function buildMandate(view, { allowExitOnly, at, atMs, ordersToday, accountEquityUsd, allocatedEquityUsd, account = null }) {
     const cap = sizeCapFor(view.equityUsd);
-    const instruments = deriveInstrumentPermissions(config, view.equityUsd);
+    const instruments = deriveInstrumentPermissions(config, view.equityUsd, account);
     return {
       agentId: view.agentId,
       issuedAt: at,
@@ -439,7 +447,7 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
           marginDebtUsd: eq.marginDebtUsd ?? 0,
           grossExposureUsd: eq.grossExposureUsd ?? 0,
           netExposureUsd: eq.netExposureUsd ?? 0,
-          instruments: deriveInstrumentPermissions(config, eq.equityUsd),
+          instruments: deriveInstrumentPermissions(config, eq.equityUsd, account),
         });
       } catch (error) {
         errors.push({ scope: 'agent', agentId: id, error: errorInfo(error) });
@@ -516,6 +524,7 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
         ordersToday: view.ordersToday,
         accountEquityUsd,
         allocatedEquityUsd: allocatedAll,
+        account,
       });
     }
 
@@ -598,6 +607,7 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
         ordersToday: 0,
         accountEquityUsd: lastTick?.account?.equityUsd,
         allocatedEquityUsd: lastTick?.allocatedUsd,
+        account: cachedAccount ?? lastTick?.account ?? null,
       });
     } catch {
       /* a stale mandate is safer than a crash during genesis funding */

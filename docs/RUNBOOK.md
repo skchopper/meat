@@ -227,14 +227,14 @@ redacted result and resolved paths. Key knobs:
 |---|---|---|
 | `mode` | paper | sim / paper / live |
 | `population.initial` / `.cap` | 3 / 10 | genesis size and population cap (this build: **30 / 60**) |
-| `endowmentUsd` | 5000 | capital allocated per agent (virtual sub-ledger; this build: **$20**) |
+| `endowmentUsd` | 5000 | capital allocated per agent (virtual sub-ledger; this build: **$50**) |
 | `deathFloorUsd` / `deathFloorPct` | 250 / 5% | equity at which death fires (this build: **$1 / 5%**) |
 | `maxDrawdownPct` | 25% | risk-of-ruin death (this build: **20%**) |
 | `burn.inferencePerCycleUsd` | 0.03 | per-agent inference cost per cycle (this build: **0.0002**) |
 | `burn.dataPerCycleUsd` | 0.005 | per-agent market-data cost per cycle (this build: **0.00005**) |
 | `cycleBudget` | 0.08/0.03/0.01 | STABLE/TIGHT/CRITICAL thinking budget |
-| `replication.*` | 150 USD / 72 h / 2500 USD | breeding gate + child endowment (this build: **$3 / 72 h / $10**) |
-| `data.maxHypothesesPerCycle` | 3 | proven hypotheses per cycle (this build: **40**, so 30 agents can each trade their own strategy) |
+| `replication.*` | 150 USD / 72 h / 2500 USD | breeding gate + child endowment (this build: **$3 / 72 h / $25**) |
+| `data.maxHypothesesPerCycle` | 60 | proven hypotheses per cycle (so 30 agents can each trade their own strategy family/symbol) |
 | `risk.*` | see `src/config.js` | max position %, order caps, daily orders, loss limits, session window, symbol whitelist |
 
 ## 8a. Minute monitoring / fast intraday profile
@@ -367,15 +367,16 @@ plus new hard rules D15–D18.
   "allowMargin": true, "maxMarginPctEquity": 1,
   "allowShort": true, "maxShortPctEquity": 1, "maxShortNotionalUsd": 25, "shortableOnly": true,
   "allowOptions": true, "allowCoveredCalls": true, "allowSpreads": true,
-  "maxOptionPremiumPctEquity": 0.25, "maxOptionPremiumUsd": 25, "maxContracts": 3,
+  "maxOptionPremiumPctEquity": 0.35, "maxOptionPremiumUsd": 30, "maxContracts": 2,
   "minDTE": 2, "maxDTE": 14, "autoCloseDTE": 1,
   "allowNakedShortOptions": false, "optionDataFeed": "indicative"
 }
 ```
 
-- **Capital**: bots were raised from $20 to $50 (one-time +$30 capital top-up per alive bot, bounded by
-  the allocation cap; the top-up is credited to the bot's ledger and its endowment basis so it is not
-  counted as trading profit). 30 × $50 = $1,500 of the ~$2,000 paper account.
+- **Capital**: bots were raised from $20 to $50 (one-time +$30 per alive bot, funded by **reallocating
+  the unallocated treasury pool**, not by minting cash, and updating the bot's endowment basis so the
+  top-up is not counted as trading profit). Sum(bot equity) + pool remains equal to broker equity, so
+  reconciliation does not halt. 30 × $50 = $1,500 of the ~$2,000 paper account.
 - **Instruments**:
   - *Long stock* — as before.
   - *Short stock* — whole shares only, shortable+marginable assets, mandate short cap; buy-to-cover on
@@ -394,12 +395,16 @@ plus new hard rules D15–D18.
   `policy.instrument`; otherwise the playbook picks the first affordable structure and falls back to
   stock/short when option premium cannot fit the cap. Option selection: nearest expiry inside the DTE
   window, OTM strikes 2–5%, contracts = floor(option budget / premium×100), budget =
-  min(25% equity, $25/order, mandate cap) minus open option premium.
-- **Data/account facts (paper)**: options trading level 3, shorting enabled, margin multiplier 4.
-  Option contracts come from `/v2/options/contracts`, marks/quotes from
-  `/v1beta1/options/snapshots/{underlying}?feed=indicative`, orders use `position_intent` and mleg
-  `order_class` for spreads. The account exposes `buying_power`, `options_buying_power`,
-  `shorting_enabled`, `options_trading_level`.
+  min(35% equity, $30/order, mandate cap) minus open option premium.
+- **Data/account facts (paper)**: options trading level 3. Option contracts come from
+  `/v2/options/contracts`, marks/quotes from `/v1beta1/options/snapshots/{underlying}?feed=indicative`,
+  orders use `position_intent` and mleg `order_class` for spreads. The account exposes `buying_power`,
+  `options_buying_power`, `shorting_enabled`, `options_trading_level`. **Broker capability gating**:
+  when the paper account is restricted (e.g. equity below the $2,000 margin minimum → `shorting_enabled:
+  false`, no margin buying power), the Treasurer removes short, margin, covered-call and credit-spread
+  permissions from mandates, bot prompts and status; long stock, long calls/puts and debit verticals
+  remain available. Fact: this paper account currently sits at ~$1,999.87 and reports shorting/margin
+  disabled; options level 3 is still enabled.
 - **Risk rules**: D15 short sale (shorting enabled, shortable+marginable asset, whole shares, mandate
   notional cap); D16 options (enabled structure, integer contracts ≤ maxContracts, premium ≤
   maxOptionPremiumPctEquity×equity and ≤ per-order cap, DTE window; covered calls require 100+ shares;
@@ -417,6 +422,47 @@ plus new hard rules D15–D18.
   and short-dated options can lose more than the bot's cash in a real account; keep `mode=paper`,
   `allowLive=false`, and treat the configured caps as hard limits. Live trading is not enabled by this
   change.
+
+## 8e. "Most bots are not trading" — diagnostic checklist (v3.1)
+
+Run this before assuming a bug. The panel shows the same data via `engine.lastCycle` and the
+restricted-account warning; `GET /automaton/state` exposes it programmatically.
+
+1. **Is the market open?** With `engine.tradingHoursOnly: true`, the engine only fetches prices,
+   evaluates strategies and trades during the regular session (09:35–15:50 ET). Off-hours cycles are
+   cheap maintenance passes (`engine.lastCycle.tradingSkipped: true`) and **no trades are expected**
+   overnight or at weekends. The last real session ends Friday 16:00 ET.
+2. **Did the runtime config actually load v3.1?** The Host derives the config path from the state
+   directory and prefers the workspace-level `automaton.config.json`; `automaton-data/automaton.config.json`
+   is a migrated fallback. Check `config.endowmentUsd === 50`, `cadence.day = {intervalSec:60,
+   timeframe:"1Min"}`, `cadence.swing = {intervalSec:3600, timeframe:"1Hour"}`,
+   `engine.tradingHoursOnly === true`, `data.maxHypothesesPerCycle === 60`, and
+   `risk.maxDailyOrders === 20`. A stale state-dir config (endowment 20, cadence null, trading hours
+   false) was the root cause of the v3.0 inactivity; it is now migrated and the workspace file wins.
+3. **What are the bot agents deciding?** Each bot has its own review. Check `agents[].policy.stance`:
+   `stand_down` blocks new entries (exits still run). v3.1 explicitly tells agents that **long stock
+   can be fractional** and to stand down only for weak/conflicting evidence — not because one whole
+   share or contract is unaffordable. Reviews are forced due on process start so old decisions do not
+   linger for an hour. `engine.lastCycle.botReviews` shows how many were reviewed/deferred.
+4. **Is there a coherent hypothesis?** Bots only compile specs for their **own family+symbol** (or the
+   same family on another symbol); the old unrelated-hypothesis fallback is gone. A
+   `no_matching_hypothesis` build skip means the Prospector did not prove that bot's strategy this
+   cycle — waiting is correct. `data.maxHypothesesPerCycle: 60` covers the 14 symbols × 4 families.
+   Cached unrelated specs are cleared on start.
+5. **Is the broker account restricted?** Paper accounts below the broker's margin minimum lose
+   shorting/margin; this account (~$1,999.87) currently reports `shortingEnabled:false`,
+   `marginMultiplier:1`. The engine then removes short/margin/covered-call/credit-spread permissions
+   automatically (status `engine.instruments.effective`, agent tooltips). Options level 3 and long
+   stock/long options remain available. Restoring shorting/margin requires the Alpaca paper account
+   to be funded/reset above the margin minimum; the engine re-enables those permissions automatically
+   on the next cycle once the broker reports them.
+6. **What did the last cycle skip?** `engine.lastCycle.topSkipReasons` shows the dominant reasons:
+   `inside_range`, `gap <x>bps`, `momentum z=<x>`, `meanrev z=<x>`, `max_orders_per_cycle`,
+   `no_matching_hypothesis`. Quiet markets legitimately produce few entries; day bots evaluate every
+   60 seconds on 1-minute bars, swing bots hourly on 1-hour bars.
+7. **Costs vs progress**: bots pay metabolism each trading cycle (inference/data/hosting). Off-hours
+   gating stops weekend burn. A bot with equity ≈ $19.4 after the old $20 era is topped up to $50 by
+   the one-time treasury reallocation on the first v3.1 start; check `limits.endowmentUsd`/agents.
 
 ## 9. Troubleshooting
 

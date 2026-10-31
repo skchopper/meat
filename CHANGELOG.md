@@ -10,6 +10,56 @@ existing state migrate with **zero** data changes.
 
 ---
 
+---
+
+## v3.1.0 — 2026-11-01 — trade-activity diagnosis, fractional-aware bots, coherent strategies
+
+This release fixes why most bots appeared inactive in v3.0 and hardens the trading loop around the
+real broker capabilities.
+
+- **Stale runtime configuration fixed.** The installed Host had continued loading an old state-dir
+  config (bots at $20, 5-minute ticks on 1-hour bars, `tradingHoursOnly:false`), so the v3 settings
+  were not actually active. The Host now prefers the workspace-level `automaton.config.json`
+  (`configFile` derived from the state directory) and the legacy state copy was migrated. The running
+  profile now really uses **$50 bots, day bots every 60 s on 1-minute bars, swing bots hourly on
+  1-hour bars, trading-hours-only monitoring, 20 orders/day, $40 order cap and 60 hypotheses/cycle**.
+- **Capital top-up conserves broker equity.** The one-time $20→$50 raise now **reallocates the
+  unallocated treasury pool** instead of minting ledger cash, so sum(bot equity) + pool still equals
+  broker equity and the Treasurer reconciliation cannot halt from the migration; the bot's endowment
+  basis is raised so the transfer is not counted as trading P&L.
+- **Bot agents no longer stand down over share price.** The prompt now carries `TRADING_RULES`
+  (fractional long stock allowed, minimum order notional, dollar `sizeBudgetUsd`, whole-share-only
+  shorts, broker `shortingEnabled`/`marginMultiplier`) and an account-adjusted instrument menu. Agents
+  are explicitly told that a high share price, stale quote or closed market is **not** a reason to
+  stand down — stand-down is reserved for weak/conflicting evidence or unacceptable risk. Policies
+  survive for the dashboard, but every process start forces reviews due so an old stand-down decision
+  cannot block entries for up to an hour after a restart.
+- **Strategy/spec coherence.** Bots only compile a spec whose **family and symbol match their own
+  genome** (exact pair, then the same family on another symbol); the old unrelated-hypothesis fallback
+  that made “Momentum F” trade an AMD breakout is removed, cached mismatched specs are cleared on
+  start, and the default Prospector budget covers all 14 symbols × 4 families.
+- **Broker capability gating.** When the paper account is restricted (currently ~$1,999.87, below the
+  margin minimum → `shorting_enabled:false`, no margin buying power), mandate permissions, the bot
+  prompt and status no longer offer shorting, margin, covered calls or credit spreads; long stock,
+  long calls/puts and debit verticals remain. Permissions re-enable automatically when the broker
+  reports margin/shorting again. The engine never constructs orders the account cannot place.
+- **Trade-activity diagnostics.** `status.engine.lastCycle` now reports the last cycle's market state,
+  executions, orders, denials, errors, top skip reasons and bot-review counters;
+  `status.engine.instruments.effective` reports what the broker can actually do. The panel header
+  shows a **Last cycle** line with the top-3 skip reasons (e.g. `inside_range`, `gap 4bps`,
+  `no_matching_hypothesis`) and an informational warning when shorting/margin are restricted.
+- **Option sizing tuned for $50 bots.** Premium cap raised to 35% of equity / $30 per order with max
+  2 contracts so cheap OTM contracts are actually reachable; DTE window, auto-close, covered-share
+  requirement and never-naked rules are unchanged.
+- **Tests:** 10 suites, **305 tests**, all passing (mortality 70, market 43, plugin 43, integration 34,
+  security 53, research 13, rankings 16, control 17, bot-agent 9, instruments 7), plus research and
+  defect-regression smoke checks. New coverage: fractional-aware bot context, broker capability
+  gating, spec/genome coherence, treasury-funded top-up conservation and the last-cycle diagnostics.
+- **Known external constraint:** the Alpaca paper account itself currently reports shorting/margin
+  disabled below the broker margin minimum. Options level 3, long stock and long/debit options remain
+  available; the new capability warning makes this explicit instead of letting orders fail at the
+  broker.
+
 ## v3.0.0 — 2026-10-30 — multi-instrument paper trading (margin, shorts, options, spreads)
 
 The population may now use margin, short selling, long calls/puts, covered calls and defined-risk

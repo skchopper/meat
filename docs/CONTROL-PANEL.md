@@ -87,8 +87,16 @@ engine: {
     account: {buyingPowerUsd, optionsBuyingPowerUsd, marginMultiplier, shortingEnabled,
               optionsTradingLevel, marginDebtUsd, grossExposureUsd, netExposureUsd} | null,
     treasury: { ...instrument permissions/caps summary } | null,
+    effective: {longStock:true, shortStock, margin, creditOptions,
+                structures:[...]} | null,
     playbooks: {momentum:{family,tier,summary,bullish,bearish,neutral,structures}, meanrev, breakout, gapfade}
-  }
+  },
+  lastCycle: null | {
+    at, marketOpen, tradingSkipped, executions, orders, denied, errors,
+    topSkipReasons: {reason: count},
+    botReviews: {enabled,configured,due,reviewed,deferred,skipped,errors,budgetUsd,note?,paused?} | null,
+    research: object | null
+  },
 },
 strategyMix: {
   swing: {label, count, families:{momentum, meanrev}},

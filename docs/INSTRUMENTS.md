@@ -3,21 +3,25 @@
 > **Status:** implemented (v3.0): `src/instruments.js`, multi-asset `ledger.js`, `brakes.js` D2/D15–D18,
 > `treasurer.js` mandates, `broker-alpaca.js`/`broker-sim.js`, multi-instrument `executor.js`,
 > `reaper.js`/`simulate.js` liquidation, bot-agent instrument policy, status/panel and docs.
-> Tests: instruments 7, market 43, mortality 70, security 53, control 16, integration 34, plugin 42
-> (302 total across 10 suites, all passing).
+> Tests: instruments 7, market 43, mortality 70, security 53, control 17, integration 34, plugin 43,
+> bot-agent 9, research 13, rankings 16 (305 total across 10 suites, all passing).
 
 Goal: every bot may use **margin, short selling, long options, defined-risk option spreads, and
 covered calls**, and uses them actively when its strategy sees an edge. Paper trading by default;
 the hard brake wall stays authoritative.
 
-User decisions: **raise bots to $50** (one-time +$30 top-up from account cash; 30 × $50 = $1,500 ≤
+User decisions: **raise bots to $50** (one-time +$30 reallocated from the unallocated treasury pool; 30 × $50 = $1,500 ≤
 80% of the ~$2,000 paper account); option scope = **long options + defined-risk spreads + covered
 calls** (no naked short options).
 
-Account facts (probed live, paper): options level 3, shorting_enabled=true, margin_multiplier=4,
+Account facts (probed live, paper): options level 3, shorting_enabled=true, margin_multiplier=4 on 2026-10-30,
 options_buying_power≈cash, assets AAPL/F/SPY/TSLA shortable+marginable, option chain + indicative
 snapshots work (`/v1beta1/options/snapshots/{UNDERLYING}`), cheap OTM contracts exist (e.g. F 13C at
-$0.04 = $4/contract).
+$0.04 = $4/contract). **v3.1 account note:** the paper account later fell to ~$1,999.87 and reports
+`shorting_enabled:false` with no margin buying power (below the broker margin minimum), so the engine
+now gates short/margin/covered-call/credit-spread permissions on the broker facts; long stock, long
+options and debit verticals remain available and permissions re-enable automatically if the account
+recovers.
 
 ## Strategy → instrument playbooks (`src/instruments.js`, Lead)
 
@@ -80,7 +84,8 @@ Generic signed positions keyed by symbol; stock ticker or OCC option symbol.
 - `equity(agentId, prices)` must mark stocks `qtySigned × price` and options
   `contracts × premium × 100`; `cash + Σ marketValues`; include `marginDebtUsd`, `grossExposureUsd`,
   `netExposureUsd`, `longSharesOf(agentId, symbol)` helper for covered-call checks.
-- `credit(agentId, amountUsd, {category:'capital', reason})` for the $30 one-time top-up.
+- `transfer('__treasury__', agentId, amountUsd, {reason})` is used for the one-time $30 top-up so
+  aggregate ledger equity is conserved (no cash minted; the Treasurer reconciliation stays valid).
 - `snapshot(agentId)` positions enriched with `side: LONG|SHORT|CALL|PUT`, `assetClass`,
   `option{strikeUsd,expiration,type,dte}`, `multiplier`, `groupId`.
 - USD rounding, invariants: equity = cash + Σ marks; no money creation except credit/charge/transfer.
@@ -169,14 +174,16 @@ instruments: {
   enabled: true, allowMargin: true, maxMarginPctEquity: 1.0,
   allowShort: true, maxShortPctEquity: 1.0, maxShortNotionalUsd: 25, shortableOnly: true,
   allowOptions: true, allowCoveredCalls: true, allowSpreads: true,
-  maxOptionPremiumPctEquity: 0.25, maxOptionPremiumUsd: 25, maxContracts: 3,
+  maxOptionPremiumPctEquity: 0.35, maxOptionPremiumUsd: 30, maxContracts: 2,
   minDTE: 2, maxDTE: 14, autoCloseDTE: 1, allowNakedShortOptions: false,
   optionDataFeed: 'indicative'
 },
 risk: { maxOrderNotionalUsd: 40, maxOrderPctOfEquity: 0.5, maxDailyOrders: 20, ...existing }
 ```
 Validation allowlists structures; capital migration: alive agents with initial $20 (endowment < 50)
-receive one-time `credit` of 30 (category capital); endowmentUsd in config becomes 50 for new agents.
+receive one-time +$30 transferred from the unallocated treasury pool and their endowment basis is
+raised to 50 (the transfer is not P&L; total ledger equity is conserved); endowmentUsd in config is 50
+for new agents.
 Paper-only permission expansion: live still triple-gated by D8.
 
 ## Status/panel (Lead + plugin teammate)

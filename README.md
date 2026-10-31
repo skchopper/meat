@@ -149,20 +149,32 @@ the operating config).
   estimated trading interval, and its latest agent thesis/plan. Contract: `docs/BOT-AGENTS.md`.
 - **Multi-instrument paper trading (v3.0):** bots may use **margin, short selling, long calls/puts,
   covered calls and defined-risk vertical spreads**, actively chosen by the bot's agent or its family
-  playbook (option premium sized to 25% of equity / $25 per order, DTE 2–14, auto-close at 1 DTE;
-  short stock whole shares within the short cap; covered calls only with 100+ owned shares; **naked
-  short options are never allowed**). The paper account was topped up to **$50/bot** (one-time +$30
-  from account cash) and part of the population now trades affordable underlyings (F/SOFI/BAC/INTC)
-  so whole-share shorts and cheap option contracts are usable. New hard brakes D2/D15–D18 gate every
-  order; death liquidates signed stock and option positions before settling the estate. The panel
-  renders LONG/SHORT/CALL/PUT positions with strike/expiry/DTE, margin/exposure totals, instrument
-  badges, playbooks and the bot's instrument plan. Contract: `docs/INSTRUMENTS.md`; ops:
+  playbook (option premium sized to 35% of equity / $30 per order, max 2 contracts, DTE 2–14,
+  auto-close at 1 DTE; short stock whole shares within the short cap; covered calls only with 100+
+  owned shares; **naked short options are never allowed**). Bots were raised to **$50 each** by
+  reallocating the unallocated treasury pool (no cash minted; reconciliation conserved) and part of
+  the population trades affordable underlyings (F/SOFI/BAC/INTC) so whole-share shorts and cheap
+  option contracts are usable. New hard brakes D2/D15–D18 gate every order; death liquidates signed
+  stock and option positions before settling the estate. Contract: `docs/INSTRUMENTS.md`; ops:
   `docs/RUNBOOK.md` §8d.
+- **Trade-activity optimization + diagnostics (v3.1):** fixed the stale-runtime-config drift that
+  silently kept the population at **$20 bots / 5-minute cadence on 1-hour bars / no trading-hours
+  gate** despite the v3 settings (the workspace config is now authoritative and the state copy is
+  migrated); bot agents are explicitly told that **long stock is fractional** and shown their dollar
+  size budget and real broker capabilities, so a $500 share no longer triggers `stand_down`; reviews
+  are forced due on restart so old decisions cannot block entries for an hour; strategies only
+  compile specs for the bot's **own family+symbol** (unrelated-hypothesis fallback removed, cached
+  mismatches cleared, 60 hypotheses/cycle for full universe coverage); and **broker capability
+  gating** removes short/margin/covered-call/credit-spread permissions automatically while the paper
+  account is below the margin minimum (current account ~$1,999.87 reports shorting/margin disabled;
+  options level 3, long stock and long/debit options remain). The engine header now shows a
+  **Last cycle** diagnostic (market state, executions, orders, errors, top skip reasons) and a
+  restricted-account warning. Ops: `docs/RUNBOOK.md` §8e.
 
 ## Status (this build)
 
-- 10 test suites: mortality 70, market 43, plugin 42, independent integration 34, security 53,
-  research 13, rankings 16, control 16, bot-agent 8 and instruments 7 — **302 tests, 302 pass,
+- 10 test suites: mortality 70, market 43, plugin 43, independent integration 34, security 53,
+  research 13, rankings 16, control 17, bot-agent 9 and instruments 7 — **305 tests, 305 pass,
   0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
   `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live

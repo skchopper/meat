@@ -82,7 +82,7 @@ export function defaultConfig() {
       // 'sip' = consolidated SIP (15-min delayed on the free plan).
       feed: 'iex',
       lookbackBars: 120,
-      maxHypothesesPerCycle: 3,
+      maxHypothesesPerCycle: 60,
       maxProofAgeDays: 7,
     },
     research: {

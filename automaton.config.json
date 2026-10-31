@@ -28,13 +28,23 @@
     "maxDailyLossPct": 0.2,
     "maxOrderPctOfEquity": 0.5,
     "maxOrderNotionalUsd": 40,
-    "minOrderNotionalUsd": 1
+    "minOrderNotionalUsd": 1,
+    "allowShort": true,
+    "allowMargin": true,
+    "allowOptions": true,
+    "extendedHours": false,
+    "sessionWindow": [
+      "09:35",
+      "15:50"
+    ],
+    "maxOrdersPerCycle": 1,
+    "maxBuildSpendPct": 0.4
   },
   "data": {
     "timeframe": "1Min",
     "feed": "iex",
     "lookbackBars": 120,
-    "maxHypothesesPerCycle": 40,
+    "maxHypothesesPerCycle": 60,
     "maxProofAgeDays": 7
   },
   "cadence": {
@@ -96,9 +106,9 @@
     "allowOptions": true,
     "allowCoveredCalls": true,
     "allowSpreads": true,
-    "maxOptionPremiumPctEquity": 0.25,
-    "maxOptionPremiumUsd": 25,
-    "maxContracts": 3,
+    "maxOptionPremiumPctEquity": 0.35,
+    "maxOptionPremiumUsd": 30,
+    "maxContracts": 2,
     "minDTE": 2,
     "maxDTE": 14,
     "autoCloseDTE": 1,

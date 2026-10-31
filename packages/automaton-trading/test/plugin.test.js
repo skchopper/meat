@@ -650,6 +650,54 @@ function policyFixture(index) {
   };
 }
 
+/** Restricted paper account: margin/shorting disabled below the $2k margin minimum. */
+function restrictedInstrumentsFixture() {
+  const base = instrumentsFixture();
+  return {
+    ...base,
+    account: { ...base.account, shortingEnabled: false, marginMultiplier: 1, optionsTradingLevel: 3 },
+    effective: {
+      longStock: true,
+      shortStock: false,
+      margin: false,
+      creditOptions: true,
+      structures: ['long_stock', 'long_call', 'long_put', 'covered_call'],
+    },
+  };
+}
+
+/** Open-market cycle with skip reasons and executions. */
+function lastCycleOpenFixture() {
+  return {
+    at: '2026-01-02T00:00:00.000Z',
+    marketOpen: true,
+    tradingSkipped: false,
+    executions: 2,
+    orders: 4,
+    denied: 1,
+    errors: 0,
+    topSkipReasons: { inside_range: 27, gap_2bps: 12, no_proof: 3, stale_policy: 1 },
+    botReviews: { enabled: true, configured: true, due: 6, reviewed: 4, deferred: 2, skipped: 0, errors: 0, budgetUsd: 0.02, note: null, paused: false },
+    research: { runs: 2 },
+  };
+}
+
+/** Closed-market cycle: everything skipped, no trading. */
+function lastCycleClosedFixture() {
+  return {
+    at: '2026-01-02T00:00:00.000Z',
+    marketOpen: false,
+    tradingSkipped: true,
+    executions: 0,
+    orders: 0,
+    denied: 0,
+    errors: 0,
+    topSkipReasons: { market_closed: 30, off_hours: 5 },
+    botReviews: { enabled: true, configured: false, due: 0, reviewed: 0, deferred: 0, skipped: 30, errors: 0, budgetUsd: 0, note: null, paused: true },
+    research: null,
+  };
+}
+
 function buildStrategyMixPayload(agents) {
   const mix = {
     swing: { count: 0, families: {} },
@@ -697,7 +745,7 @@ function buildRankingsPayload(agents) {
 }
 
 /** Full 30-agent status payload, close to what GET /automaton/state returns. */
-function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings, strategyMix, engineAgents, instruments } = {}) {
+function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings, strategyMix, engineAgents, instruments, lastCycle } = {}) {
   const agents = Array.from({ length: agentCount }, (_, index) => agentFixture(index));
   const alive = agents.filter((agent) => agent.status === 'alive').length;
   const dead = agents.filter((agent) => agent.status === 'dead').length;
@@ -779,6 +827,8 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
         runs: 7,
         errors: 0,
       },
+      lastCycle: lastCycle ?? lastCycleOpenFixture(),
+      instruments: instruments ?? instrumentsFixture(),
     },
     account: {
       equityUsd: 20000,
@@ -1259,6 +1309,11 @@ test('GET /automaton/state returns the redacted 30-agent snapshot', async () => 
   assert.ok(json.agents[0].instrumentPermissions.allowedStructures.length > 0);
   assert.equal(json.agents[0].playbook.family, json.agents[0].strategy.family);
   assert.ok(Array.isArray(json.agents[1].positions));
+  // v3.1 trade diagnostics pass through unchanged.
+  assert.equal(json.engine.lastCycle.marketOpen, true);
+  assert.equal(json.engine.lastCycle.executions, 2);
+  assert.equal(json.engine.lastCycle.topSkipReasons.inside_range, 27);
+  assert.equal(json.engine.instruments.enabled, true);
   // Names + drill-down data cross the route untouched by the host.
   assert.equal(json.agents[0].name, 'Momentum AAPL');
   assert.equal(Array.isArray(json.agents[0].recentTrades), true);
@@ -3110,6 +3165,8 @@ test('pure data mapping: long/short/option positions, instrument badges, playboo
     // ---- bare payload: none of the v3.0 fields exist yet ----
     const bareStatus = buildStatusPayload({ running: true });
     delete bareStatus.instruments;
+    delete bareStatus.engine.instruments;
+    delete bareStatus.engine.lastCycle;
     for (const agent of bareStatus.agents) {
       delete agent.positions;
       delete agent.instrumentPermissions;
@@ -3124,6 +3181,143 @@ test('pure data mapping: long/short/option positions, instrument badges, playboo
     assert.equal(bareRows.every((row) => row.instrumentPolicy === null), true);
     assert.equal(helpers.summarize(bareStatus).instruments.available, false);
     assert.equal(helpers.instrumentsHeader(undefined, undefined).available, false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: last-cycle diagnostics and restricted broker capability', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+
+    // ---- last cycle: absent / closed / open (object and array skip-reason forms) ----
+    const none = helpers.lastCycleMapping(null);
+    assert.equal(none.available, false);
+    assert.equal(none.marketStateKey, 'lastCycleEmpty');
+    assert.equal(none.topSkipText, '');
+    assert.equal(helpers.lastCycleMapping(undefined).available, false);
+
+    const closed = helpers.lastCycleMapping(lastCycleClosedFixture());
+    assert.equal(closed.available, true);
+    assert.equal(closed.marketOpen, false);
+    assert.equal(closed.marketStateKey, 'marketClosed');
+    assert.equal(closed.tradingSkipped, true);
+    assert.equal(closed.executions, 0);
+    assert.equal(closed.orders, 0);
+    assert.equal(closed.hasActivity, false);
+    assert.equal(closed.topSkipReasons[0].reason, 'market_closed');
+    assert.equal(closed.topSkipReasons[0].count, 30);
+    assert.match(closed.topSkipText, /market_closed 30/);
+    assert.equal(closed.botReviews.paused, true);
+    assert.equal(closed.botReviews.skipped, 30);
+
+    const open = helpers.lastCycleMapping(lastCycleOpenFixture());
+    assert.equal(open.marketStateKey, 'marketOpen');
+    assert.equal(open.tradingSkipped, false);
+    assert.equal(open.executions, 2);
+    assert.equal(open.orders, 4);
+    assert.equal(open.denied, 1);
+    assert.equal(open.hasActivity, true);
+    assert.equal(open.topSkipReasons.length, 3, 'top skip reasons are limited to three');
+    assert.deepEqual(open.topSkipReasons.map((entry) => entry.reason), ['inside_range', 'gap_2bps', 'no_proof']);
+    assert.deepEqual(open.topSkipReasons.map((entry) => entry.count), [27, 12, 3]);
+    assert.equal(open.topSkipText, 'inside_range 27 · gap_2bps 12 · no_proof 3');
+    assert.equal(open.botReviews.due, 6);
+    assert.equal(open.botReviews.reviewed, 4);
+    assert.equal(open.botReviews.deferred, 2);
+    assert.equal(open.research.runs, 2);
+
+    const arrayReasons = helpers.lastCycleMapping({ marketOpen: true, topSkipReasons: [{ reason: 'a', count: 5 }, { reason: 'b', count: 2 }] });
+    assert.deepEqual(arrayReasons.topSkipReasons.map((entry) => entry.reason), ['a', 'b']);
+    assert.equal(helpers.lastCycleMapping({ topSkipReasons: { zero: 0 } }).topSkipText, '');
+    assert.equal(helpers.lastCycleMapping({ executions: 1 }).marketStateKey, 'marketUnknown');
+
+    // ---- restricted broker capability warning ----
+    const unknown = helpers.instrumentsCapabilityWarning(null);
+    assert.equal(unknown.show, false);
+    assert.equal(unknown.unknown, true);
+    assert.equal(helpers.instrumentsCapabilityWarning(instrumentsFixture()).show, false, 'an account with no effective caps produces no warning');
+
+    const warning = helpers.instrumentsCapabilityWarning(restrictedInstrumentsFixture());
+    assert.equal(warning.show, true);
+    assert.equal(warning.restricted, true);
+    assert.equal(warning.shortStockDisabled, true);
+    assert.equal(warning.marginDisabled, true);
+    assert.equal(warning.creditOptionsDisabled, false);
+    assert.deepEqual(warning.disabled, ['shortStock', 'margin']);
+    assert.equal(warning.longStockAvailable, true);
+    assert.equal(warning.optionsAvailable, true);
+    assert.equal(warning.account.shortingEnabled, false);
+    assert.equal(warning.account.marginMultiplier, 1);
+    assert.equal(warning.account.optionsTradingLevel, 3);
+    assert.equal(warning.unknown, false);
+
+    // ---- per-agent badge handling of restricted permissions ----
+    const fullBadges = helpers.effectiveInstrumentBadges(instrumentPermissionsFixture(2));
+    assert.equal(fullBadges.available, true);
+    assert.equal(fullBadges.badges.some((badge) => badge.key === 'short'), true);
+    assert.equal(fullBadges.badges.some((badge) => badge.key === 'margin'), true);
+    assert.deepEqual(fullBadges.disabled, []);
+
+    const restrictedBadges = helpers.effectiveInstrumentBadges({ longStock: true, shortStock: false, margin: false, longOptions: true, allowedStructures: ['long_stock', 'long_call'] });
+    assert.equal(restrictedBadges.available, true);
+    assert.equal(restrictedBadges.badges.some((badge) => badge.key === 'short'), false, 'disabled shorting omits the Short badge');
+    assert.equal(restrictedBadges.badges.some((badge) => badge.key === 'margin'), false, 'disabled margin omits the Margin badge');
+    assert.equal(restrictedBadges.badges.some((badge) => badge.key === 'stock'), true);
+    assert.equal(restrictedBadges.badges.some((badge) => badge.key === 'options'), true);
+    assert.deepEqual(restrictedBadges.disabled.map((entry) => entry.key), ['short', 'margin']);
+    assert.match(restrictedBadges.tooltip, /disabled by broker account/);
+    assert.equal(helpers.effectiveInstrumentBadges(null).available, false);
+
+    // ---- dashboard integration: restricted status + closed cycle ----
+    const restrictedStatus = buildStatusPayload({ running: true, instruments: restrictedInstrumentsFixture(), lastCycle: lastCycleClosedFixture() });
+    const summary = helpers.summarize(restrictedStatus);
+    assert.equal(summary.instruments.available, true);
+    assert.equal(summary.instruments.effective.shortStock, false);
+    assert.equal(summary.instruments.effective.margin, false);
+    assert.equal(summary.instruments.effective.creditOptions, true);
+    assert.equal(summary.instruments.effective.longStock, true);
+    assert.equal(summary.instruments.account.shortingEnabled, false);
+    assert.equal(summary.brokerCapability.show, true);
+    assert.equal(summary.brokerCapability.shortStockDisabled, true);
+    assert.equal(summary.brokerCapability.account.marginMultiplier, 1);
+    assert.equal(summary.lastCycle.available, true);
+    assert.equal(summary.lastCycle.marketStateKey, 'marketClosed');
+    assert.equal(summary.lastCycle.tradingSkipped, true);
+    assert.equal(summary.lastCycle.hasActivity, false);
+
+    const rows = helpers.buildAgentRows(restrictedStatus);
+    const restrictedRow = rows.find((row) => row.instrumentPermissions.shortStock === false);
+    assert.ok(restrictedRow, 'some bots have shorting disabled by the broker account');
+    assert.equal(restrictedRow.instrumentBadges.some((badge) => badge.key === 'short'), false);
+    assert.match(restrictedRow.instrumentTooltip, /disabled by broker account/);
+    const marginRow = rows.find((row) => row.instrumentPermissions.margin === false);
+    assert.ok(marginRow);
+    assert.equal(marginRow.instrumentBadges.some((badge) => badge.key === 'margin'), false);
+
+    // Open-cycle default fixture keeps the diagnostic line meaningful.
+    const openSummary = helpers.summarize(buildStatusPayload({ running: true }));
+    assert.equal(openSummary.lastCycle.marketStateKey, 'marketOpen');
+    assert.deepEqual(openSummary.lastCycle.topSkipReasons.map((entry) => entry.reason), ['inside_range', 'gap_2bps', 'no_proof']);
+    assert.equal(openSummary.brokerCapability.show, false);
+
+    // ---- bare payload: neither v3.1 field exists yet ----
+    const bareStatus = buildStatusPayload({ running: true });
+    delete bareStatus.engine.lastCycle;
+    delete bareStatus.engine.instruments;
+    delete bareStatus.instruments;
+    for (const agent of bareStatus.agents) {
+      delete agent.instrumentPermissions;
+      delete agent.playbook;
+    }
+    const bareSummary = helpers.summarize(bareStatus);
+    assert.equal(bareSummary.lastCycle.available, false);
+    assert.equal(bareSummary.lastCycle.marketStateKey, 'lastCycleEmpty');
+    assert.equal(bareSummary.brokerCapability.show, false);
+    assert.equal(bareSummary.brokerCapability.unknown, true);
+    assert.equal(bareSummary.instruments.effective.available, false);
+    assert.equal(helpers.buildAgentRows(bareStatus).every((row) => row.instrumentBadges.length === 0), true);
   } finally {
     loaded.restore();
   }

@@ -246,4 +246,24 @@ describe('per-bot agent brain', () => {
     assert.equal(unconfiguredRun.reviewed.length, 0);
     assert.equal(unconfigured.policy('atm-day00001'), null);
   });
+
+  it('tells the bot that long stock is fractional, shows its budget, and hides unavailable broker capabilities', () => {
+    const { brain } = makeBrain();
+    const agent = makeAgent('atm-day00001', 'Breakout AAPL', 'breakout', 'AAPL');
+    const prompt = brain._internals.buildUserPrompt({
+      agent,
+      snapshot: { cashUsd: 50, equityUsd: 50, positions: {}, trades: 0, realizedPlUsd: 0, unrealizedPlUsd: 0, marginDebtUsd: 0 },
+      spec: null,
+      prior: [],
+      market: { prices: { AAPL: 500 }, quotes: {}, marketOpen: true },
+      researchBriefing: null,
+      account: { shortingEnabled: false, marginMultiplier: 1, optionsBuyingPowerUsd: 1999, optionsTradingLevel: 3 },
+    });
+    assert.match(prompt, /TRADING_RULES:/, 'mandate/risk rules must be visible to the bot');
+    assert.match(prompt, /"fractionalLongStock":true/, 'fractional long stock capability must be explicit');
+    assert.match(prompt, /"sizeBudgetUsd":/, 'the bot must see its dollar sizing budget, not only equity');
+    assert.doesNotMatch(prompt, /"allowedStructures":\[[^\]]*covered_call/, 'credit/covered structures hidden while margin is unavailable');
+    assert.match(prompt, /"shortStock":false/, 'short stock capability must reflect the broker restriction');
+    assert.match(prompt, /"margin":false/, 'margin capability must reflect the broker restriction');
+  });
 });

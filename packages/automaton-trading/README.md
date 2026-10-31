@@ -28,6 +28,7 @@ obituary the living read.
 | Strategy taxonomy | Per-bot **strategy type** + **estimated trading interval** columns, category tabs (All / Swing · mid-long / Day · intraday with counts) and category-coloured chips |
 | Per-bot agent brains | Each bot has its own agent brain (isolated per-bot reviews): a **Bot agent** section (stance, size/risk multipliers, confidence, thesis, plan, watch list, review count, last/next review, stale warning) plus a small engine-level bridge line |
 | Multi-instrument v3.0 | Margin, short selling, long options, defined-risk spreads and covered calls: LONG/SHORT/CALL/PUT position rendering (strike, expiry, DTE, contracts, spread group), per-bot Instruments badges, Instrument playbook, policy instrument plan, and an engine header instruments/exposure line |
+| Trade diagnostics | "Last cycle" line (market state, executions/orders/errors, top-3 skip reasons, bot reviews) plus a restricted-broker capability warning (shorting/margin unavailable, account facts) that explains why bots are or are not trading |
 
 Everything is dependency-free ESM with no build step; the browser module is loaded as
 plain JavaScript (`./client`). `dsh.client.inject` orders the client half after the real
@@ -186,6 +187,28 @@ Naked short options are never allowed; `minDTE ≥ 1` (default window 2–14, au
   carry `optionsBuyingPowerUsd`, `marginMultiplier`, `shortingEnabled`,
   `optionsTradingLevel`, `marginDebtUsd`, `grossExposureUsd`, `netExposureUsd`. Every new
   field is optional, so older snapshots render the empty states.
+
+### Trade diagnostics: last cycle & restricted broker
+
+Two diagnostic rows under the engine header answer **"why are the bots (not) trading?"**:
+
+- **Last cycle** (`engine.lastCycle`): market state (open / closed / off-hours skip),
+  executions, orders, denied and error counts, the **top-3 skip reasons** with counts
+  (e.g. `inside_range 27 · gap 2bps 12 · no_proof 3`) and the bot-review counters
+  (`reviewed/due`, deferred, paused, budget note). When `engine.lastCycle` is absent the
+  panel shows a soft "no cycle data yet".
+- **Broker capability warning**: when `engine.instruments.effective.shortStock === false`
+  or `.margin === false` (e.g. the paper account is below the $2k margin minimum) an
+  informational warning row explains that **shorting/margin are unavailable while long
+  stock and long options remain available**, quoting the account facts
+  (`shortingEnabled`, `marginMultiplier`, `optionsTradingLevel`). If `effective` is absent
+  no warning is shown — the panel never invents restrictions.
+- **Per-agent badges** honor the same restrictions: when an agent's
+  `instrumentPermissions.shortStock`/`margin` is `false` the Short/Margin badge is omitted
+  and the tooltip says "disabled by broker account" (the remaining structures stay).
+- The pure helpers `lastCycleMapping`, `instrumentsCapabilityWarning` and
+  `effectiveInstrumentBadges` back these rows and are exported for tests; every field is
+  optional and a bare/older snapshot renders the empty states.
 
 ### Research sidecar — isolated hourly analyst
 
@@ -367,6 +390,13 @@ so the new client module + routes load), verify:
     instrument plan (prefer + premium/contracts/DTE caps); with an engine that has no
     v3.0 fields yet the panel shows the soft "instrument status not reported yet" /
     "no instrument permissions yet" / "no instrument playbook" empty states.
+14. Trade diagnostics: the header shows a **Last cycle** line (market state,
+    executions/orders/errors, top-3 skip reasons, bot-review counters) and, when the paper
+    account is restricted, a broker capability warning explaining that shorting/margin are
+    unavailable while long stock/options remain; an agent whose permissions disable
+    shorting/margin shows no Short/Margin badge and a "disabled by broker account"
+    tooltip. With an older engine (no `lastCycle`/`effective`) the panel shows "no cycle
+    data yet" and no warning.
 
 ## Configuration
 
@@ -496,7 +526,8 @@ research/reward settings + the operator-only Reaper stop helper; passes `ranking
 `strategyMix`, `instruments`, `rewards` and `engine.agents` through from the engine
 status), `client.js` (shared dashboard: sidebar entry + keyed `main` panel + settings
 page; names/genome-vs-spec/holdings/activity/research/cadence/rewards/leaderboards/plan/
-transactions/strategy-type/bot-agent-policy/instrument-positions/playbook mapping are
-pure functions exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata),
-`icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the core project).
+transactions/strategy-type/bot-agent-policy/instrument-positions/playbook/last-cycle/
+capability mapping are pure functions exported as `helpers` for tests), `locale/{en,zh}.json`
+(plugin metadata), `icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the
+core project).
 

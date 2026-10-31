@@ -1,6 +1,6 @@
 {
   "name": "@local/automaton-trading",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "displayName": "MEAT — Mortality Engineered Auto-Trading",

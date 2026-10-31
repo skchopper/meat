@@ -70,10 +70,16 @@ const SYSTEM_PROMPT = [
   ' "instrument": {"prefer": "auto"|"long_stock"|"short_stock"|one of the provided structures,',
   '   "maxPremiumUsd": number<=cap or null, "maxContracts": integer<=cap or null,',
   '   "dteMin": integer within provided window or null, "dteMax": integer within window or null}}',
-  'Rules: stand_down = do not open new positions (risk-reducing; exits still allowed);',
-  'cautious = reduce size and prefer capital preservation; trade = normal execution.',
+  'Rules: stand_down = do not open new positions (exits still allowed); cautious = reduce size but',
+  'stay willing to trade when the edge is real; trade = normal execution.',
+  'CRITICAL: LONG STOCK CAN BE FRACTIONAL. A high share price is NEVER a reason to stand_down: the',
+  'executor sizes entries from sizeBudgetUsd, so a $500 stock can be bought with $5. If no option',
+  'contract fits the premium budget, the executor falls back to fractional long stock — do not block',
+  'that fallback. Use stand_down ONLY for weak/conflicting evidence or unacceptable risk, never',
+  'because one whole share/contract is unaffordable, because a quote is stale, or because the market',
+  'is closed (the engine already pauses off-session).',
   'Use "auto" to let the deterministic family playbook choose. Never invent structures that were',
-  'not offered. If the market is closed, prefer a cautious/trade stance without forcing action.',
+  'not offered.',
 ].join(' ');
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -186,7 +192,10 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     if (isPlainObject(saved?.agents)) {
       for (const [agentId, entry] of Object.entries(saved.agents)) {
         perAgent.set(agentId, {
-          lastReviewAt: numberOrNull(entry?.lastReviewAt) ?? 0,
+          // Policies survive for the dashboard, but every process start re-reviews the population:
+          // an old stand_down decision must not silently block entries for up to an hour after a
+          // restart while the market has moved on. Reviews are cheap and capped per cycle.
+          lastReviewAt: 0,
           policy: isPlainObject(entry?.policy) ? entry.policy : null,
           reviewCount: Math.max(0, Math.trunc(numberOrNull(entry?.reviewCount) ?? 0)),
         });
@@ -234,7 +243,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     }
   }
 
-  function buildUserPrompt({ agent, snapshot, spec, prior, market, researchBriefing }) {
+  function buildUserPrompt({ agent, snapshot, spec, prior, market, researchBriefing, account }) {
     const type = strategyTypeForFamily(agent?.genome?.family);
     const symbol = String(spec?.symbol ?? agent?.genome?.symbol ?? '').toUpperCase();
     const marketView = isPlainObject(market) ? market : {};
@@ -244,14 +253,38 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     const playbook = playbookForFamily(agent?.genome?.family);
     const equityUsd = numberOrNull(snapshot?.equityUsd);
     const premiumBudget = optionPremiumBudget({ config, equityUsd, mandateMaxUsd: null });
+    const risk = config?.risk ?? {};
+    const maxOrderCap = Number.isFinite(Number(risk.maxOrderNotionalUsd)) ? Number(risk.maxOrderNotionalUsd) : null;
+    const pctCap = Number(risk.maxOrderPctOfEquity ?? 0.5) * (equityUsd ?? 0);
+    const sizeBudgetUsd = round2(Math.max(0, Math.min(maxOrderCap ?? pctCap, pctCap)));
+    const accountCaps = isPlainObject(account) ? account : {};
+    const brokerMarginUnavailable = Number.isFinite(Number(accountCaps.marginMultiplier))
+      && Number(accountCaps.marginMultiplier) <= 1;
+    const creditStructures = ['covered_call', 'call_credit_spread', 'put_credit_spread'];
+    const allowedStructures = (permissions.allowedStructures ?? []).filter((structure) => (
+      !brokerMarginUnavailable || !creditStructures.includes(structure)
+    ));
+    const tradingRules = {
+      fractionalLongStock: true,
+      minOrderNotionalUsd: Number(risk.minOrderNotionalUsd) || 1,
+      sizeBudgetUsd,
+      maxOrderNotionalUsd: maxOrderCap,
+      shortStockWholeSharesOnly: true,
+      shortingEnabledByBroker: accountCaps.shortingEnabled ?? null,
+      marginMultiplier: accountCaps.marginMultiplier ?? null,
+      optionsBuyingPowerUsd: accountCaps.optionsBuyingPowerUsd ?? null,
+      optionsTradingLevel: accountCaps.optionsTradingLevel ?? null,
+      marketOpen: marketView.marketOpen ?? null,
+    };
     const instrumentContext = {
       enabled: permissions.enabled,
-      allowedStructures: permissions.allowedStructures,
-      shortStock: permissions.shortStock,
-      margin: permissions.margin,
-      coveredCalls: permissions.coveredCalls,
-      spreads: permissions.spreads,
+      allowedStructures,
+      shortStock: permissions.shortStock && accountCaps.shortingEnabled !== false,
+      margin: permissions.margin && !brokerMarginUnavailable,
+      coveredCalls: permissions.coveredCalls && !brokerMarginUnavailable,
+      spreads: permissions.spreads && allowedStructures.some((structure) => structure.endsWith('_spread')),
       optionBudgetUsd: premiumBudget,
+      optionContractCostHint: '1 contract costs premium x 100',
       maxContracts: config?.instruments?.maxContracts ?? null,
       dteWindow: [config?.instruments?.minDTE ?? 2, config?.instruments?.maxDTE ?? 14],
       playbook: { bullish: playbook.bullish, bearish: playbook.bearish, neutral: playbook.neutral, summary: playbook.summary },
@@ -261,6 +294,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
       `STRATEGY: ${type.typeLabel} on ${symbol || 'n/a'} (family ${agent?.genome?.family ?? 'unknown'})`,
       `GENOME: ${JSON.stringify(agent?.genome ?? {})}`,
       spec ? `ACTIVE_SPEC: ${JSON.stringify({ symbol: spec.symbol, family: spec.family, params: spec.params ?? {} })}` : 'ACTIVE_SPEC: none compiled yet',
+      `TRADING_RULES: ${JSON.stringify(tradingRules)}`,
       `INSTRUMENT_CONTEXT: ${JSON.stringify(instrumentContext)}`,
       `BOOK: ${JSON.stringify({
         cashUsd: snapshot ? round2(snapshot.cashUsd) : null,
@@ -295,7 +329,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
    * @param {number} nowMs
    * @param {{market?: object}} context
    */
-  async function reviewOne(agent, nowMs, { market } = {}) {
+  async function reviewOne(agent, nowMs, { market, account } = {}) {
     const outcome = { agentId: agent.id, stance: null, sizeMultiplier: null, confidence: null, costUsd: 0, error: null };
     const type = strategyTypeForFamily(agent?.genome?.family);
     const reviewSec = reviewSecFor(agent);
@@ -317,7 +351,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
       researchBriefing = null;
     }
     const prior = await readOwnPrior(agent.id);
-    const baseUser = buildUserPrompt({ agent, snapshot, spec, prior, market, researchBriefing });
+    const baseUser = buildUserPrompt({ agent, snapshot, spec, prior, market, researchBriefing, account });
     let policy = null;
     let lastFailure = null;
     let usage = null;
@@ -414,7 +448,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
   }
 
   /** One review pass (called once per engine cycle; only due bots are reviewed). */
-  async function tick({ market } = {}) {
+  async function tick({ market, account } = {}) {
     await init();
     const nowMs = currentClock.now();
     if (!enabled || !configured) {
@@ -444,7 +478,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     const reviewed = [];
     for (const agent of batch) {
       // eslint-disable-next-line no-await-in-loop
-      reviewed.push(await reviewOne(agent, currentClock.now(), { market }));
+      reviewed.push(await reviewOne(agent, currentClock.now(), { market, account }));
     }
     await saveState();
     return {

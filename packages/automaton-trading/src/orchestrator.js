@@ -328,6 +328,10 @@ export async function createAutomaton(options = {}) {
    */
   async function ensureSpec(agent, hypotheses, cycleBudgetUsd, usedPairs = new Set()) {
     const cached = agent.specId ? state.specs.get(agent.specId) : null;
+    const genome = genomeForSpec(agent);
+    const specMatchesGenome = (candidate) => Boolean(
+      candidate && (!genome || (candidate.symbol === genome.symbol && candidate.family === genome.family)),
+    );
     if (cached) {
       // A spec is executable only while its proof is fresh. Recompile from this cycle's
       // hypotheses when the proof has aged past half of maxProofAgeDays, but never
@@ -339,21 +343,25 @@ export async function createAutomaton(options = {}) {
       );
       const book = ledger.book?.(agent.id);
       const hasPosition = Boolean(book && Object.keys(book.positions ?? {}).length > 0);
-      if (!Number.isFinite(proofAgeMs) || proofAgeMs <= maxSpecAgeMs || hasPosition) {
-        return { spec: cached, cached: true };
+      // A cached spec compiled from an unrelated family/symbol is not this bot's strategy: drop it
+      // and recompile from the genome unless a position opened under it still needs managing.
+      if (specMatchesGenome(cached) || hasPosition) {
+        if (!Number.isFinite(proofAgeMs) || proofAgeMs <= maxSpecAgeMs || hasPosition) {
+          return { spec: cached, cached: true };
+        }
       }
     }
     const ranked = [...(hypotheses ?? [])].sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
     if (ranked.length === 0) return null;
-    const genome = genomeForSpec(agent);
     const pairKey = (hypothesis) => `${hypothesis.symbol}:${hypothesis.family}`;
     const exact = ranked.find((h) => h.symbol === genome?.symbol && h.family === genome?.family);
-    // Prefer a proven pair NO other agent is using before falling back to the same family:
-    // with 30 agents and ~22 proven hypotheses this spreads the population across as many
-    // distinct strategies as the data actually supports instead of piling onto one symbol.
-    const unused = ranked.find((h) => !usedPairs.has(pairKey(h)));
+    // Stay coherent with the agent's inherited strategy: exact genome pair first, then another
+    // symbol of the SAME family. Never compile an unrelated strategy into this bot (the old
+    // "unused pair"/"top ranked" fallbacks caused Momentum F to trade AMD breakout setups).
+    const sameFamilyUnused = ranked.find((h) => h.family === genome?.family && !usedPairs.has(pairKey(h)));
     const sameFamily = ranked.find((h) => h.family === genome?.family);
-    const match = exact ?? unused ?? sameFamily ?? ranked[0];
+    const match = exact ?? sameFamilyUnused ?? sameFamily ?? null;
+    if (!match) return { __noMatch: true };
     usedPairs.add(pairKey(match));
     try {
       const compiled = await builder.compile({
@@ -364,6 +372,9 @@ export async function createAutomaton(options = {}) {
       });
       const spec = compiled?.spec ?? compiled;
       if (!spec || !spec.specId) return null;
+      // Builder may still derive from the hypothesis; reject unrelated results rather than
+      // silently trading a different strategy.
+      if (!specMatchesGenome(spec)) return { __noMatch: true };
       await ensureDir(paths.specsDir);
       await writeJsonAtomic(path.join(paths.specsDir, `${spec.specId}.json`), spec);
       state.specs.set(spec.specId, spec);
@@ -592,10 +603,11 @@ export async function createAutomaton(options = {}) {
   }
 
   /**
-   * One-time capital top-up when the operator raises `endowmentUsd` (v3.0: bots moved from $20 to
-   * $50 so margin/short/option tools are usable). Credits the difference to each alive bot's own
-   * ledger, bounded by the account allocation cap, and updates the bot's endowment basis (so the
-   * top-up is not counted as trading profit). Idempotent: no deficit → no credit.
+   * One-time capital top-up when the operator raises `endowmentUsd` (v3: bots moved from $20 to
+   * $50 so short/option/margin tools are usable). The extra capital is REALLOCATED from the
+   * unallocated treasury pool, never created: sum(bot equity) + pool must stay equal to broker
+   * equity or the Treasurer's reconciliation halts the population. Updates the bot's endowment
+   * basis too (so the top-up is not counted as trading profit). Idempotent: no deficit → no move.
    */
   async function capitalizePopulation(accountEquityUsd) {
     const target = Math.max(0, Number(config.endowmentUsd) || 0);
@@ -605,14 +617,25 @@ export async function createAutomaton(options = {}) {
       .map((agent) => ({ agent, deficit: round2(target - (Number(agent.endowmentUsd) || 0)) }))
       .filter((entry) => entry.deficit > 0.009);
     if (!deficits.length) return;
-    if (typeof ledger.credit !== 'function') {
-      log.warn('capital top-up skipped: ledger.credit() not available');
+    if (typeof ledger.transfer !== 'function' || typeof ledger.anchorToBrokerEquity !== 'function') {
+      log.warn('capital top-up skipped: ledger transfer/anchor API not available');
       return;
     }
-    const cap = Math.max(0, Number(accountEquityUsd) || 0) * Number(config.account?.allocationCapPct ?? 0.8);
-    const allocated = alive.reduce((sum, agent) => sum + (Number(agent.endowmentUsd) || 0), 0);
-    const available = Math.max(0, cap - allocated);
+    const accountEquity = Math.max(0, Number(accountEquityUsd) || 0);
+    if (!(accountEquity > 0)) return;
+    // The pool only exists after the broker-equity anchor; do it here so the top-up can move money
+    // from the unallocated side instead of minting virtual cash.
+    if (typeof ledger.isAnchored === 'function' && !ledger.isAnchored()) {
+      try {
+        ledger.anchorToBrokerEquity(accountEquity);
+      } catch {
+        /* fall through: pool() returns zero and no top-up happens */
+      }
+    }
+    const cap = accountEquity * Number(config.account?.allocationCapPct ?? 0.8);
+    const pool = typeof ledger.pool === 'function' ? ledger.pool() : { poolUsd: 0, allocatedUsd: 0 };
     const totalDeficit = deficits.reduce((sum, entry) => sum + entry.deficit, 0);
+    const available = Math.max(0, Math.min(cap - Number(pool.allocatedUsd || 0), Number(pool.poolUsd || 0)));
     const budget = Math.min(totalDeficit, available);
     if (!(budget > 0)) return;
     const scale = budget / totalDeficit;
@@ -623,8 +646,7 @@ export async function createAutomaton(options = {}) {
       if (!(amount > 0)) continue;
       try {
         // eslint-disable-next-line no-await-in-loop
-        await ledger.credit(agent.id, amount, {
-          category: 'capital',
+        ledger.transfer('__treasury__', agent.id, amount, {
           reason: 'v3.0 capital top-up',
           at: clock.now(),
         });
@@ -639,7 +661,44 @@ export async function createAutomaton(options = {}) {
     if (changed > 0) {
       await ledger.save();
       await registry.save();
-      log.info('capital top-up credited', { agents: changed, creditedUsd: credited, targetEndowmentUsd: target });
+      log.info('capital reallocated from treasury pool', { agents: changed, creditedUsd: credited, targetEndowmentUsd: target });
+    }
+  }
+
+  /**
+   * One-time v3.1 cleanup: bots whose cached spec was compiled from an unrelated family/symbol
+   * (the old builder fallback could put "Momentum F" on an AMD breakout spec) get their specId
+   * cleared so the next due evaluation recompiles a coherent strategy. Agents holding a position
+   * keep their opening spec so the exit rules continue to match the trade.
+   */
+  async function alignSpecsToGenomes() {
+    const alive = registry.alive();
+    let changed = 0;
+    for (const agent of alive) {
+      if (!agent.specId) continue;
+      const spec = state.specs.get(agent.specId);
+      const genome = agent.genome;
+      if (!spec || !genome) continue;
+      if (spec.symbol === genome.symbol && spec.family === genome.family) continue;
+      let hasPosition = false;
+      try {
+        const book = ledger.book?.(agent.id);
+        hasPosition = Boolean(book && Object.keys(book.positions ?? {}).length > 0);
+      } catch {
+        hasPosition = false;
+      }
+      if (hasPosition) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await registry.update(agent.id, { specId: null });
+        changed += 1;
+      } catch {
+        /* immutable/dead record */
+      }
+    }
+    if (changed > 0) {
+      await registry.save();
+      log.info('misaligned strategy specs cleared', { count: changed });
     }
   }
 
@@ -671,6 +730,7 @@ export async function createAutomaton(options = {}) {
     await rebalanceStrategyMix();
     await introduceAffordableSymbols();
     await capitalizePopulation(Number(account?.equityUsd) || 0);
+    await alignSpecsToGenomes();
     state.initialized = true;
     const snapshot = await buildSnapshot({ account, treasury: null, halted: false, haltReasons: [] });
     await writeStateFile(snapshot);
@@ -984,6 +1044,12 @@ export async function createAutomaton(options = {}) {
             trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_hypothesis' });
             continue;
           }
+          if (built.__noMatch) {
+            // No hypothesis for this bot's own strategy family/symbol this cycle. Wait for a
+            // coherent setup instead of trading a different bot's strategy.
+            trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_matching_hypothesis' });
+            continue;
+          }
           if (built.__compileError) {
             trace.builds.push({ agentId: agent.id, specId: null, error: built.__compileError.code, hypothesisId: built.hypothesisId });
             continue;
@@ -1144,6 +1210,9 @@ export async function createAutomaton(options = {}) {
       try {
         const agentRun = await botAgents.tick({
           market: { prices: state.lastPrices ?? {}, quotes: state.lastQuotes ?? {}, marketOpen },
+          // Broker capability facts: the bot agent needs to know fractional long stock is always
+          // allowed and that shorts/margin may be disabled by the paper account itself.
+          account: treasuryView?.account ?? null,
         });
         trace.agents = {
           enabled: agentRun.enabled,
@@ -1436,8 +1505,11 @@ export async function createAutomaton(options = {}) {
           cadence,
         }),
         // Instrument permissions + family playbook (multi-instrument paper trading, v3.0).
-        instrumentPermissions: agentInstrumentPermissions(config, agent),
-        playbook: playbookView(agent?.genome?.family, agentInstrumentPermissions(config, agent)),
+        instrumentPermissions: { ...agentInstrumentPermissions(config, agent), ...(view?.instruments ?? {}) },
+        playbook: playbookView(
+          agent?.genome?.family,
+          { ...agentInstrumentPermissions(config, agent), ...(view?.instruments ?? {}) },
+        ),
         // This bot's own agent brain: latest review policy, review count, next review time.
         policy: botAgents.status(agent.id),
         // Strategy explanation + current plan/next step for the detail page.
@@ -1508,9 +1580,52 @@ export async function createAutomaton(options = {}) {
                 }
               : null,
             treasury: t.instruments ?? null,
+            // What the broker can actually do right now (the paper account can be restricted below
+            // the margin minimum; mandates already intersect with these facts).
+            effective: (() => {
+              const shorting = acct.shortingEnabled ?? acct.shorting_enabled ?? null;
+              const marginMultiplier = num(acct.marginMultiplier ?? acct.margin_multiplier);
+              const marginUnavailable = marginMultiplier !== null && marginMultiplier <= 1;
+              const creditStructures = ['covered_call', 'call_credit_spread', 'put_credit_spread'];
+              return {
+                longStock: true,
+                shortStock: permissions.shortStock && shorting !== false,
+                margin: permissions.margin && !marginUnavailable,
+                creditOptions: permissions.shortOptions && !marginUnavailable,
+                structures: permissions.allowedStructures.filter((structure) => (
+                  !marginUnavailable || !creditStructures.includes(structure)
+                )),
+              };
+            })(),
             playbooks: Object.fromEntries(
               ['momentum', 'meanrev', 'breakout', 'gapfade'].map((family) => [family, playbookView(family, permissions)]),
             ),
+          };
+        })(),
+        lastCycle: (() => {
+          const trace = state.lastTrace;
+          if (!trace) return null;
+          const executions = trace.executions ?? [];
+          const reasons = {};
+          for (const execution of executions) {
+            for (const detail of execution.detail ?? []) {
+              if (detail.reason) reasons[detail.reason] = (reasons[detail.reason] ?? 0) + 1;
+            }
+            if (execution.skipped) reasons[`skipped:${execution.skipped}`] = (reasons[`skipped:${execution.skipped}`] ?? 0) + 1;
+          }
+          return {
+            at: trace.at ?? state.lastTickAt,
+            marketOpen: trace.marketOpen ?? null,
+            tradingSkipped: trace.tradingSkipped === true,
+            executions: executions.length,
+            orders: executions.reduce((sum, entry) => sum + (entry.orders ?? 0), 0),
+            denied: executions.reduce((sum, entry) => sum + (entry.denied ?? 0), 0),
+            errors: (trace.errors ?? []).length,
+            topSkipReasons: Object.fromEntries(
+              Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 10),
+            ),
+            botReviews: trace.agents ?? null,
+            research: trace.research ?? null,
           };
         })(),
         rewards: rewardsView,
