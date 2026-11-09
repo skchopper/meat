@@ -31,6 +31,8 @@ export const inject = ['tools'];
 
 const PLUGIN_ID = 'automaton-trading';
 const ROUTE_PATH = '/automaton/state';
+/** Live market/portfolio view used by the analytics dashboard. */
+const MARKET_PATH = '/automaton/market';
 /** Operator-only control route used by the dashboard (loopback only). */
 const CONTROL_PATH = '/automaton/control';
 /** Whitelisted control actions; anything else is a 400. */
@@ -648,6 +650,68 @@ async function buildState(holder, row) {
     config: summary,
   };
   return redactSecrets(snapshot);
+}
+
+/**
+ * GET /automaton/market — live analytics view for the dashboard (quotes, sparklines,
+ * portfolio, agent live P&L, equity history). Delegates to `engine.marketView()`
+ * defensively: a missing/failing view is a structured 503, never a crash and never secrets.
+ */
+function createMarketHandler(holder, row, log) {
+  return async function marketHandler(req, res) {
+    const send = (statusCode, body) => {
+      try {
+        res.statusCode = statusCode;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('x-content-type-options', 'nosniff');
+        res.end(JSON.stringify(body));
+      } catch (error) {
+        log.warn('failed to write /automaton/market response', safeError(error));
+      }
+    };
+    const method = String(req?.method ?? 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      send(405, failure(httpError('METHOD_NOT_ALLOWED', 'GET only')));
+      return;
+    }
+    if (!isLoopbackRequest(req)) {
+      log.warn('rejected non-loopback automaton market request');
+      send(403, failure(httpError('FORBIDDEN', 'automaton market view is loopback-only: the request did not arrive over a local connection')));
+      return;
+    }
+    try {
+      const engine = await holder.getEngine();
+      if (!engine || typeof engine.marketView !== 'function') {
+        send(503, failure(httpError('MARKET_UNAVAILABLE', 'engine.marketView() is not available in this build')));
+        return;
+      }
+      const view = await engine.marketView();
+      if (!view || view.ok === false) {
+        send(503, failure(httpError('MARKET_UNAVAILABLE', view?.error?.message ?? 'market view unavailable', view?.error)));
+        return;
+      }
+      const payload = redactSecrets({
+        ...view,
+        ok: true,
+        at: view.at ?? new Date().toISOString(),
+        route: MARKET_PATH,
+        loopbackOnly: true,
+        mode: view.mode ?? row.mode,
+      });
+      if (method === 'HEAD') {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end();
+        return;
+      }
+      send(200, payload);
+    } catch (error) {
+      log.warn('market view failed', safeError(error));
+      send(503, failure(error));
+    }
+  };
 }
 
 /** GET /automaton/state — same redacted snapshot the panel polls. */
@@ -1571,11 +1635,16 @@ export function apply(ctx, config) {
             }),
             webServer.register({
               kind: 'exact',
+              path: MARKET_PATH,
+              handler: createMarketHandler(holder, row, log),
+            }),
+            webServer.register({
+              kind: 'exact',
               path: CONTROL_PATH,
               handler: createControlHandler(holder, row, log),
             }),
           ];
-          log.info(`routes registered: ${ROUTE_PATH}, ${CONTROL_PATH}`);
+          log.info(`routes registered: ${ROUTE_PATH}, ${MARKET_PATH}, ${CONTROL_PATH}`);
         } catch (error) {
           log.warn('route registration failed', safeError(error));
         }
@@ -1602,7 +1671,7 @@ export function apply(ctx, config) {
         }
       }
     };
-  }, `${PLUGIN_ID}: routes (${ROUTE_PATH}, ${CONTROL_PATH})`);
+  }, `${PLUGIN_ID}: routes (${ROUTE_PATH}, ${MARKET_PATH}, ${CONTROL_PATH})`);
 
   ctx.effect(() => () => holder.dispose(), `${PLUGIN_ID}: engine`);
 
@@ -1638,6 +1707,7 @@ export const TOOL_NAMES = Object.freeze([
 // research bridge builder (the research sidecar seam; returns null when no LLM exists).
 export {
   ROUTE_PATH,
+  MARKET_PATH,
   CONTROL_PATH,
   stopReaperOperator,
   createResearchBridge,

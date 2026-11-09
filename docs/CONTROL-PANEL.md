@@ -101,10 +101,14 @@ engine: {
 strategyMix: {
   swing: {label, count, families:{momentum, meanrev}},
   day:   {label, count, families:{breakout, gapfade}},
-  total
+  total,
+  target: {dayPct, dayCount, swingCount}   // v3.2 70/30 target
 },
 agents: [{
   ...existing,
+  symbols: [SYMBOL, ...],                    // v3.2 multi-symbol basket
+  specs: [{symbol, specId, family, params, createdAt}], // one spec per basket symbol
+  spec: {symbol, specId, family, params} | null,       // primary-symbol spec only
   strategy: {family, category, tier, typeLabel, className, description,
              categoryLabel, estimatedIntervalSec, timeframe, reviewSec},
   instrumentPermissions: {longStock, shortStock, longOptions, shortOptions, coveredCalls, spreads,
@@ -142,6 +146,30 @@ rankings: {
 },
 rewards: { ...engine.rewards, history: [{periodKey, period, at, winners:[{rank, agentId, name, percent, amountUsd}]}] }
 ```
+
+## Real-time market route (v3.2)
+
+`engine.marketView()` backs a loopback-only **`GET /automaton/market`** route (GET/HEAD; redacted;
+503 structured fallback when unavailable; no new tools/control actions):
+
+```js
+{
+  ok, at, marketOpen,
+  quotes: {SYM: {priceUsd, bid, ask, changeUsd, changePct, openUsd, highUsd, lowUsd,
+                 prevCloseUsd, volume, ts, stale, simulated?}},
+  sparklines: {SYM: [closes...]},            // last ~60 1-minute closes
+  portfolio: {equityUsd, cashUsd, buyingPowerUsd, dayPnlUsd, dayPnlPct,
+              grossExposureUsd, netExposureUsd, positions},
+  agents: [{id, name, tier, strategy, basket, equityUsd, dayPnlPct, positions, stance}],
+  engine: {running, marketOpen, lastCycle, research, agents, halted, haltReasons},
+  equityHistory: [{at, equityUsd, cashUsd}],  // in-memory, up to 240 points
+  error: null | {code, message}
+}
+```
+
+`engine.portfolio` in the state snapshot carries the v3.2 config (`basketSize*`,
+`maxOpenPositions*`, `maxOrdersPerCycle`, `strategyMix.dayPct`). The panel polls state every 5 s and
+market every 2 s, pauses when hidden/paused, and falls back to state-only rendering when unavailable.
 
 ## Rankings module (market teammate, `src/rankings.js`)
 

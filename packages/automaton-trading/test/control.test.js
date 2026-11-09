@@ -758,3 +758,72 @@ describe('capital top-up for multi-instrument paper trading', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// v3.2: 70/30 day/swing population + multi-symbol baskets
+// ---------------------------------------------------------------------------
+
+describe('v3.2 strategy mix and basket portfolios', () => {
+  it('seeds 70% day bots with multi-symbol baskets and per-symbol specs', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-v32mix-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-30T15:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 10, cap: 20 },
+          strategyMix: { dayPct: 0.7 },
+          portfolio: { basketSizeDay: 4, basketSizeSwing: 3, maxOpenPositionsDay: 5, maxOpenPositionsSwing: 3, maxOrdersPerCycle: 2 },
+          risk: { maxOpenPositions: 6 },
+          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120, maxHypothesesPerCycle: 60 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+          agents: { enabled: false },
+        },
+      }).config;
+      const broker = createSimBroker(config, { seed: 23, accountEquityUsd: 100000 });
+      const automaton = await createAutomaton({ config, broker, clock });
+      await automaton.init();
+      const status = await automaton.status();
+      assert.equal(status.strategyMix.total, 10);
+      assert.equal(status.strategyMix.day.count, 7, '70% of 10 bots should be day/intraday');
+      assert.equal(status.strategyMix.swing.count, 3);
+      assert.equal(status.strategyMix.target.dayPct, 0.7);
+      const day = status.agents.filter((agent) => agent.tier === 'day');
+      const swing = status.agents.filter((agent) => agent.tier === 'swing');
+      assert.equal(day.length, 7);
+      assert.equal(swing.length, 3);
+      for (const agent of day) {
+        assert.equal(agent.symbols.length, 4, 'day bots manage a 4-symbol basket');
+        assert.equal(new Set(agent.symbols).size, agent.symbols.length, 'basket symbols are unique');
+        for (const symbol of agent.symbols) assert.ok(config.symbols.includes(symbol));
+      }
+      for (const agent of swing) {
+        assert.equal(agent.symbols.length, 3, 'swing bots manage a 3-symbol basket');
+      }
+      assert.equal(status.engine.portfolio.strategyMix.dayPct, 0.7);
+      assert.equal(status.engine.portfolio.basketSizeDay, 4);
+
+      await automaton.tick();
+      const after = await automaton.status();
+      const withSpecs = after.agents.filter((agent) => (agent.specs ?? []).length > 0);
+      assert.ok(withSpecs.length >= 1, 'at least one basket spec should compile from the proven hypotheses');
+      for (const agent of after.agents) {
+        for (const spec of agent.specs ?? []) {
+          assert.equal(spec.family, agent.genome.family, 'every basket spec uses the bot family');
+          assert.ok(agent.symbols.includes(spec.symbol), 'every spec symbol belongs to the basket');
+        }
+        if (agent.spec) {
+          assert.equal(agent.spec.family, agent.genome.family);
+          assert.equal(agent.spec.symbol, agent.genome.symbol, 'primary spec view stays tied to the primary symbol');
+        }
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

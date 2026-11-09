@@ -626,8 +626,19 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   return {
     /**
      * Run one execution cycle for one agent.
+     *
+     * Accepts BOTH the legacy single `spec` and (v3.2 multi-symbol portfolio) a `specs`
+     * basket array plus `portfolio` caps:
+     *   - legacy `spec` only  -> byte-for-byte the old single-symbol behaviour;
+     *   - `specs` array       -> exits manage ALL held positions using the spec whose
+     *                            symbol matches the position's underlying (fallback
+     *                            primary), entries iterate the basket with per-symbol
+     *                            signals, one order per symbol per run, capped by
+     *                            `portfolio.maxOpenPositions` / `maxOrdersPerCycle`.
+     *
      * @param {{
-     *   agent: object, spec: object, mandate: object,
+     *   agent: object, spec?: object, specs?: Array<object>, mandate: object,
+     *   portfolio?: {maxOpenPositions?: number, maxOrdersPerCycle?: number},
      *   quotes?: Record<string, {bid?:number, ask?:number, last?:number, ts?:number}>,
      *   bars?: Record<string, Array<object>>|Array<object>,
      *   dayStats?: object, now?: number|string|Date,
@@ -638,15 +649,44 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      * @returns {Promise<{agentId:string, actions:Array<object>, orders:Array<object>,
      *           denied:Array<{code:string, reason:string}>, spentUsd:number}>}
      */
-    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, policy, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
+    async run({ agent, spec: specInput, specs, portfolio, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, policy, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
       const atMs = normalizeNow(nowInput, now);
       const at = new Date(atMs).toISOString();
+      // --- spec normalization: legacy single spec OR multi-symbol basket ---------
+      const basketSpecs = Array.isArray(specs)
+        ? specs.filter((entry) => entry && typeof entry === 'object' && typeof entry.symbol === 'string' && entry.symbol.trim() !== '')
+        : [];
+      const primarySpec = specInput && typeof specInput === 'object'
+        ? specInput
+        : basketSpecs[0] ?? null;
+      /** Primary/legacy spec; the rest of the function keeps using `spec` for it. */
+      const spec = primarySpec;
+      const specsBySymbol = new Map();
+      for (const entrySpec of basketSpecs) {
+        const key = String(entrySpec.symbol).toUpperCase();
+        if (!specsBySymbol.has(key)) specsBySymbol.set(key, entrySpec);
+      }
+      const specForSymbol = (symbol) => {
+        const key = String(symbol ?? '').toUpperCase();
+        return specsBySymbol.get(key) ?? spec;
+      };
       const agentId = String(agent?.id ?? agent?.agentId ?? spec?.agentId ?? '');
       // Per-tier cadence: a bot's tier timeframe overrides the global data timeframe so bar
       // windows and hold rules are evaluated on the cadence the operator assigned to it.
       const timeframe = runTimeframe ?? defaultTimeframe;
+      // v3.2 portfolio caps (caller supplies them from config.portfolio; absent = legacy).
+      const portfolioOrderCap = numberOrNull(portfolio?.maxOrdersPerCycle);
+      const runMaxOrders = portfolioOrderCap !== null && portfolioOrderCap > 0
+        ? Math.trunc(portfolioOrderCap)
+        : maxOrdersPerCycle;
+      const portfolioOpenCap = numberOrNull(portfolio?.maxOpenPositions);
+      const maxOpenPositions = portfolioOpenCap !== null && portfolioOpenCap > 0
+        ? Math.trunc(portfolioOpenCap)
+        : Infinity;
       /** @type {{agentId:string, actions:Array<object>, orders:Array<object>, denied:Array<object>, spentUsd:number}} */
       const result = { agentId, actions: [], orders: [], denied: [], spentUsd: 0 };
+      /** One order per symbol per run (an exited symbol is not re-entered in the same cycle). */
+      const runOrderedUnderlyings = new Set();
 
       const deny = (code, reason, extra = {}) => {
         result.denied.push({ code, reason, ...extra });
@@ -846,15 +886,25 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         deny('SPEC_INVALID', 'executor.run requires a compiled StrategySpec');
         return result;
       }
-      // D9: the spec must carry its proof link. The Builder stores it as the
-      // `proofRef` URL string (what the brake wall checks) with dated evidence in `proof`.
-      const proofUrl = typeof spec.proofRef === 'string'
-        ? spec.proofRef
-        : spec.proofRef?.url ?? (typeof spec.proof?.url === 'string' ? spec.proof.url : null);
-      if (typeof proofUrl !== 'string' || proofUrl.trim().length === 0) {
+      /** D9: a spec is usable only with its proof link (string URL ref). */
+      const specHasProof = (candidate) => {
+        if (!candidate || typeof candidate !== 'object') return false;
+        const url = typeof candidate.proofRef === 'string'
+          ? candidate.proofRef
+          : candidate.proofRef?.url ?? (typeof candidate.proof?.url === 'string' ? candidate.proof.url : null);
+        return typeof url === 'string' && url.trim().length > 0;
+      };
+      const proofUrl = specHasProof(spec)
+        ? (typeof spec.proofRef === 'string' ? spec.proofRef : spec.proofRef?.url ?? spec.proof?.url)
+        : null;
+      if (!proofUrl && !basketSpecs.some(specHasProof)) {
         deny('NO_PROOF', 'spec carries no dated proof reference (D9)');
         return result;
       }
+      /** Basket entries are only attempted on specs that carry their proof. */
+      const entrySpecs = basketSpecs.length > 0
+        ? basketSpecs.filter(specHasProof)
+        : (specHasProof(spec) ? [spec] : []);
       if (!mandate || typeof mandate !== 'object') {
         deny('BRAKE_DENIED', 'no Treasurer mandate for this agent');
         return result;
@@ -1339,7 +1389,8 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       }
 
       const ordersPlaced = () => result.orders.length;
-      const cycleBudgetLeft = () => maxOrdersPerCycle - ordersPlaced();
+      // One shared order budget for the whole run (exits + entries), portfolio-aware.
+      const cycleBudgetLeft = () => runMaxOrders - ordersPlaced();
 
       /**
        * Check the brakes, submit, and book the fill for one intended order.
@@ -1371,11 +1422,22 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         underlying = null,
         orderType = null,
         closing = false,
+        orderSpec = spec,
       }) {
         const isMultiLeg = orderClass === 'mleg' && Array.isArray(legs) && legs.length >= 2;
         const isOptionOrder = assetClass === 'us_option' || isMultiLeg;
         const ticker = String(symbol).toUpperCase();
         const displaySymbol = underlying ? String(underlying).toUpperCase() : ticker;
+        // D9: each order's spec must carry its proof; a basket spec without proof is not
+        // tradable (the run-level gate already rejected the all-missing case).
+        const activeProofUrl = typeof orderSpec?.proofRef === 'string'
+          ? orderSpec.proofRef
+          : orderSpec?.proofRef?.url ?? (typeof orderSpec?.proof?.url === 'string' ? orderSpec.proof.url : null);
+        if (typeof activeProofUrl !== 'string' || activeProofUrl.trim().length === 0) {
+          deny('NO_PROOF', `spec for ${displaySymbol} carries no dated proof reference (D9)`, { symbol: displaySymbol });
+          skip(displaySymbol, 'no_proof');
+          return null;
+        }
         const orderQty = isMultiLeg ? Math.max(1, Math.trunc(qty)) : round4(qty);
         if (!(orderQty > 0)) {
           skip(displaySymbol, 'qty_rounds_to_zero');
@@ -1455,7 +1517,9 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           buyingPowerUsd: numberOrNull(mandate?.buyingPowerUsd) ?? numberOrNull(mandate?.equityUsd) ?? null,
           positions: positionsSnapshot,
           mandate,
-          spec,
+          // D9 per-order proof context: the spec that owns THIS symbol's parameters.
+          spec: orderSpec,
+          ...(Array.isArray(basketSpecs) && basketSpecs.length > 1 ? { basketSpecs: basketSpecs.map((entry) => entry.specId ?? entry.symbol) } : {}),
           // D13 is enforced by the Treasurer (the only role allowed to read account
           // equity). The Executor must never obtain account equity, so it forwards a
           // mandate-provided figure when present and otherwise leaves the check to the
@@ -1497,11 +1561,12 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         }
 
         const seq = nextSeq(agentId);
-        const clientOrderId = `atm:${agentId}:${spec.specId}:${seq}`;
+        const orderSpecId = String(orderSpec?.specId ?? spec.specId ?? 'spec');
+        const clientOrderId = `atm:${agentId}:${orderSpecId}:${seq}`;
         // Every option order gets a durable internal group link for the ledger (spread legs
         // are opened/closed together); single-leg orders use their own group as well.
         const effectiveGroupId = isOptionOrder
-          ? String(groupId ?? `grp:${agentId}:${spec.specId}:${seq}`)
+          ? String(groupId ?? `grp:${agentId}:${orderSpecId}:${seq}`)
           : null;
         if (isOptionOrder) {
           orderInput.groupId = effectiveGroupId;
@@ -1580,6 +1645,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
             }
           : resolvedOrder;
         result.orders.push(resolvedOrder);
+        runOrderedUnderlyings.add(displaySymbol);
         let booked = { bookedQty: 0 };
         try {
           booked = await bookFilledOrder(bookableOrder);
@@ -1637,12 +1703,14 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 
       // --- shared exit/entry helpers (multi-instrument) ---------------------------
       const signalCache = new Map();
-      async function getSignalFor(underlying) {
+      async function getSignalFor(underlying, activeSpec = spec) {
         const ticker = String(underlying ?? '').toUpperCase();
-        if (signalCache.has(ticker)) return signalCache.get(ticker);
+        const specKey = activeSpec?.specId ?? activeSpec?.symbol ?? 'primary';
+        const cacheKey = `${ticker}:${specKey}`;
+        if (signalCache.has(cacheKey)) return signalCache.get(cacheKey);
         const bars = await getBars(ticker);
-        const signal = computeSignal(spec.family, bars, spec.params);
-        signalCache.set(ticker, signal);
+        const signal = computeSignal(activeSpec?.family ?? spec.family, bars, activeSpec?.params ?? spec.params);
+        signalCache.set(cacheKey, signal);
         return signal;
       }
 
@@ -1668,9 +1736,9 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         return candidates;
       }
 
-      async function enterLongStockEntry({ symbol, quote, signal, reason }) {
+      async function enterLongStockEntry({ symbol, quote, signal, reason, activeSpec = spec }) {
         const price = round4(quote.ask ?? quote.last);
-        const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        const caps = [(activeSpec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
         if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
         if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
         if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -1697,20 +1765,21 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           kind: 'entry',
           quote,
           positionsSnapshot: Object.fromEntries(positions),
+          orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
           policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
         });
         return Boolean(order);
       }
 
-      async function enterShortStockEntry({ symbol, quote, signal }) {
+      async function enterShortStockEntry({ symbol, quote, signal, activeSpec = spec }) {
         const asset = await getAssetInfo(symbol);
         if (instrumentsConfig.shortableOnly !== false && asset && (asset.shortable === false || asset.marginable === false)) {
           skip(symbol, 'asset_not_shortable');
           return false;
         }
         const price = round4(quote.bid ?? quote.last);
-        const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        const caps = [(activeSpec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
         if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
         if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
         if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -1731,13 +1800,14 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           quote,
           asset,
           positionsSnapshot: Object.fromEntries(positions),
+          orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
           policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
         });
         return Boolean(order);
       }
 
-      async function enterOptionEntry({ plan, quote, signal, direction }) {
+      async function enterOptionEntry({ plan, quote, signal, direction, activeSpec = spec }) {
         const right = optionRightForStructure(plan.structure) ?? (plan.structure.includes('put') ? 'put' : 'call');
         const primary = plan.legs[0];
         const creditStructure = plan.structure === 'covered_call'
@@ -1771,6 +1841,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           marginRequiredUsd: creditStructure && plan.orderClass === 'mleg' ? plan.maxRiskUsd : 0,
           closing: false,
           positionsSnapshot: Object.fromEntries(positions),
+          orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
           policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
         }));
@@ -1780,9 +1851,22 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       // 1) EXITS FIRST (risk-reducing orders have priority over new entries)
       // =========================================================================
       const barMs = timeframeToMs(timeframe);
-      const stopPct = spec.params?.stopPct ?? 0.02;
-      const targetPct = spec.params?.targetPct ?? 0.04;
-      const maxHoldBars = spec.params?.maxHoldBars ?? 12;
+      // v3.2: each held position is managed with the spec of ITS underlying symbol
+      // (fallback: the primary spec) so a basket bot keeps per-symbol stop/target/hold rules.
+      const primaryParams = spec.params ?? {};
+      const fallbackStopPct = numberOrNull(primaryParams.stopPct) ?? 0.02;
+      const fallbackTargetPct = numberOrNull(primaryParams.targetPct) ?? 0.04;
+      const fallbackMaxHoldBars = numberOrNull(primaryParams.maxHoldBars) ?? 12;
+      const exitParamsFor = (underlying) => {
+        const activeSpec = specForSymbol(underlying) ?? spec;
+        const params = activeSpec?.params ?? primaryParams;
+        return {
+          activeSpec,
+          stopPct: numberOrNull(params.stopPct) ?? fallbackStopPct,
+          targetPct: numberOrNull(params.targetPct) ?? fallbackTargetPct,
+          maxHoldBars: numberOrNull(params.maxHoldBars) ?? fallbackMaxHoldBars,
+        };
+      };
       const exitResearch = researchExitAlert ? { ...researchEffect, applied: 'exit' } : null;
       const exitPolicy = !researchExitAlert && policyExitPressure ? { ...policyEffect, applied: 'exit' } : null;
       const optionsSnapshot = () => Object.fromEntries(positions);
@@ -1833,6 +1917,8 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           ? round2(Math.abs(Math.max(...strikes) - Math.min(...strikes)) * OPTION_MULTIPLIER * contracts)
           : 0;
         const maxRiskUsd = round2(openValue > 0 ? openValue : Math.max(1, widthUsd + openValue));
+        const groupUnderlying = legs[0].option?.underlying ?? parseOccSymbol(legs[0].symbol)?.underlying ?? legs[0].symbol;
+        const groupExitParams = exitParamsFor(groupUnderlying);
         let exitReason = null;
         let legResearch = null;
         let legPolicy = null;
@@ -1844,12 +1930,11 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           legPolicy = exitPolicy;
         } else if (dte <= autoCloseDTE) {
           exitReason = 'dte_auto_close';
-        } else if (maxRiskUsd > 0 && pnlUsd >= targetPct * maxRiskUsd) {
+        } else if (maxRiskUsd > 0 && pnlUsd >= groupExitParams.targetPct * maxRiskUsd) {
           exitReason = 'target';
-        } else if (maxRiskUsd > 0 && pnlUsd <= -stopPct * maxRiskUsd) {
+        } else if (maxRiskUsd > 0 && pnlUsd <= -groupExitParams.stopPct * maxRiskUsd) {
           exitReason = 'stop';
         }
-        const groupUnderlying = legs[0].option?.underlying ?? parseOccSymbol(legs[0].symbol)?.underlying ?? legs[0].symbol;
         if (!exitReason) {
           result.actions.push({
             type: 'hold',
@@ -1902,6 +1987,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           marginRequiredUsd: 0,
           research: legResearch,
           policy: legPolicy,
+          orderSpec: groupExitParams.activeSpec,
         });
       }
 
@@ -1916,7 +2002,8 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         const underlying = position.option?.underlying
           ?? parseOccSymbol(positionSymbol)?.underlying
           ?? positionSymbol;
-        const signal = await getSignalFor(underlying);
+        const { stopPct, targetPct, maxHoldBars, activeSpec: positionSpec } = exitParamsFor(underlying);
+        const signal = await getSignalFor(underlying, positionSpec);
         let mark = null;
         let bid = null;
         let ask = null;
@@ -2021,6 +2108,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
             marginRequiredUsd: 0,
             research: positionResearch,
             policy: positionPolicy,
+            orderSpec: positionSpec,
           });
         } else {
           const side = isLong ? 'sell' : 'buy';
@@ -2038,6 +2126,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
             closing: true,
             research: positionResearch,
             policy: positionPolicy,
+            orderSpec: positionSpec,
           });
         }
       }
@@ -2055,110 +2144,159 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         });
         return result;
       }
-      const symbol = String(spec.symbol ?? '').toUpperCase();
-      // A long stock book can still sell covered calls against its shares (an entry order).
-      const heldUnderlying = positions.get(symbol);
-      const heldShares = heldUnderlying && heldUnderlying.assetClass === 'us_equity' && heldUnderlying.qtySigned > 0
-        ? heldUnderlying.qtySigned
-        : 0;
-      const coverEligible = instrumentsEnabled
-        && mandatePermissions.coveredCalls === true
-        && heldShares >= OPTION_MULTIPLIER;
-      if (positions.has(symbol) && !coverEligible) {
-        // Already handled by the exit pass; nothing to do without a new signal.
-        if (!result.actions.some((action) => action.symbol === symbol)) {
-          result.actions.push({ type: 'hold', symbol, reason: 'in_position' });
+      // v3.2: iterate the basket (or the single legacy spec) — one order per symbol/run.
+      // Underlyings already held count toward the tier position cap (a spread counts once,
+      // by its underlying). Held symbols are skipped for entries (the exit pass owns them).
+      const entryUniverse = entrySpecs.length > 0 ? entrySpecs : [];
+      const heldUnderlyings = new Set(
+        [...positions.values()].map((position) => String(position.option?.underlying ?? position.symbol).toUpperCase()),
+      );
+      for (const entrySpec of entryUniverse) {
+        const symbol = String(entrySpec.symbol ?? '').toUpperCase();
+        if (!symbol) continue;
+        const openOrderForSymbol = openOrders.some((order) => {
+          const orderSymbol = String(order?.symbol ?? '').toUpperCase();
+          if (orderSymbol === symbol) return true;
+          const parsed = parseOccSymbol(orderSymbol);
+          return Boolean(parsed && parsed.underlying === symbol);
+        });
+        // A long stock book can still sell covered calls against its shares (an entry order).
+        const heldUnderlying = positions.get(symbol);
+        const heldShares = heldUnderlying && heldUnderlying.assetClass === 'us_equity' && heldUnderlying.qtySigned > 0
+          ? heldUnderlying.qtySigned
+          : 0;
+        const coverEligible = instrumentsEnabled
+          && mandatePermissions.coveredCalls === true
+          && heldShares >= OPTION_MULTIPLIER;
+        if (heldUnderlyings.has(symbol) && !coverEligible) {
+          if (!result.actions.some((action) => action.symbol === symbol)) {
+            result.actions.push({ type: 'hold', symbol, reason: 'in_position' });
+          }
+          continue;
         }
-      } else if (openOrders.some((order) => String(order?.symbol ?? '').toUpperCase() === symbol)) {
-        result.actions.push({ type: 'hold', symbol, reason: 'open_order_pending' });
-      } else if (cycleBudgetLeft() <= 0) {
-        skip(symbol, 'max_orders_per_cycle');
-      } else if (entriesBlocked) {
-        skip(symbol, `entries_blocked:${entriesBlockedReason}`);
-      } else if (allowedSymbols && !allowedSymbols.includes(symbol)) {
-        deny('INSTRUMENT_FORBIDDEN', `symbol ${symbol} is outside the mandate allowlist`, { symbol });
-        skip(symbol, 'symbol_not_in_mandate');
-      } else {
+        if (openOrderForSymbol) {
+          result.actions.push({ type: 'hold', symbol, reason: 'open_order_pending' });
+          continue;
+        }
+        if (runOrderedUnderlyings.has(symbol)) {
+          // One order per symbol per run: an exited symbol is not re-entered in the same cycle.
+          result.actions.push({ type: 'hold', symbol, reason: 'ordered_this_run' });
+          continue;
+        }
+        if (cycleBudgetLeft() <= 0) {
+          skip(symbol, 'max_orders_per_cycle');
+          break; // the order cap is shared by exits + entries for the whole run
+        }
+        if (entriesBlocked) {
+          skip(symbol, `entries_blocked:${entriesBlockedReason}`);
+          continue;
+        }
+        if (allowedSymbols && !allowedSymbols.includes(symbol)) {
+          deny('INSTRUMENT_FORBIDDEN', `symbol ${symbol} is outside the mandate allowlist`, { symbol });
+          skip(symbol, 'symbol_not_in_mandate');
+          continue;
+        }
+        if (!coverEligible && heldUnderlyings.size >= maxOpenPositions) {
+          skip(symbol, 'max_open_positions', {
+            maxOpenPositions,
+            openPositions: heldUnderlyings.size,
+          });
+          continue;
+        }
         const quote = await getQuote(symbol);
         if (!quote) {
           deny('DATA_MISSING', `no quote for ${symbol}`);
-        } else {
-          const signal = await getSignalFor(symbol);
-          const wantLong = signal.longEntry === true || signal.enter === true;
-          const wantShort = signal.shortEntry === true && mandatePermissions.shortStock === true;
-          const coveredCallOnly = coverEligible; // shares already held: only sell calls against them
-          if (!coveredCallOnly && !wantLong && !wantShort) {
-            result.actions.push({
-              type: 'hold',
-              symbol,
-              reason: signal.reason ?? 'no_signal',
-              z: signal.z,
-            });
-          } else if (policyStandDown) {
-            // The bot's own brain said stand down: no new exposure. This is a stance
-            // skip, not a brake denial; the exit pass above still ran for held positions.
-            result.actions.push({
-              type: 'skip',
-              symbol,
-              reason: 'agent_stand_down',
-              policy: { stance: policyState.stance },
-            });
-          } else if (researchVeto) {
-            // The isolated analyst vetoed the entry that the signal would otherwise take.
-            // This is an advisory skip, not a brake denial: no order ever reaches the wall.
-            result.actions.push({
-              type: 'skip',
-              symbol,
-              reason: 'research_veto',
-              research: { ...researchEffect, applied: 'veto' },
-            });
-          } else {
-            const direction = wantLong ? 'bullish' : wantShort ? 'bearish' : 'neutral';
-            const structures = coveredCallOnly ? ['covered_call'] : candidateStructures(spec.family, direction);
-            let placed = false;
-            let lastSkipReason = 'no_instrument_available';
-            let lastBlocked = null;
-            for (const structure of structures) {
-              if (cycleBudgetLeft() <= 0) break;
-              if (!structureAllowed(structure, mandatePermissions)) {
-                lastSkipReason = 'instrument_not_permitted';
-                continue;
-              }
-              if (structure === 'long_stock') {
-                if (instrumentsEnabled && !mandatePermissions.longStock) continue;
-                placed = await enterLongStockEntry({ symbol, quote, signal, reason: signal.reason ?? 'signal' });
-                break;
-              }
-              if (structure === 'short_stock') {
-                placed = await enterShortStockEntry({ symbol, quote, signal });
-                break;
-              }
-              const plan = await buildOptionPlan({ structure, family: spec.family, underlying: symbol, direction });
-              if (!plan) {
-                lastSkipReason = 'option_plan_unavailable';
-                continue;
-              }
-              if (plan.blocked === 'covered_call_requires_100_shares') {
-                lastBlocked = 'covered_call_requires_100_shares';
-                lastSkipReason = lastBlocked;
-                result.actions.push({
-                  type: 'skip',
-                  symbol,
-                  reason: 'covered_call_requires_100_shares',
-                  structure,
-                });
-                continue;
-              }
-              placed = await enterOptionEntry({ plan, quote, signal, direction });
-              break;
-            }
-            if (!placed) {
-              if (!result.actions.some((action) => action.type === 'skip' && action.symbol === symbol)) {
-                skip(symbol, lastBlocked ?? lastSkipReason);
-              }
-            }
-          }
+          continue;
         }
+        const signal = await getSignalFor(symbol, entrySpec);
+        const wantLong = signal.longEntry === true || signal.enter === true;
+        const wantShort = signal.shortEntry === true && mandatePermissions.shortStock === true;
+        const coveredCallOnly = coverEligible; // shares already held: only sell calls against them
+        if (!coveredCallOnly && !wantLong && !wantShort) {
+          result.actions.push({
+            type: 'hold',
+            symbol,
+            reason: signal.reason ?? 'no_signal',
+            z: signal.z,
+            specId: entrySpec.specId ?? null,
+          });
+          continue;
+        }
+        if (policyStandDown) {
+          // The bot's own brain said stand down: no new exposure. This is a stance
+          // skip, not a brake denial; the exit pass above still ran for held positions.
+          result.actions.push({
+            type: 'skip',
+            symbol,
+            reason: 'agent_stand_down',
+            policy: { stance: policyState.stance },
+          });
+          continue;
+        }
+        if (researchVeto) {
+          // The isolated analyst vetoed the entry that the signal would otherwise take.
+          // This is an advisory skip, not a brake denial: no order ever reaches the wall.
+          result.actions.push({
+            type: 'skip',
+            symbol,
+            reason: 'research_veto',
+            research: { ...researchEffect, applied: 'veto' },
+          });
+          continue;
+        }
+        const direction = wantLong ? 'bullish' : wantShort ? 'bearish' : 'neutral';
+        const structures = coveredCallOnly ? ['covered_call'] : candidateStructures(entrySpec.family, direction);
+        let placed = false;
+        let lastSkipReason = 'no_instrument_available';
+        let lastBlocked = null;
+        for (const structure of structures) {
+          if (cycleBudgetLeft() <= 0) break;
+          if (!structureAllowed(structure, mandatePermissions)) {
+            lastSkipReason = 'instrument_not_permitted';
+            continue;
+          }
+          if (structure === 'long_stock') {
+            if (instrumentsEnabled && !mandatePermissions.longStock) continue;
+            placed = await enterLongStockEntry({
+              symbol,
+              quote,
+              signal,
+              reason: signal.reason ?? 'signal',
+              activeSpec: entrySpec,
+            });
+            break;
+          }
+          if (structure === 'short_stock') {
+            placed = await enterShortStockEntry({ symbol, quote, signal, activeSpec: entrySpec });
+            break;
+          }
+          const plan = await buildOptionPlan({ structure, family: entrySpec.family, underlying: symbol, direction });
+          if (!plan) {
+            lastSkipReason = 'option_plan_unavailable';
+            continue;
+          }
+          if (plan.blocked === 'covered_call_requires_100_shares') {
+            lastBlocked = 'covered_call_requires_100_shares';
+            lastSkipReason = lastBlocked;
+            result.actions.push({
+              type: 'skip',
+              symbol,
+              reason: 'covered_call_requires_100_shares',
+              structure,
+            });
+            continue;
+          }
+          placed = await enterOptionEntry({ plan, quote, signal, direction, activeSpec: entrySpec });
+          break;
+        }
+        if (placed) {
+          heldUnderlyings.add(symbol);
+        } else if (!result.actions.some((action) => action.type === 'skip' && action.symbol === symbol)) {
+          skip(symbol, lastBlocked ?? lastSkipReason);
+        }
+      }
+      if (entryUniverse.length === 0) {
+        skip(String(spec.symbol ?? '').toUpperCase(), 'no_proven_specs');
       }
 
       return result;
@@ -2173,6 +2311,12 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         maxOrderPctOfEquity,
         timeframe: defaultTimeframe,
         readsAccountEquity: false,
+        portfolio: {
+          supported: true,
+          maxOpenPositionsFallback: Number.isFinite(risk.maxOpenPositions) ? risk.maxOpenPositions : Infinity,
+          maxOrdersPerCycleFallback: maxOrdersPerCycle,
+          perSymbolSpecs: true,
+        },
         research: {
           enabled: researchConfig.enabled === true,
           influence: researchConfig.influence === true,
@@ -2208,3 +2352,4 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 }
 
 export default createExecutor;
+

@@ -32,12 +32,17 @@ window.__ModuleLoader__.load({
 
     const NS = 'automaton-trading';
     const STATE_URL = '/automaton/state';
+    const MARKET_URL = '/automaton/market';
     const CONTROL_URL = '/automaton/control';
-    const POLL_MS = 3000;
+    const STATE_POLL_MS = 5000;
+    const MARKET_POLL_MS = 2000;
+    /** Back-compat alias: the state poller interval (older exports/tests). */
+    const POLL_MS = STATE_POLL_MS;
     const PANEL_ID = 'automaton-trading';
     const SIDEBAR_SLOT = 'sidebar.panellist';
     const MAIN_SLOT = 'main';
     const SETTINGS_SLOT = 'settings.plugins.tab';
+    const DASHBOARD_TABS = ['overview', 'agents', 'markets', 'research', 'rewards', 'settings'];
     const MAX_OBITUARIES = 8;
     const MODE_LABEL = { sim: 'SIM', paper: 'PAPER', live: 'LIVE' };
     const STATUS_FILTERS = ['all', 'alive', 'dead', 'condemned'];
@@ -275,6 +280,60 @@ window.__ModuleLoader__.load({
       accountFacts: 'account',
       onLabel: 'on',
       offLabel: 'off',
+      tabOverview: 'Overview',
+      tabAgents: 'Agents',
+      tabMarkets: 'Markets',
+      tabResearch: 'Research',
+      tabRewards: 'Rewards',
+      tabSettings: 'Settings',
+      brand: 'MEAT',
+      brandSub: 'Mortality Engineered Auto-Trading',
+      kpiEquity: 'Account equity',
+      kpiEquityDetail: 'mode',
+      kpiDayPnl: 'Day P&L',
+      kpiCashBp: 'Cash / Buying power',
+      kpiExposure: 'Gross exposure',
+      kpiNetExposure: 'net',
+      kpiPopulation: 'Population',
+      kpiDead: 'dead',
+      kpiTradesToday: 'Trades today',
+      kpiWinRate: 'Win rate',
+      kpiTreasury: 'Treasury runway',
+      kpiNoData: '—',
+      liveFeed: 'Live feed',
+      feedLive: 'LIVE',
+      feedClosed: 'CLOSED',
+      feedUnavailable: 'live feed unavailable — state-only',
+      feedRefreshing: 'refreshing…',
+      manualRefresh: 'Refresh',
+      marketClock: 'Market clock',
+      marketWatch: 'Market watch',
+      equityChart: 'Portfolio equity',
+      strategyMixTitle: 'Strategy mix',
+      dayVsSwing: 'Day vs Swing',
+      target: 'target',
+      actual: 'actual',
+      tape: 'Live market tape',
+      lastPrice: 'Last',
+      change: 'Change',
+      bidAsk: 'Bid / Ask',
+      trend: 'Trend',
+      closedLastClose: 'market closed · last close',
+      live: 'live',
+      up: 'up',
+      down: 'down',
+      flat: 'flat',
+      noMarketData: 'no market data yet',
+      chartEmpty: 'not enough data yet',
+      basket: 'Basket',
+      stance: 'Stance',
+      agentSearch: 'Search agents…',
+      researchSummary: 'Research coverage',
+      researchVerdicts: 'verdicts',
+      tierAll: 'All tiers',
+      feedStatus: 'feed',
+      marketSectionHint: 'prices, P&L and charts update live when the engine is running',
+      paperDefault: 'paper trading is the default; live is gated',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -614,6 +673,60 @@ window.__ModuleLoader__.load({
       accountFacts: '账户',
       onLabel: '开启',
       offLabel: '关闭',
+      tabOverview: '概览',
+      tabAgents: '个体',
+      tabMarkets: '市场',
+      tabResearch: '研究',
+      tabRewards: '奖励',
+      tabSettings: '设置',
+      brand: 'MEAT',
+      brandSub: '死亡工程化自动交易',
+      kpiEquity: '账户权益',
+      kpiEquityDetail: '模式',
+      kpiDayPnl: '当日盈亏',
+      kpiCashBp: '现金 / 购买力',
+      kpiExposure: '总敞口',
+      kpiNetExposure: '净敞口',
+      kpiPopulation: '种群',
+      kpiDead: '死亡',
+      kpiTradesToday: '今日成交',
+      kpiWinRate: '胜率',
+      kpiTreasury: '资金跑道',
+      kpiNoData: '—',
+      liveFeed: '实时行情',
+      feedLive: '实时',
+      feedClosed: '休市',
+      feedUnavailable: '实时行情不可用 —— 仅状态数据',
+      feedRefreshing: '刷新中…',
+      manualRefresh: '刷新',
+      marketClock: '市场时钟',
+      marketWatch: '市场观察',
+      equityChart: '组合权益',
+      strategyMixTitle: '策略配比',
+      dayVsSwing: '日内 vs 波段',
+      target: '目标',
+      actual: '实际',
+      tape: '实时行情',
+      lastPrice: '最新',
+      change: '涨跌',
+      bidAsk: '买 / 卖',
+      trend: '走势',
+      closedLastClose: '休市 —— 最后收盘价',
+      live: '实时',
+      up: '涨',
+      down: '跌',
+      flat: '平',
+      noMarketData: '暂无行情数据',
+      chartEmpty: '数据不足',
+      basket: '股票池',
+      stance: '姿态',
+      agentSearch: '搜索个体…',
+      researchSummary: '研究覆盖',
+      researchVerdicts: '结论',
+      tierAll: '全部层级',
+      feedStatus: '行情',
+      marketSectionHint: '引擎运行时价格、盈亏与图表实时更新',
+      paperDefault: '默认纸面交易；实盘需多重门禁',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -2460,7 +2573,336 @@ window.__ModuleLoader__.load({
     }
 
     // -----------------------------------------------------------------------
-    // shared data store: one 3 s poller for every mounted dashboard surface
+    // v3.2 live analytics mapping (market feed, KPIs, charts, agent table)
+    // -----------------------------------------------------------------------
+
+    /** up / down / flat from a signed number (null → flat). */
+    function changeDirection(value) {
+      const number = toNumber(value);
+      if (number === null || number === 0) return 'flat';
+      return number > 0 ? 'up' : 'down';
+    }
+
+    /** Market change percent text: accepts a fraction (≤0.2) or percent points. */
+    function marketChangePctText(value) {
+      const number = toNumber(value);
+      if (number === null) return '—';
+      const pct = Math.abs(number) <= 0.2 ? number * 100 : number;
+      return `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`;
+    }
+
+    /** Inline-SVG polyline path for a list of numeric closes ('' when empty). */
+    function sparklinePath(values, { width = 96, height = 24, pad = 2 } = {}) {
+      const series = (Array.isArray(values) ? values : []).map((value) => toNumber(value)).filter((value) => value !== null);
+      if (series.length === 0) return '';
+      const min = Math.min(...series);
+      const max = Math.max(...series);
+      const span = max - min || 1;
+      const innerWidth = Math.max(1, width - pad * 2);
+      const innerHeight = Math.max(1, height - pad * 2);
+      const step = series.length > 1 ? innerWidth / (series.length - 1) : 0;
+      return series
+        .map((value, index) => {
+          const x = Math.round((pad + index * step) * 10) / 10;
+          const y = Math.round((height - pad - ((value - min) / span) * innerHeight) * 10) / 10;
+          return `${index === 0 ? 'M' : 'L'}${x} ${y}`;
+        })
+        .join(' ');
+    }
+
+    /** Live market tape rows from a marketView payload (quotes map or array). */
+    function marketTapeRows(market, { limit = null } = {}) {
+      const raw = plainObject(market);
+      const quotesRaw = raw.quotes;
+      let list = [];
+      if (Array.isArray(quotesRaw)) {
+        list = quotesRaw;
+      } else if (quotesRaw && typeof quotesRaw === 'object') {
+        list = Object.entries(quotesRaw).map(([symbol, quote]) => ({ symbol, ...(quote && typeof quote === 'object' ? quote : {}) }));
+      }
+      const sparklines = plainObject(raw.sparklines);
+      const sessionOpen = raw.marketOpen === true ? true : raw.marketOpen === false ? false : null;
+      const rows = list.map((quote, index) => {
+        const symbol = String(quote.symbol ?? quote.ticker ?? '').toUpperCase();
+        const priceUsd = toNumber(quote.priceUsd ?? quote.price);
+        const changeUsd = toNumber(quote.changeUsd);
+        const changePct = toNumber(quote.changePct);
+        const direction = changeDirection(changeUsd ?? changePct);
+        const sparkline = (Array.isArray(sparklines[symbol]) ? sparklines[symbol] : Array.isArray(quote.sparkline) ? quote.sparkline : [])
+          .map((value) => toNumber(value))
+          .filter((value) => value !== null);
+        return {
+          key: `${symbol || 'symbol'}-${index}`,
+          symbol: symbol || '—',
+          priceUsd,
+          priceText: fmtUsd(priceUsd),
+          bidUsd: toNumber(quote.bidUsd ?? quote.bid),
+          askUsd: toNumber(quote.askUsd ?? quote.ask),
+          bidText: fmtUsd(toNumber(quote.bidUsd ?? quote.bid)),
+          askText: fmtUsd(toNumber(quote.askUsd ?? quote.ask)),
+          changeUsd,
+          changePct,
+          direction,
+          changeUsdText: changeUsd === null ? '—' : `${changeUsd > 0 ? '+' : changeUsd < 0 ? '-' : ''}${fmtUsd(Math.abs(changeUsd))}`,
+          changePctText: marketChangePctText(changePct),
+          sparkline,
+          sparklinePath: sparklinePath(sparkline),
+          stale: quote.stale === true,
+          closed: sessionOpen === false,
+        };
+      });
+      return limit !== null ? rows.slice(0, limit) : rows;
+    }
+
+    /** Equity area-chart geometry from the portfolio equity history ring. */
+    function equityChartPoints(history, { width = 640, height = 160, pad = 8 } = {}) {
+      const series = (Array.isArray(history) ? history : [])
+        .filter((point) => point && typeof point === 'object' && toNumber(point.equityUsd) !== null)
+        .map((point) => ({
+          at: point.at ?? null,
+          equityUsd: toNumber(point.equityUsd),
+          cashUsd: toNumber(point.cashUsd),
+        }));
+      if (series.length === 0) {
+        return { points: [], path: '', area: '', min: null, max: null, first: null, last: null, deltaUsd: null, deltaPct: null, hasData: false };
+      }
+      const values = series.map((point) => point.equityUsd);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || 1;
+      const innerWidth = Math.max(1, width - pad * 2);
+      const innerHeight = Math.max(1, height - pad * 2);
+      const step = series.length > 1 ? innerWidth / (series.length - 1) : 0;
+      const points = series.map((point, index) => ({
+        ...point,
+        x: Math.round((pad + index * step) * 10) / 10,
+        y: Math.round((height - pad - ((point.equityUsd - min) / span) * innerHeight) * 10) / 10,
+      }));
+      const path = points.map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x} ${point.y}`).join(' ');
+      const last = points[points.length - 1];
+      const first = points[0];
+      const area = `${path} L${last.x} ${height - pad} L${first.x} ${height - pad} Z`;
+      const deltaUsd = round2(last.equityUsd - first.equityUsd);
+      return {
+        points,
+        path,
+        area,
+        min,
+        max,
+        first,
+        last,
+        deltaUsd,
+        deltaPct: first.equityUsd > 0 ? (deltaUsd / first.equityUsd) * 100 : null,
+        hasData: true,
+      };
+    }
+
+    /** KPI cards for the analytics overview (state + optional live market view). */
+    function kpiCards(stateStatus, marketView) {
+      const status = plainObject(stateStatus);
+      if (Object.keys(status).length === 0) return [];
+      const summary = summarize(status);
+      const market = plainObject(marketView);
+      const portfolio = plainObject(market.portfolio);
+      const liveEquity = toNumber(portfolio.equityUsd);
+      const equity = liveEquity ?? summary.equityUsd;
+      const dayPnlUsd = toNumber(portfolio.dayPnlUsd);
+      const dayPnlPct = toNumber(portfolio.dayPnlPct);
+      const cashUsd = toNumber(portfolio.cashUsd) ?? summary.cashUsd;
+      const buyingPowerUsd = toNumber(portfolio.buyingPowerUsd) ?? summary.buyingPowerUsd;
+      const grossExposureUsd = toNumber(portfolio.grossExposureUsd);
+      const netExposureUsd = toNumber(portfolio.netExposureUsd);
+      const population = summary.population ?? {};
+      const lastCycle = summary.lastCycle ?? null;
+      const agents = Array.isArray(status.agents) ? status.agents : [];
+      const aliveAgents = agents.filter((agent) => String(agent?.status ?? 'alive').toLowerCase() === 'alive');
+      const winners = aliveAgents.filter((agent) => {
+        const pnl = toNumber(agent?.dayPnlPct) ?? toNumber(agent?.pnlPct);
+        return pnl !== null && pnl > 0;
+      }).length;
+      const winRatePct = aliveAgents.length > 0 ? (winners / aliveAgents.length) * 100 : null;
+      const tradesToday = toNumber(lastCycle?.orders) ?? agents.reduce((total, agent) => total + (toNumber(agent?.tradesCount) ?? 0), 0);
+      const treasury = summary.treasury ?? {};
+      return [
+        {
+          key: 'equity',
+          labelKey: 'kpiEquity',
+          value: fmtUsd(equity),
+          deltaUsd: dayPnlUsd,
+          deltaPct: dayPnlPct,
+          direction: changeDirection(dayPnlUsd ?? dayPnlPct),
+          detailKey: 'kpiEquityDetail',
+          detail: summary.mode,
+          live: liveEquity !== null,
+        },
+        {
+          key: 'dayPnl',
+          labelKey: 'kpiDayPnl',
+          value: `${dayPnlUsd === null ? '—' : fmtSignedUsd(dayPnlUsd)}${dayPnlPct === null ? '' : ` (${fmtPct(dayPnlPct)})`}`,
+          deltaPct: dayPnlPct,
+          direction: changeDirection(dayPnlUsd ?? dayPnlPct),
+        },
+        {
+          key: 'cashBp',
+          labelKey: 'kpiCashBp',
+          value: `${fmtUsd(cashUsd)} / ${fmtUsd(buyingPowerUsd)}`,
+          direction: 'flat',
+        },
+        {
+          key: 'exposure',
+          labelKey: 'kpiExposure',
+          value: fmtUsd(grossExposureUsd),
+          detail: netExposureUsd === null ? null : fmtUsd(netExposureUsd),
+          detailKey: 'kpiNetExposure',
+          direction: 'flat',
+        },
+        {
+          key: 'population',
+          labelKey: 'kpiPopulation',
+          value: `${fmtNum(population.alive ?? 0)} / ${fmtNum(population.total ?? 0)}`,
+          detail: fmtNum(population.dead ?? 0),
+          detailKey: 'kpiDead',
+          direction: 'flat',
+        },
+        {
+          key: 'tradesToday',
+          labelKey: 'kpiTradesToday',
+          value: fmtNum(tradesToday ?? 0),
+          detail: lastCycle?.available === true ? (lastCycle.topSkipText || null) : null,
+          direction: 'flat',
+        },
+        {
+          key: 'winRate',
+          labelKey: 'kpiWinRate',
+          value: winRatePct === null ? '—' : `${winRatePct.toFixed(0)}%`,
+          detail: `${fmtNum(winners)}/${fmtNum(aliveAgents.length)}`,
+          direction: 'flat',
+        },
+        {
+          key: 'treasury',
+          labelKey: 'kpiTreasury',
+          value: fmtHours(treasury.runwayHours),
+          detail: treasury.state ?? null,
+          direction: 'flat',
+        },
+      ];
+    }
+
+    /** 70/30 day-vs-swing strategy mix projection for the overview chart. */
+    function strategyMixBreakdown(stateStatus) {
+      const status = plainObject(stateStatus);
+      const mix = plainObject(status.strategyMix);
+      const dayCount = toNumber(mix.day?.count) ?? 0;
+      const swingCount = toNumber(mix.swing?.count) ?? 0;
+      const total = toNumber(mix.total) ?? dayCount + swingCount;
+      const targetDayPct = toNumber(mix.targetDayPct) ?? toNumber(status.config?.strategyMix?.dayPct) ?? 0.7;
+      const dayPct = total > 0 ? dayCount / total : null;
+      const swingPct = total > 0 ? swingCount / total : null;
+      const bar = (key, labelKey, count, pct, targetPct) => ({
+        key,
+        labelKey,
+        count,
+        pct,
+        pctText: pct === null ? '—' : fmtPct(pct),
+        targetPct,
+        targetText: fmtPct(targetPct),
+        deltaPct: pct === null ? null : (pct - targetPct) * 100,
+      });
+      return {
+        available: Object.keys(mix).length > 0,
+        total,
+        targetDayPct,
+        day: bar('day', 'categoryDay', dayCount, dayPct, targetDayPct),
+        swing: bar('swing', 'categorySwing', swingCount, swingPct, 1 - targetDayPct),
+        bars: [
+          bar('day', 'categoryDay', dayCount, dayPct, targetDayPct),
+          bar('swing', 'categorySwing', swingCount, swingPct, 1 - targetDayPct),
+        ],
+      };
+    }
+
+    /** Agent table rows merged with live market data (equity/P&L/stance/basket/sparkline). */
+    function agentTableRows(stateStatus, marketView) {
+      const status = plainObject(stateStatus);
+      if (Object.keys(status).length === 0) return [];
+      const baseRows = buildAgentRows(status);
+      const market = plainObject(marketView);
+      const marketAgents = Array.isArray(market.agents) ? market.agents : [];
+      const byId = new Map();
+      for (const agent of marketAgents) {
+        if (agent && agent.id !== undefined) byId.set(String(agent.id), agent);
+      }
+      const sparklines = plainObject(market.sparklines);
+      return baseRows.map((row) => {
+        const live = byId.get(row.id) ?? null;
+        const symbols = (Array.isArray(row.genome?.symbols) ? row.genome.symbols : row.genome?.symbol ? [row.genome.symbol] : [])
+          .map((symbol) => String(symbol))
+          .filter((symbol) => symbol.length > 0);
+        const primary = symbols[0] ?? null;
+        const livePositions = Array.isArray(live?.positions) ? live.positions.length : null;
+        const liveEquityUsd = toNumber(live?.equityUsd);
+        const liveDayPnlPct = toNumber(live?.dayPnlPct);
+        const stance = typeof live?.stance === 'string' ? live.stance : row.policy?.stance ?? null;
+        return {
+          ...row,
+          live: live !== null,
+          liveEquityUsd,
+          liveDayPnlPct,
+          livePositions,
+          stance,
+          stanceBadge: stance ? stanceBadge(stance) : null,
+          basket: symbols,
+          basketText: symbols.length === 0 ? '—' : symbols.slice(0, 4).join(', '),
+          sparkline: primary && Array.isArray(sparklines[primary]) ? sparklines[primary] : [],
+          sparklinePath: primary && Array.isArray(sparklines[primary]) ? sparklinePath(sparklines[primary]) : '',
+          liveDirection: changeDirection(liveDayPnlPct ?? row.dayPnlPct),
+        };
+      });
+    }
+
+    /** Market session label projection (open/closed/unknown). */
+    function marketSession(marketView) {
+      const market = plainObject(marketView);
+      if (Object.keys(market).length === 0 || market.ok === false) return { open: null, labelKey: 'marketUnknown', available: false };
+      if (market.marketOpen === true) return { open: true, labelKey: 'marketOpen', available: true };
+      if (market.marketOpen === false) return { open: false, labelKey: 'marketClosed', available: true };
+      return { open: null, labelKey: 'marketUnknown', available: true };
+    }
+
+    /**
+     * One dashboard view: state + live market feed with graceful fallback. The tape/KPIs are
+     * state-only when the market endpoint is missing (old Host), never throwing.
+     */
+    function liveViewMapping(stateStatus, marketView) {
+      const status = plainObject(stateStatus);
+      const market = plainObject(marketView);
+      const hasState = Object.keys(status).length > 0;
+      const available = Object.keys(market).length > 0 && market.ok !== false;
+      const summary = hasState ? summarize(status) : null;
+      const session = marketSession(market);
+      const tape = available ? marketTapeRows(market) : [];
+      const feedStatus = !available ? 'unavailable' : session.open === false ? 'closed' : 'live';
+      return {
+        available,
+        hasState,
+        feedStatus,
+        marketOpen: session.open,
+        sessionLabelKey: session.labelKey,
+        tape,
+        quotesCount: tape.length,
+        kpis: hasState ? kpiCards(status, available ? market : null) : [],
+        equity: equityChartPoints(available ? market.equityHistory : []),
+        mix: hasState ? strategyMixBreakdown(status) : null,
+        agents: hasState ? agentTableRows(status, available ? market : null) : [],
+        summary,
+        lastUpdatedAt: available ? market.at ?? null : null,
+        error: available ? null : market.error ?? null,
+        market,
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // shared data store: one poller for every mounted dashboard surface
     // -----------------------------------------------------------------------
 
     function createStateStore() {
@@ -2470,6 +2912,7 @@ window.__ModuleLoader__.load({
       let timer = null;
       let inFlight = false;
       let disposed = false;
+      let visibilityHandler = null;
 
       function publish(patch) {
         snapshot = { ...snapshot, ...patch };
@@ -2485,7 +2928,8 @@ window.__ModuleLoader__.load({
       function schedule() {
         clearTimeout(timer);
         timer = null;
-        if (disposed || snapshot.paused || listeners.size === 0) return;
+        const hidden = typeof document !== 'undefined' && document.hidden === true;
+        if (disposed || snapshot.paused || listeners.size === 0 || hidden) return;
         timer = setTimeout(() => {
           timer = null;
           void load();
@@ -2529,12 +2973,29 @@ window.__ModuleLoader__.load({
         getSnapshot: () => snapshot,
         subscribe(listener) {
           listeners.add(listener);
-          if (listeners.size === 1) schedule();
+          if (listeners.size === 1) {
+            schedule();
+            if (typeof document !== 'undefined') {
+              visibilityHandler = () => {
+                if (document.hidden) {
+                  clearTimeout(timer);
+                  timer = null;
+                } else {
+                  schedule();
+                }
+              };
+              document.addEventListener('visibilitychange', visibilityHandler);
+            }
+          }
           return () => {
             listeners.delete(listener);
             if (listeners.size === 0) {
               clearTimeout(timer);
               timer = null;
+              if (visibilityHandler && typeof document !== 'undefined') {
+                document.removeEventListener('visibilitychange', visibilityHandler);
+                visibilityHandler = null;
+              }
             }
           };
         },
@@ -2557,6 +3018,138 @@ window.__ModuleLoader__.load({
     }
 
     const store = createStateStore();
+
+    /**
+     * Live market feed store: GET /automaton/market every 2 s (paused when the tab is
+     * hidden or auto-refresh is off). A missing endpoint is not an error state for the
+     * dashboard: the feed reports `unavailable` and the UI falls back to state-only data.
+     */
+    function createMarketStore() {
+      let snapshot = { loading: true, data: null, error: null, fetchedAt: 0, paused: false, refreshing: false, unavailable: false };
+      const listeners = new Set();
+      let timer = null;
+      let inFlight = false;
+      let disposed = false;
+      let visibilityHandler = null;
+
+      function publish(patch) {
+        snapshot = { ...snapshot, ...patch };
+        for (const listener of [...listeners]) {
+          try {
+            listener(snapshot);
+          } catch {
+            /* one bad subscriber must not stop the live feed */
+          }
+        }
+      }
+
+      function schedule() {
+        clearTimeout(timer);
+        timer = null;
+        const hidden = typeof document !== 'undefined' && document.hidden === true;
+        if (disposed || snapshot.paused || listeners.size === 0 || hidden) return;
+        timer = setTimeout(() => {
+          timer = null;
+          void load();
+        }, MARKET_POLL_MS);
+      }
+
+      async function load() {
+        if (inFlight || disposed) return;
+        inFlight = true;
+        publish({ refreshing: true });
+        try {
+          const response = await fetch(MARKET_URL, {
+            method: 'GET',
+            headers: { accept: 'application/json' },
+            cache: 'no-store',
+          });
+          let body = null;
+          try {
+            body = await response.json();
+          } catch {
+            body = null;
+          }
+          if (!response.ok || !body || body.ok === false) {
+            publish({
+              loading: false,
+              refreshing: false,
+              unavailable: true,
+              error: body?.error ?? { code: `HTTP_${response.status}`, message: response.statusText || 'market route unavailable' },
+            });
+          } else {
+            publish({ loading: false, refreshing: false, error: null, unavailable: false, data: body, fetchedAt: Date.now() });
+          }
+        } catch (error) {
+          publish({ loading: false, refreshing: false, unavailable: true, error: { code: 'FETCH_FAILED', message: errorText(error) } });
+        } finally {
+          inFlight = false;
+          schedule();
+        }
+      }
+
+      return {
+        getSnapshot: () => snapshot,
+        subscribe(listener) {
+          listeners.add(listener);
+          if (listeners.size === 1) {
+            schedule();
+            if (typeof document !== 'undefined') {
+              visibilityHandler = () => {
+                if (document.hidden) {
+                  clearTimeout(timer);
+                  timer = null;
+                } else {
+                  schedule();
+                }
+              };
+              document.addEventListener('visibilitychange', visibilityHandler);
+            }
+          }
+          return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0) {
+              clearTimeout(timer);
+              timer = null;
+              if (visibilityHandler && typeof document !== 'undefined') {
+                document.removeEventListener('visibilitychange', visibilityHandler);
+                visibilityHandler = null;
+              }
+            }
+          };
+        },
+        refreshNow() {
+          if (!inFlight && !disposed) void load();
+        },
+        setPaused(paused) {
+          publish({ paused: Boolean(paused) });
+          if (!snapshot.paused) schedule();
+          else {
+            clearTimeout(timer);
+            timer = null;
+            publish({ refreshing: false });
+          }
+        },
+      };
+    }
+
+    const marketStore = createMarketStore();
+
+    /** Subscribe one component to the shared live market feed; syncs the pause toggle. */
+    function useMarketFeed(paused) {
+      const [snapshot, setSnapshot] = React.useState(marketStore.getSnapshot());
+      React.useEffect(() => marketStore.subscribe(setSnapshot), []);
+      React.useEffect(() => {
+        marketStore.setPaused(Boolean(paused));
+      }, [paused]);
+      return snapshot;
+    }
+
+    /** Manual refresh: pull both the state snapshot and the live market feed now. */
+    function refreshAll() {
+      store.refreshNow();
+      marketStore.refreshNow();
+    }
 
     /** Subscribe one component to the shared poll snapshot. */
     function useDashboardState() {
@@ -2807,6 +3400,80 @@ window.__ModuleLoader__.load({
 .atm-plan-text{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
 .atm-plan-list{margin:0;padding-left:15px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-primary,inherit)}
 .atm-plan-list li{margin:0}
+.atm-topbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:12px;padding:8px 12px;background:var(--dsw-alias-bg-l2,transparent)}
+.atm-brand{display:flex;align-items:center;gap:9px;min-width:0}
+.atm-brand-mark{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:9px;border:.5px solid var(--dsw-alias-state-business-primary,currentColor);color:var(--dsw-alias-state-business-primary,inherit);font-weight:700;font-size:12px;letter-spacing:.04em;flex:0 0 auto}
+.atm-brand-text{display:flex;flex-direction:column;min-width:0}
+.atm-brand-title{font-size:15px;font-weight:700;line-height:20px;letter-spacing:.04em}
+.atm-brand-sub{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.atm-topbar-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.atm-clock{display:inline-flex;align-items:baseline;gap:5px;font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary,inherit);font-variant-numeric:tabular-nums;white-space:nowrap}
+.atm-clock b{color:var(--dsw-alias-label-primary,inherit);font-weight:600}
+.atm-feed-pill{display:inline-flex;align-items:center;gap:4px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:1px 8px;font-size:10px;line-height:17px;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-feed-pill[data-status="live"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-feed-pill[data-status="closed"]{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-tertiary,inherit));border-color:currentColor}
+.atm-feed-pill[data-status="unavailable"]{color:var(--dsw-alias-label-tertiary,inherit);border-style:dashed}
+.atm-feed-pill .atm-dot{width:5px;height:5px}
+.atm-feed-pill[data-status="live"] .atm-dot{animation:atm-pulse 1.6s ease-in-out infinite}
+@keyframes atm-pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.atm-tabs{display:flex;gap:3px;flex-wrap:wrap;border-bottom:.5px solid var(--dsw-alias-border-l2,currentColor);padding-bottom:4px}
+.atm-tab{font:inherit;font-size:12px;line-height:18px;border:.5px solid transparent;background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:7px;padding:2px 10px;cursor:pointer;white-space:nowrap}
+.atm-tab:hover{background:var(--dsw-alias-interactive-bg-hover,transparent)}
+.atm-tab[data-active="true"]{color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-border-l2,currentColor);background:var(--dsw-alias-bg-l2,transparent);font-weight:600}
+.atm-tab-panel{display:flex;flex-direction:column;gap:10px;min-width:0}
+.atm-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:8px}
+.atm-kpi{display:flex;flex-direction:column;gap:1px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:10px;padding:7px 10px;background:var(--dsw-alias-bg-l2,transparent)}
+.atm-kpi-label{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.atm-kpi-value{font-size:16px;font-weight:600;line-height:23px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:baseline;gap:5px}
+.atm-kpi-delta{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.atm-kpi[data-direction="up"] .atm-kpi-value{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-kpi[data-direction="down"] .atm-kpi-value{color:var(--dsw-alias-state-error-primary,inherit)}
+.atm-arrow-up{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-arrow-down{color:var(--dsw-alias-state-error-primary,inherit)}
+.atm-chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.atm-chart{border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:4px;min-width:0;background:var(--dsw-alias-bg-l2,transparent)}
+.atm-chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.atm-chart-title{font-size:11.5px;font-weight:600;line-height:17px}
+.atm-chart-meta{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);font-variant-numeric:tabular-nums}
+.atm-chart svg{width:100%;height:auto;display:block;overflow:visible}
+.atm-chart-empty{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit);padding:18px 0;text-align:center;border:.5px dashed var(--dsw-alias-border-l2,currentColor);border-radius:8px}
+.atm-spark{display:inline-block;vertical-align:middle}
+.atm-spark path{fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
+.atm-spark[data-direction="up"] path{stroke:var(--dsw-alias-state-business-primary,currentColor)}
+.atm-spark[data-direction="down"] path{stroke:var(--dsw-alias-state-error-primary,currentColor)}
+.atm-spark[data-direction="flat"] path{stroke:var(--dsw-alias-label-tertiary,currentColor)}
+.atm-mix-bars{display:flex;flex-direction:column;gap:5px}
+.atm-mix-row{display:flex;flex-direction:column;gap:1px}
+.atm-mix-head{display:flex;align-items:baseline;justify-content:space-between;gap:6px;font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-mix-track{position:relative;height:8px;border-radius:999px;background:var(--dsw-alias-fill-l2,var(--dsw-alias-border-l2,currentColor));overflow:hidden}
+.atm-mix-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--dsw-alias-state-business-primary,currentColor)}
+.atm-mix-row[data-side="swing"] .atm-mix-fill{background:var(--dsw-alias-label-tertiary,currentColor)}
+.atm-mix-target{position:absolute;top:-2px;bottom:-2px;width:1.5px;background:var(--dsw-alias-label-primary,currentColor);opacity:.7}
+.atm-tape-wrap{overflow:auto;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px;max-height:360px}
+.atm-tape{width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:16px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.atm-tape th{position:sticky;top:0;z-index:1;text-align:left;font-weight:500;color:var(--dsw-alias-label-tertiary,inherit);background:var(--dsw-alias-bg-l2,var(--dsw-alias-bg-base,Canvas));border-bottom:.5px solid var(--dsw-alias-border-l2,currentColor);padding:3px 8px}
+.atm-tape td{border-bottom:.5px solid var(--dsw-alias-border-l2,currentColor);padding:3px 8px;vertical-align:middle}
+.atm-tape tbody tr:last-child td{border-bottom:0}
+.atm-tape tbody tr:hover{background:var(--dsw-alias-interactive-bg-hover,transparent)}
+.atm-tape .atm-sym{font-weight:600;letter-spacing:.02em}
+.atm-tape .atm-chg-up{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-tape .atm-chg-down{color:var(--dsw-alias-state-error-primary,inherit)}
+.atm-tape .atm-chg-flat{color:var(--dsw-alias-label-tertiary,inherit)}
+@keyframes atm-flash-up{0%{background:color-mix(in srgb,var(--dsw-alias-state-business-primary,currentColor) 26%,transparent)}100%{background:transparent}}
+@keyframes atm-flash-down{0%{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,currentColor) 26%,transparent)}100%{background:transparent}}
+.atm-flash-up{animation:atm-flash-up 1.1s ease-out}
+.atm-flash-down{animation:atm-flash-down 1.1s ease-out}
+.atm-closed-label{font-size:10.5px;line-height:15px;color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-tertiary,inherit));white-space:nowrap}
+.atm-stance-chip{display:inline-flex;align-items:center;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 6px;font-size:9.5px;line-height:15px;font-weight:600;letter-spacing:.03em;white-space:nowrap;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-stance-chip[data-tone="trade"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-stance-chip[data-tone="cautious"]{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit));border-color:currentColor}
+.atm-stance-chip[data-tone="stand_down"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor}
+.atm-research-summary{display:flex;gap:6px;flex-wrap:wrap;font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary,inherit)}
+@media (max-width:820px){
+  .atm-topbar{align-items:flex-start}
+  .atm-chart-grid{grid-template-columns:1fr}
+  .atm-kpis{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}
+}
 .atm-close{font:inherit;font-size:13px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:6px;padding:0 7px;cursor:pointer}
 .atm-close:hover{color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-interactive-bg-hover,transparent)}
 .atm-icon{display:block}
@@ -3826,16 +4493,19 @@ window.__ModuleLoader__.load({
     const TABLE_COLUMNS = [
       { key: 'index', label: '#', sortable: false, width: '30px' },
       { key: 'name', labelKey: 'agent', sortable: true },
+      { key: 'basket', labelKey: 'basket', sortable: false },
       { key: 'generation', labelKey: 'gen', sortable: true },
       { key: 'strategyType', labelKey: 'strategyType', sortable: false },
       { key: 'estInterval', labelKey: 'estInterval', sortable: false },
       { key: 'instruments', labelKey: 'instruments', sortable: false },
+      { key: 'stance', labelKey: 'stance', sortable: false },
       { key: 'genome', labelKey: 'genome', sortable: false },
       { key: 'trading', labelKey: 'trading', sortable: false },
       { key: 'research', labelKey: 'research', sortable: false },
       { key: 'equityUsd', labelKey: 'equity', sortable: true },
       { key: 'pnlUsd', labelKey: 'pnl', sortable: true },
       { key: 'dayPnlPct', labelKey: 'dayPnl', sortable: true },
+      { key: 'trend', labelKey: 'trend', sortable: false },
       { key: 'runwayHours', labelKey: 'runway', sortable: true },
       { key: 'status', labelKey: 'statusLabel', sortable: true },
       { key: 'positions', labelKey: 'positions', sortable: false },
@@ -3932,6 +4602,7 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'atm-name-main', key: 'n', title: row.name }, row.name),
                   h('span', { className: 'atm-name-sub atm-mono', key: 'id', title: row.id }, row.shortId),
                 ])),
+                h('td', { key: 'basket', className: 'atm-muted', title: row.basket.length > 0 ? row.basket.join(', ') : '' }, row.basketText ?? '—'),
                 h('td', { key: 'gen', className: 'atm-mono' }, fmtNum(row.generation)),
                 h('td', { key: 'strategyType' }, h(StrategyTypeChip, { t, strategy: row.strategy })),
                 h('td', { key: 'estInterval', className: 'atm-interval', title: row.strategy?.timeframe ?? '' }, row.intervalLabel),
@@ -3941,28 +4612,32 @@ window.__ModuleLoader__.load({
                   tooltip: row.instrumentTooltip,
                   emptyLabel: t('instrumentsEmpty'),
                 })),
+                h('td', { key: 'stance' }, row.stanceBadge
+                  ? h('span', { className: 'atm-stance-chip', 'data-tone': row.stanceBadge.tone, title: row.policy?.thesis ?? '' }, t(row.stanceBadge.labelKey))
+                  : h('span', { className: 'atm-muted' }, '—')),
                 h('td', { key: 'genome', title: row.genomeParamsText }, row.genomeText),
                 h('td', { key: 'trading', title: row.specParamsText }, [
                   h('span', { key: 'spec' }, row.specText ?? t('none')),
                   row.tradingDiffers ? h('span', { key: 'diff', className: 'atm-warn', title: t('specDiffers') }, ' ≠') : null,
                 ]),
                 h('td', { key: 'research', title: row.research?.summary ?? '' }, h(ResearchBadge, { t, row })),
-                h('td', { key: 'equity', className: 'atm-mono' }, fmtUsd(row.equityUsd)),
+                h('td', { key: 'equity', className: 'atm-mono' }, fmtUsd(row.liveEquityUsd ?? row.equityUsd)),
                 h('td', {
                   key: 'pnl',
                   className: `atm-mono ${row.pnlUsd === null ? '' : row.pnlUsd > 0 ? 'atm-pos' : row.pnlUsd < 0 ? 'atm-neg' : ''}`,
                 }, `${fmtSignedUsd(row.pnlUsd)}${row.pnlPct === null ? '' : ` (${fmtPercentPoints(row.pnlPct)})`}`),
                 h('td', {
                   key: 'day',
-                  className: `atm-mono ${(row.dayPnlPct ?? 0) > 0 ? 'atm-pos' : (row.dayPnlPct ?? 0) < 0 ? 'atm-neg' : ''}`,
-                }, fmtPct(row.dayPnlPct)),
+                  className: `atm-mono ${((row.liveDayPnlPct ?? row.dayPnlPct) ?? 0) > 0 ? 'atm-pos' : ((row.liveDayPnlPct ?? row.dayPnlPct) ?? 0) < 0 ? 'atm-neg' : ''}`,
+                }, fmtPct(row.liveDayPnlPct ?? row.dayPnlPct)),
+                h('td', { key: 'trend' }, h(Sparkline, { values: row.sparkline, direction: row.liveDirection ?? 'flat', width: 64, height: 18 })),
                 h('td', { key: 'runway' }, h(RunwayCell, { row })),
                 h('td', { key: 'status' }, h(StatusCell, { t, row })),
                 h('td', {
                   key: 'positions',
                   className: 'atm-mono',
-                  title: `${t('positionsCount')} ${row.positionCount} · ${t('tradesCount')} ${row.tradesCount}`,
-                }, `${row.positionCount} / ${row.tradesCount}`),
+                  title: `${t('positionsCount')} ${row.livePositions ?? row.positionCount} · ${t('tradesCount')} ${row.tradesCount}`,
+                }, `${row.livePositions ?? row.positionCount} / ${row.tradesCount}`),
               ]))),
             ])),
       ]);
@@ -4246,24 +4921,370 @@ window.__ModuleLoader__.load({
     }
 
     // -----------------------------------------------------------------------
+    // v3.2 analytics components (live dashboard)
+    // -----------------------------------------------------------------------
+
+    function Sparkline({ values, direction = 'flat', width = 96, height = 24 }) {
+      const path = sparklinePath(values, { width, height });
+      if (!path) return null;
+      return h('svg', {
+        className: 'atm-spark',
+        'data-direction': direction,
+        width,
+        height,
+        viewBox: `0 0 ${width} ${height}`,
+        'aria-hidden': true,
+        focusable: 'false',
+      }, h('path', { d: path }));
+    }
+
+    function EquityChart({ t, equity }) {
+      const chart = equity ?? equityChartPoints([]);
+      const head = h('div', { className: 'atm-chart-head', key: 'head' }, [
+        h('span', { className: 'atm-chart-title', key: 'title' }, t('equityChart')),
+        h('span', { className: 'atm-chart-meta', key: 'meta' }, chart.hasData
+          ? `${fmtUsd(chart.last.equityUsd)} · Δ ${fmtSignedUsd(chart.deltaUsd)} (${fmtPct(chart.deltaPct)})`
+          : ''),
+      ]);
+      if (!chart.hasData) {
+        return h('div', { className: 'atm-chart' }, [head, h('div', { className: 'atm-chart-empty', key: 'empty' }, t('chartEmpty'))]);
+      }
+      const width = 640;
+      const height = 170;
+      const step = Math.max(1, Math.ceil(chart.points.length / 24));
+      return h('div', { className: 'atm-chart' }, [
+        head,
+        h('svg', { key: 'svg', viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': t('equityChart') }, [
+          h('path', { key: 'area', d: chart.area, fill: 'var(--dsw-alias-state-business-primary,currentColor)', opacity: 0.12, stroke: 'none' }),
+          h('path', { key: 'line', d: chart.path, fill: 'none', stroke: 'var(--dsw-alias-state-business-primary,currentColor)', strokeWidth: 1.6 }),
+          chart.points.filter((__, index) => index % step === 0).map((point) => h('circle', {
+            key: `${point.x}-${point.y}`,
+            cx: point.x,
+            cy: point.y,
+            r: 2,
+            fill: 'var(--dsw-alias-state-business-primary,currentColor)',
+          }, h('title', null, `${fmtUsd(point.equityUsd)} · ${fmtDateTime(point.at)}`))),
+        ]),
+        h('div', { className: 'atm-chart-meta', key: 'range' }, `${fmtUsd(chart.min)} — ${fmtUsd(chart.max)}`),
+      ]);
+    }
+
+    function KpiCards({ t, cards }) {
+      const list = Array.isArray(cards) ? cards : [];
+      if (list.length === 0) return null;
+      return h('div', { className: 'atm-kpis' }, list.map((card) => {
+        const deltaParts = [];
+        if (card.deltaPct !== null && card.deltaPct !== undefined) deltaParts.push(fmtPct(card.deltaPct));
+        if (card.deltaUsd !== null && card.deltaUsd !== undefined) deltaParts.push(fmtSignedUsd(card.deltaUsd));
+        if (card.detailKey) deltaParts.push(`${t(card.detailKey)} ${card.detail ?? '—'}`);
+        else if (card.detail) deltaParts.push(String(card.detail));
+        return h('div', { key: card.key, className: 'atm-kpi', 'data-direction': card.direction ?? 'flat' }, [
+          h('span', { className: 'atm-kpi-label', key: 'label' }, t(card.labelKey)),
+          h('span', { className: 'atm-kpi-value', key: 'value' }, [
+            card.direction === 'up' ? h('span', { key: 'arrow', className: 'atm-arrow-up', 'aria-hidden': true }, '▲') : null,
+            card.direction === 'down' ? h('span', { key: 'arrow', className: 'atm-arrow-down', 'aria-hidden': true }, '▼') : null,
+            h('span', { key: 'text' }, card.value),
+          ]),
+          deltaParts.length > 0
+            ? h('span', { key: 'delta', className: 'atm-kpi-delta', title: card.deltaTitle ?? '' }, deltaParts.join(' · '))
+            : null,
+        ]);
+      }));
+    }
+
+    function MarketTape({ t, live, limit = null, titleKey = 'tape' }) {
+      const rows = Array.isArray(live?.tape) ? (limit === null ? live.tape : live.tape.slice(0, limit)) : [];
+      const feedStatus = live?.feedStatus ?? 'unavailable';
+      const open = live?.marketOpen;
+      const head = h('div', { className: 'atm-chart-head', key: 'head' }, [
+        h('span', { className: 'atm-chart-title', key: 'title' }, t(titleKey)),
+        h('span', { className: 'atm-chart-meta', key: 'meta' }, [
+          h('span', { key: 'feed', className: 'atm-feed-pill', 'data-status': feedStatus }, [
+            h('span', { key: 'dot', className: 'atm-dot', 'aria-hidden': true }),
+            feedStatus === 'live' ? t('feedLive') : feedStatus === 'closed' ? t('feedClosed') : t('feedUnavailable'),
+          ]),
+          open === false ? h('span', { key: 'closed', className: 'atm-closed-label' }, ` ${t('closedLastClose')}`) : null,
+          live?.lastUpdatedAt ? h('span', { key: 'updated', className: 'atm-muted' }, ` ${fmtAgo(live.lastUpdatedAt)}`) : null,
+        ]),
+      ]);
+      if (rows.length === 0) {
+        return h('div', { className: 'atm-chart' }, [head, h('div', { className: 'atm-chart-empty', key: 'empty' }, t('noMarketData'))]);
+      }
+      return h('div', { className: 'atm-chart' }, [
+        head,
+        h('div', { className: 'atm-tape-wrap', key: 'wrap' }, h('table', { className: 'atm-tape' }, [
+          h('thead', { key: 'thead' }, h('tr', null, [
+            h('th', { key: 'symbol' }, t('symbol')),
+            h('th', { key: 'last' }, t('lastPrice')),
+            h('th', { key: 'change' }, t('change')),
+            h('th', { key: 'bidask' }, t('bidAsk')),
+            h('th', { key: 'trend' }, t('trend')),
+          ])),
+          h('tbody', { key: 'tbody' }, rows.map((row) => h('tr', { key: row.key }, [
+            h('td', { key: 'symbol', className: 'atm-sym' }, row.symbol),
+            h('td', { key: 'last', className: 'atm-mono', title: row.stale ? 'stale quote' : '' }, [
+              row.priceText,
+              row.stale ? h('span', { key: 'stale', className: 'atm-muted' }, ' *') : null,
+            ]),
+            h('td', {
+              key: 'change',
+              className: `atm-mono ${row.direction === 'up' ? 'atm-chg-up' : row.direction === 'down' ? 'atm-chg-down' : 'atm-chg-flat'} ${row.direction === 'up' ? 'atm-flash-up' : row.direction === 'down' ? 'atm-flash-down' : ''}`,
+            }, h('span', { key: `${row.key}-${row.priceUsd}-${row.changeUsd}` }, `${row.changeUsdText} (${row.changePctText})`)),
+            h('td', { key: 'bidask', className: 'atm-mono atm-muted' }, `${row.bidText} / ${row.askText}`),
+            h('td', { key: 'trend' }, h(Sparkline, { values: row.sparkline, direction: row.direction, width: 72, height: 20 })),
+          ]))),
+        ])),
+      ]);
+    }
+
+    function StrategyMixChart({ t, mix }) {
+      if (!mix || mix.available !== true) {
+        return h('div', { className: 'atm-chart' }, [
+          h('div', { className: 'atm-chart-head', key: 'head' }, h('span', { className: 'atm-chart-title', key: 't' }, t('strategyMixTitle'))),
+          h('div', { className: 'atm-chart-empty', key: 'empty' }, t('chartEmpty')),
+        ]);
+      }
+      return h('div', { className: 'atm-chart' }, [
+        h('div', { className: 'atm-chart-head', key: 'head' }, [
+          h('span', { className: 'atm-chart-title', key: 't' }, t('strategyMixTitle')),
+          h('span', { className: 'atm-chart-meta', key: 'm' }, `${t('dayVsSwing')} · ${t('target')} ${fmtPct(mix.targetDayPct)} / ${fmtPct(1 - mix.targetDayPct)}`),
+        ]),
+        h('div', { className: 'atm-mix-bars', key: 'bars' }, mix.bars.map((bar) => h('div', {
+          key: bar.key,
+          className: 'atm-mix-row',
+          'data-side': bar.key,
+        }, [
+          h('div', { className: 'atm-mix-head', key: 'head' }, [
+            h('span', { key: 'label' }, `${t(bar.labelKey)} · ${fmtNum(bar.count)}`),
+            h('span', { key: 'pct' }, `${t('actual')} ${bar.pctText} · ${t('target')} ${bar.targetText}`),
+          ]),
+          h('div', { className: 'atm-mix-track', key: 'track' }, [
+            h('div', {
+              key: 'fill',
+              className: 'atm-mix-fill',
+              style: { width: `${Math.max(0, Math.min(100, (bar.pct ?? 0) * 100))}%` },
+            }),
+            h('div', {
+              key: 'target',
+              className: 'atm-mix-target',
+              style: { left: `${Math.max(0, Math.min(100, bar.targetPct * 100))}%` },
+              title: `${t('target')} ${bar.targetText}`,
+            }),
+          ]),
+        ]))),
+      ]);
+    }
+
+    function TabBar({ t, active, onChange }) {
+      const labels = {
+        overview: 'tabOverview',
+        agents: 'tabAgents',
+        markets: 'tabMarkets',
+        research: 'tabResearch',
+        rewards: 'tabRewards',
+        settings: 'tabSettings',
+      };
+      return h('div', { className: 'atm-tabs', role: 'tablist' }, DASHBOARD_TABS.map((tab) => h('button', {
+        key: tab,
+        type: 'button',
+        role: 'tab',
+        className: 'atm-tab',
+        'data-active': active === tab ? 'true' : 'false',
+        'aria-selected': active === tab,
+        onClick: () => onChange(tab),
+      }, t(labels[tab]))));
+    }
+
+    function TopBar({ t, summary, live, paused, refreshing, onTogglePause, onRefresh }) {
+      const [now, setNow] = React.useState(() => new Date());
+      React.useEffect(() => {
+        const timer = setInterval(() => setNow(new Date()), 1000);
+        return () => clearInterval(timer);
+      }, []);
+      const clock = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+      const sessionLabel = t(live?.sessionLabelKey ?? 'marketUnknown');
+      return h('div', { className: 'atm-topbar' }, [
+        h('div', { className: 'atm-brand', key: 'brand' }, [
+          h('span', { className: 'atm-brand-mark', key: 'mark', 'aria-hidden': true }, 'M'),
+          h('div', { className: 'atm-brand-text', key: 'text' }, [
+            h('span', { className: 'atm-brand-title', key: 'title' }, t('brand')),
+            h('span', { className: 'atm-brand-sub', key: 'sub' }, t('brandSub')),
+          ]),
+        ]),
+        h('div', { className: 'atm-topbar-actions', key: 'actions' }, [
+          summary ? h(ModeBadge, { key: 'mode', t, mode: summary.mode }) : null,
+          summary ? h('span', { className: 'atm-badge', key: 'running', 'data-running': summary.running ? 'true' : 'false' }, summary.running ? t('running') : t('stopped')) : null,
+          summary?.halted ? h('span', { key: 'halted', className: 'atm-badge' }, t('halted')) : null,
+          summary ? h(KillBadge, { key: 'kill', t, on: summary.killSwitch }) : null,
+          h('span', {
+            key: 'feed',
+            className: 'atm-feed-pill',
+            'data-status': live?.feedStatus ?? 'unavailable',
+            title: live?.error ? errorText(live.error) : t('liveFeed'),
+          }, [
+            h('span', { key: 'dot', className: 'atm-dot', 'aria-hidden': true }),
+            live?.feedStatus === 'live' ? t('feedLive') : live?.feedStatus === 'closed' ? t('feedClosed') : t('feedUnavailable'),
+          ]),
+          h('span', { className: 'atm-clock', key: 'clock', title: t('marketClock') }, [
+            h('b', { key: 'session' }, sessionLabel),
+            ' · ',
+            h('span', { key: 'time', className: 'atm-mono' }, clock),
+          ]),
+          h('button', {
+            key: 'refresh',
+            type: 'button',
+            className: 'atm-btn',
+            title: t('manualRefresh'),
+            disabled: refreshing === true,
+            onClick: onRefresh,
+          }, refreshing ? t('feedRefreshing') : t('manualRefresh')),
+          h('button', {
+            key: 'pause',
+            type: 'button',
+            className: 'atm-btn',
+            'data-variant': paused ? 'active' : undefined,
+            onClick: onTogglePause,
+          }, paused ? t('resume') : t('pause')),
+        ]),
+      ]);
+    }
+
+    function ResearchSummaryPanel({ t, live, summary, controlState, runControl }) {
+      const rows = Array.isArray(live?.agents) ? live.agents : [];
+      const counts = { HOLD: 0, AVOID: 0, ALERT: 0, none: 0 };
+      for (const row of rows) {
+        const verdict = row.research?.verdict;
+        if (verdict === 'HOLD' || verdict === 'AVOID' || verdict === 'ALERT') counts[verdict] += 1;
+        else counts.none += 1;
+      }
+      return h('div', { className: 'atm-tab-panel' }, [
+        h('div', { className: 'atm-chart', key: 'status' }, [
+          h('div', { className: 'atm-chart-head', key: 'head' }, h('span', { className: 'atm-chart-title', key: 't' }, t('researchSummary'))),
+          h('div', { className: 'atm-research-summary', key: 'counts' }, [
+            h('span', { key: 'hold' }, `HOLD ${counts.HOLD}`),
+            h('span', { key: 'avoid' }, `AVOID ${counts.AVOID}`),
+            h('span', { key: 'alert' }, `ALERT ${counts.ALERT}`),
+            h('span', { key: 'none' }, `${t('none')} ${counts.none}`),
+          ]),
+          summary.research?.disabledReason
+            ? h('p', { className: 'atm-warn', key: 'disabled' }, t(summary.research.disabledReason === 'disabled' ? 'researchDisabledConfig' : 'researchDisabled'))
+            : null,
+        ]),
+        h(ResearchCadenceControl, {
+          key: 'cadence',
+          t,
+          research: summary.research,
+          controlState,
+          runControl,
+        }),
+      ]);
+    }
+
+    // -----------------------------------------------------------------------
     // dashboard (shared by the main panel and the settings tab)
     // -----------------------------------------------------------------------
 
-    function DashboardBody({ t, snapshot, summary, rows, selectedRow, onSelect, onCloseDetail }) {
+    function DashboardBody({ t, snapshot, market, live, rows, selectedRow, onSelect, onCloseDetail }) {
       const { controlState, runControl } = useControlActions();
-      return h('div', { className: 'atm-root' }, [
+      const [tab, setTab] = React.useState('overview');
+      const summary = live.summary ?? summarize(snapshot.data);
+      const paused = snapshot.paused === true;
+      const selectAgent = (id) => {
+        onSelect(id);
+        setTab('agents');
+      };
+      const diagnostics = [
+        h(BotAgentBridgeLine, { key: 'bot-agents', t, engineAgents: summary.engineAgents }),
+        h(InstrumentsLine, { key: 'instruments', t, instruments: summary.instruments }),
+        h(CapabilityWarningLine, { key: 'capability', t, capability: summary.brokerCapability }),
+        h(LastCycleLine, { key: 'last-cycle', t, lastCycle: summary.lastCycle }),
+      ];
+      const workspace = h('div', { className: 'atm-workspace', key: 'workspace', 'data-detail': selectedRow ? 'true' : 'false' }, [
+        h('div', { className: 'atm-main-col', key: 'left' }, [
+          h(AgentTable, {
+            key: 'table',
+            t,
+            rows,
+            selectedId: selectedRow ? selectedRow.id : null,
+            onSelect: selectAgent,
+            strategyMix: summary.strategyMix,
+          }),
+        ]),
+        selectedRow
+          ? h(AgentDetail, { key: 'detail', t, row: selectedRow, researchStatus: summary.research, onClose: onCloseDetail })
+          : null,
+      ]);
+      const banners = [
         summary.halted ? h('p', { className: 'atm-halt', key: 'halted' }, t('halted')) : null,
         snapshot.error ? h('p', { className: 'atm-err', key: 'fetch-error' }, `${t('lastError')}: ${errorText(snapshot.error)}`) : null,
         summary.research?.disabledReason
           ? h('p', { className: 'atm-warn', key: 'research-note' }, t(summary.research.disabledReason === 'disabled' ? 'researchDisabledConfig' : 'researchDisabled'))
           : null,
-        h(HeaderStats, { key: 'stats', t, summary }),
-        h(BotAgentBridgeLine, { key: 'bot-agents', t, engineAgents: summary.engineAgents }),
-        h(InstrumentsLine, { key: 'instruments', t, instruments: summary.instruments }),
-        h(CapabilityWarningLine, { key: 'capability', t, capability: summary.brokerCapability }),
-        h(LastCycleLine, { key: 'last-cycle', t, lastCycle: summary.lastCycle }),
+      ].filter(Boolean);
+      const overview = h('div', { className: 'atm-tab-panel', key: 'overview' }, [
+        h(KpiCards, { key: 'kpis', t, cards: live.kpis }),
+        h('div', { className: 'atm-chart-grid', key: 'charts' }, [
+          h(EquityChart, { key: 'equity', t, equity: live.equity }),
+          h(StrategyMixChart, { key: 'mix', t, mix: live.mix }),
+          h(MarketTape, { key: 'watch', t, live, limit: 6, titleKey: 'marketWatch' }),
+        ]),
+        workspace,
+        h('div', { className: 'atm-two', key: 'bottom' }, [
+          h(Generations, { key: 'gens', t, summaryData: snapshot.data }),
+          h(Obituaries, { key: 'obits', t, summaryData: snapshot.data }),
+        ]),
+      ]);
+      const agentsTab = h('div', { className: 'atm-tab-panel', key: 'agents' }, [workspace]);
+      const marketsTab = h('div', { className: 'atm-tab-panel', key: 'markets' }, [
+        h(MarketTape, { key: 'tape', t, live }),
+        ...diagnostics,
+      ]);
+      const researchRows = rows.filter((row) => row.research).slice(0, 16);
+      const researchTab = h('div', { className: 'atm-tab-panel', key: 'research' }, [
+        h(ResearchSummaryPanel, { key: 'summary', t, live, summary, controlState, runControl }),
+        h('div', { className: 'atm-chart', key: 'briefings' }, [
+          h('div', { className: 'atm-chart-head', key: 'head' }, [
+            h('span', { className: 'atm-chart-title', key: 't' }, t('research')),
+            h('span', { className: 'atm-chart-meta', key: 'm' }, `${fmtNum(researchRows.length)} / ${fmtNum(rows.length)}`),
+          ]),
+          researchRows.length === 0
+            ? h('div', { className: 'atm-chart-empty', key: 'empty' }, t('researchEmpty'))
+            : h('div', { className: 'atm-tape-wrap', key: 'wrap' }, h('table', { className: 'atm-tape' }, [
+              h('thead', { key: 'thead' }, h('tr', null, [
+                h('th', { key: 'agent' }, t('agent')),
+                h('th', { key: 'verdict' }, t('research')),
+                h('th', { key: 'sent' }, t('researchSentiment')),
+                h('th', { key: 'conf' }, t('confidence')),
+                h('th', { key: 'age' }, t('time')),
+              ])),
+              h('tbody', { key: 'tbody' }, researchRows.map((row) => h('tr', {
+                key: row.id,
+                'data-clickable': 'true',
+                onClick: () => selectAgent(row.id),
+              }, [
+                h('td', { key: 'agent' }, h('span', { className: 'atm-sym' }, row.name)),
+                h('td', { key: 'verdict' }, h(ResearchBadge, { t, row })),
+                h('td', { key: 'sent', className: 'atm-mono' }, row.research?.sentiment === null || row.research?.sentiment === undefined ? '—' : row.research.sentiment.toFixed(2)),
+                h('td', { key: 'conf', className: 'atm-mono' }, row.research?.confidence === null || row.research?.confidence === undefined ? '—' : `${Math.round(row.research.confidence * 100)}%`),
+                h('td', { key: 'age', className: 'atm-muted' }, fmtAgo(row.research?.at)),
+              ]))),
+            ])),
+        ]),
+      ]);
+      const data = snapshot.data ?? {};
+      const rewardsTab = h('div', { className: 'atm-tab-panel', key: 'rewards' }, [
+        h(RewardsControl, {
+          key: 'rewards',
+          t,
+          rewards: data.engine?.rewards ?? null,
+          history: Array.isArray(data.rewards?.history) ? data.rewards.history : [],
+          controlState,
+          runControl,
+        }),
+        h(Leaderboards, { key: 'leaderboards', t, rankings: data.rankings ?? null, onSelect: selectAgent }),
+      ]);
+      const settingsTab = h('div', { className: 'atm-tab-panel', key: 'settings' }, [
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
-        h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
         h(OperatorPanel, {
           key: 'operator',
           t,
@@ -4271,27 +5292,43 @@ window.__ModuleLoader__.load({
           summary,
           controlState,
           runControl,
-          onSelect,
+          onSelect: selectAgent,
         }),
-        h('div', { className: 'atm-workspace', key: 'workspace', 'data-detail': selectedRow ? 'true' : 'false' }, [
-          h('div', { className: 'atm-main-col', key: 'left' }, [
-            h(AgentTable, {
-              key: 'table',
-              t,
-              rows,
-              selectedId: selectedRow ? selectedRow.id : null,
-              onSelect,
-              strategyMix: summary.strategyMix,
-            }),
-            h('div', { className: 'atm-two', key: 'bottom' }, [
-              h(Generations, { key: 'gens', t, summaryData: snapshot.data }),
-              h(Obituaries, { key: 'obits', t, summaryData: snapshot.data }),
-            ]),
-          ]),
-          selectedRow
-            ? h(AgentDetail, { key: 'detail', t, row: selectedRow, researchStatus: summary.research, onClose: onCloseDetail })
-            : null,
-        ]),
+        h(HeaderStats, { key: 'stats', t, summary }),
+        h('p', { className: 'atm-note', key: 'paper-note' }, `${t('paperDefault')} · ${t('externalReaper')}`),
+      ]);
+      const tabContent = tab === 'agents'
+        ? agentsTab
+        : tab === 'markets'
+          ? marketsTab
+          : tab === 'research'
+            ? researchTab
+            : tab === 'rewards'
+              ? rewardsTab
+              : tab === 'settings'
+                ? settingsTab
+                : overview;
+      return h('div', { className: 'atm-root' }, [
+        h(TopBar, {
+          key: 'top',
+          t,
+          summary,
+          live,
+          paused,
+          refreshing: snapshot.refreshing === true || market?.refreshing === true,
+          onTogglePause: () => store.togglePaused(),
+          onRefresh: refreshAll,
+        }),
+        ...banners,
+        h(ControlBar, {
+          key: 'controls',
+          t,
+          summary: { ...summary, paused },
+          controlState,
+          runControl,
+        }),
+        h(TabBar, { key: 'tabs', t, active: tab, onChange: setTab }),
+        tabContent,
         summary.lastError ? h('p', { className: 'atm-err', key: 'last-error' }, `${t('lastError')}: ${errorText(summary.lastError)}`) : null,
         h('p', { className: 'atm-note', key: 'note' },
           `${t('brakes')} · ${t('externalReaper')} · ${t('updated')} ${fmtAgo(snapshot.data.at)}`),
@@ -4300,14 +5337,16 @@ window.__ModuleLoader__.load({
 
     /**
      * Shared dashboard page: used for the sidebar-opened `main` panel and the
-     * `settings.plugins.tab` page. Selection is component-local (per surface) and
-     * survives polling because rows are re-looked-up by agent id.
+     * `settings.plugins.tab` page. The live market feed (2 s) and the state snapshot (5 s)
+     * share the pause toggle; selection is component-local and persisted across polling by
+     * re-looking agents up by id.
      */
     function AutomatonDashboard({ t, variant }) {
       const snapshot = useDashboardState();
+      const market = useMarketFeed(snapshot.paused);
       const summaryData = snapshot.data;
-      const summary = React.useMemo(() => (summaryData ? summarize(summaryData) : null), [summaryData]);
-      const rows = React.useMemo(() => (summaryData ? buildAgentRows(summaryData) : []), [summaryData]);
+      const live = React.useMemo(() => liveViewMapping(summaryData, market.data), [summaryData, market.data]);
+      const rows = live.hasState ? live.agents : [];
       const [selectedId, setSelectedId] = React.useState(null);
       const selectedRow = React.useMemo(() => findAgentRow(rows, selectedId), [rows, selectedId]);
       React.useEffect(() => {
@@ -4319,26 +5358,23 @@ window.__ModuleLoader__.load({
       const isSettings = variant === 'settings';
       return h('div', { className: isSettings ? 'atm-root atm-settings' : 'atm-root atm-main' }, [
         h('style', { key: 'css' }, APP_CSS),
-        h('div', { className: 'atm-head', key: 'head' }, [
-          h('div', { className: 'atm-head-main', key: 'titles' }, [
-            h('h2', { className: 'atm-title', key: 'title' }, t('title')),
-            h('p', { className: 'atm-sub', key: 'sub' }, t('subtitle')),
-          ]),
-          h('div', { className: 'atm-head-actions', key: 'actions' }, [
-            summary ? h(ModeBadge, { key: 'mode', t, mode: summary.mode }) : null,
-            summary ? h('span', { className: 'atm-badge', key: 'loop', 'data-running': summary.running ? 'true' : 'false' }, summary.running ? t('running') : t('stopped')) : null,
-            summary ? h(KillBadge, { key: 'kill', t, on: summary.killSwitch }) : null,
-            h(PauseToggle, { key: 'pause', t }),
-            h('span', { className: 'atm-muted', key: 'auto', title: t('autoRefresh') }, t('autoRefresh')),
-          ]),
-        ]),
         !summaryData
-          ? h('p', { className: 'atm-muted', key: 'loading' }, snapshot.error ? `${t('offline')}: ${errorText(snapshot.error)}` : t('loading'))
+          ? h('div', { className: 'atm-topbar', key: 'loading-bar' }, [
+            h('div', { className: 'atm-brand', key: 'brand' }, [
+              h('span', { className: 'atm-brand-mark', key: 'mark', 'aria-hidden': true }, 'M'),
+              h('div', { className: 'atm-brand-text', key: 'text' }, [
+                h('span', { className: 'atm-brand-title', key: 'title' }, t('brand')),
+                h('span', { className: 'atm-brand-sub', key: 'sub' }, t('brandSub')),
+              ]),
+            ]),
+            h('span', { className: 'atm-muted', key: 'status' }, snapshot.error ? `${t('offline')}: ${errorText(snapshot.error)}` : t('loading')),
+          ])
           : h(DashboardBody, {
             key: 'body',
             t,
             snapshot,
-            summary,
+            market,
+            live,
             rows,
             selectedRow,
             onSelect: (id) => setSelectedId((previous) => (previous === id ? null : id)),
@@ -4487,6 +5523,16 @@ window.__ModuleLoader__.load({
         agentRankingBadges,
         agentPnlMapping,
         MEDALS,
+        changeDirection,
+        marketChangePctText,
+        sparklinePath,
+        marketTapeRows,
+        equityChartPoints,
+        kpiCards,
+        strategyMixBreakdown,
+        agentTableRows,
+        marketSession,
+        liveViewMapping,
         summarize,
         generationRows,
         obituaryRows,
@@ -4512,8 +5558,12 @@ window.__ModuleLoader__.load({
         shortId,
         modeOf,
         STATE_URL,
+        MARKET_URL,
         CONTROL_URL,
         POLL_MS,
+        STATE_POLL_MS,
+        MARKET_POLL_MS,
+        DASHBOARD_TABS,
         PANEL_ID,
         SIDEBAR_SLOT,
         MAIN_SLOT,

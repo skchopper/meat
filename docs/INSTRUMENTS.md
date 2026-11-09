@@ -3,8 +3,8 @@
 > **Status:** implemented (v3.0): `src/instruments.js`, multi-asset `ledger.js`, `brakes.js` D2/D15–D18,
 > `treasurer.js` mandates, `broker-alpaca.js`/`broker-sim.js`, multi-instrument `executor.js`,
 > `reaper.js`/`simulate.js` liquidation, bot-agent instrument policy, status/panel and docs.
-> Tests: instruments 7, market 43, mortality 70, security 53, control 17, integration 34, plugin 43,
-> bot-agent 9, research 13, rankings 16 (305 total across 10 suites, all passing).
+> Tests: **346 total across 10 suites**, all passing (v3.2): mortality 76, market 50, plugin 46,
+> integration 53, security 58, research 13, rankings 16, control 18, bot-agent 9, instruments 7.
 
 Goal: every bot may use **margin, short selling, long options, defined-risk option spreads, and
 covered calls**, and uses them actively when its strategy sees an edge. Paper trading by default;

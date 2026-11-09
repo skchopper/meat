@@ -118,7 +118,9 @@ export function resolveInstrumentPermissions(config) {
   }
   return {
     enabled,
-    longStock: enabled,
+    // `instruments.enabled:false` restores v2 long-stock-only behaviour: long stock is ALWAYS
+    // allowed (it is the baseline instrument); only short/options/margin are disabled.
+    longStock: true,
     shortStock: allowShort,
     longOptions: allowOptions,
     shortOptions: allowOptions && (allowCoveredCalls || allowSpreads),

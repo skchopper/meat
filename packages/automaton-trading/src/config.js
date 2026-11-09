@@ -124,6 +124,15 @@ export function defaultConfig() {
     // on the intraday timeframe every `intervalSec`; a 'swing' bot on its slower timeframe.
     // null = derive from cycleIntervalSec + data.timeframe (backward compatible).
     cadence: null,
+    // v3.2 strategy mix + multi-symbol portfolio (docs/PORTFOLIO-ANALYTICS.md).
+    strategyMix: { dayPct: 0.5 },
+    portfolio: {
+      basketSizeDay: 4,
+      basketSizeSwing: 3,
+      maxOpenPositionsDay: 5,
+      maxOpenPositionsSwing: 3,
+      maxOrdersPerCycle: 2,
+    },
     // Per-bot agent brain (docs/BOT-AGENTS.md): each bot reviews its own strategy in an isolated
     // context on its cadence and writes a policy the executor consumes.
     agents: {
@@ -492,6 +501,20 @@ export function validateConfig(config) {
       }
     }
   }
+  // v3.2: 70/30 strategy mix + multi-symbol portfolio limits.
+  const mixCfg = config.strategyMix;
+  if (!mixCfg || typeof mixCfg !== 'object') fail('CONFIG_INVALID', 'strategyMix config object is required');
+  assertNumber(mixCfg.dayPct, 'strategyMix.dayPct', { min: 0.1, max: 0.9 });
+  const portfolioCfg = config.portfolio;
+  if (!portfolioCfg || typeof portfolioCfg !== 'object') fail('CONFIG_INVALID', 'portfolio config object is required');
+  assertNumber(portfolioCfg.basketSizeDay, 'portfolio.basketSizeDay', { min: 1, max: 8 });
+  assertNumber(portfolioCfg.basketSizeSwing, 'portfolio.basketSizeSwing', { min: 1, max: 8 });
+  assertNumber(portfolioCfg.maxOpenPositionsDay, 'portfolio.maxOpenPositionsDay', { min: 1, max: 12 });
+  assertNumber(portfolioCfg.maxOpenPositionsSwing, 'portfolio.maxOpenPositionsSwing', { min: 1, max: 12 });
+  assertNumber(portfolioCfg.maxOrdersPerCycle, 'portfolio.maxOrdersPerCycle', { min: 1, max: 8 });
+  for (const key of ['basketSizeDay', 'basketSizeSwing', 'maxOpenPositionsDay', 'maxOpenPositionsSwing', 'maxOrdersPerCycle']) {
+    if (!Number.isInteger(portfolioCfg[key])) fail('CONFIG_INVALID', `portfolio.${key} must be an integer`);
+  }
   const engineCfg = config.engine;
   if (!engineCfg || typeof engineCfg !== 'object') fail('CONFIG_INVALID', 'engine config object is required');
   if (typeof engineCfg.tradingHoursOnly !== 'boolean') fail('CONFIG_INVALID', 'engine.tradingHoursOnly must be boolean');
@@ -721,6 +744,8 @@ export function configSummary(config) {
       maxAgeSec: config.agents.maxAgeSec,
     },
     cadence: config.cadence,
+    strategyMix: config.strategyMix,
+    portfolio: config.portfolio,
     instruments: {
       enabled: config.instruments.enabled,
       allowMargin: config.instruments.allowMargin,

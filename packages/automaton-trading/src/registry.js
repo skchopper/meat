@@ -5,7 +5,13 @@
  * D14 (RESURRECTION_FORBIDDEN) is enforced by the absence of a revival path, by refusing
  * status changes through `update`, and by refusing `markDead` twice (AGENT_DEAD).
  *
- * Owned by mortality-core. Contract: docs/CONTRACTS.md ("Mortality modules").
+ * v3.2 (docs/PORTFOLIO-ANALYTICS.md §2): a bot may manage a multi-symbol basket.
+ * `agent.symbols` is a sanitized, unique, uppercase 1..8 symbol basket (primary = first),
+ * derived for legacy records from `genome.symbols` or `genome.symbol`. `agent.specIds`
+ * maps symbol → specId; the legacy single `agent.specId` remains the primary spec and is
+ * preserved separately. Both fields are additive: old state files load unchanged.
+ *
+ * Owned by mortality-core. Contract: docs/CONTRACTS.md + docs/PORTFOLIO-ANALYTICS.md.
  */
 
 import fs from 'node:fs';
@@ -16,6 +22,12 @@ import { statePaths } from './config.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 
+/** Maximum basket size (docs/PORTFOLIO-ANALYTICS.md): day bots default 4, swing 3. */
+export const MAX_BASKET_SYMBOLS = 8;
+
+/** Same ticker shape config.js validates for `config.symbols`. */
+const SYMBOL_PATTERN = /^[A-Z][A-Z0-9.]{0,9}$/;
+
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const clone = (value) => (value === undefined ? undefined : structuredClone(value));
 const toIso = (value, fallbackIso) => {
@@ -24,6 +36,61 @@ const toIso = (value, fallbackIso) => {
   return fallbackIso;
 };
 
+/**
+ * Sanitize a basket: uppercase tickers, unique, order-preserving, capped at
+ * MAX_BASKET_SYMBOLS. Accepts an array or a single string; anything else is empty.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function sanitizeBasket(value) {
+  const list = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+  /** @type {string[]} */
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const symbol = raw.trim().toUpperCase();
+    if (symbol === '' || !SYMBOL_PATTERN.test(symbol) || seen.has(symbol)) continue;
+    seen.add(symbol);
+    out.push(symbol);
+    if (out.length >= MAX_BASKET_SYMBOLS) break;
+  }
+  return out;
+}
+
+/**
+ * Sanitize a symbol → specId map (plain object, uppercase keys, non-empty string values).
+ * @param {unknown} value
+ * @returns {Record<string, string>}
+ */
+export function sanitizeSpecIds(value) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (!isPlainObject(value)) return out;
+  for (const [rawSymbol, rawSpecId] of Object.entries(value)) {
+    if (typeof rawSpecId !== 'string' || rawSpecId.trim() === '') continue;
+    const symbol = String(rawSymbol ?? '').trim().toUpperCase();
+    if (symbol === '' || !SYMBOL_PATTERN.test(symbol)) continue;
+    out[symbol] = rawSpecId.trim();
+  }
+  return out;
+}
+
+/**
+ * Resolve an agent's basket with v3.2 back-compat:
+ * `agent.symbols ?? agent.genome.symbols ?? [agent.genome.symbol]`, sanitized.
+ * @param {{ symbols?: unknown, genome?: { symbols?: unknown, symbol?: unknown } }} agent
+ * @returns {string[]}
+ */
+export function basketOf(agent) {
+  const direct = agent?.symbols;
+  if (Array.isArray(direct) || typeof direct === 'string') return sanitizeBasket(direct);
+  const genomeSymbols = agent?.genome?.symbols;
+  if (Array.isArray(genomeSymbols) || typeof genomeSymbols === 'string') return sanitizeBasket(genomeSymbols);
+  const primary = agent?.genome?.symbol;
+  return typeof primary === 'string' ? sanitizeBasket([primary]) : [];
+}
+
 function emptyState(cap) {
   return { version: 1, cap, agents: {} };
 }
@@ -31,8 +98,9 @@ function emptyState(cap) {
 /**
  * @param {{ id?: string, parentId?: string|null, generation?: number, bornAt?: string,
  *   status?: string, endowmentUsd?: number, genome?: object,
- *   mutation?: object|null, specId?: string|null, lastCycleAt?: string|null,
- *   tier?: string|null, diedAt?: string|null, cause?: string|null, notes?: string[] }} agent
+ *   mutation?: object|null, specId?: string|null, specIds?: object,
+ *   symbols?: string[]|string, lastCycleAt?: string|null,
+ *   tier?: string|null, diedAt?: string|null, cause?: string|null, notes?: string[], name?: string|null }} agent
  */
 function normalizeAgent(agent) {
   const notes = Array.isArray(agent.notes) ? agent.notes.filter((note) => typeof note === 'string') : [];
@@ -48,7 +116,11 @@ function normalizeAgent(agent) {
     endowmentUsd: Number.isFinite(agent.endowmentUsd) ? round2(agent.endowmentUsd) : 0,
     genome: isPlainObject(agent.genome) ? clone(agent.genome) : {},
     mutation: agent.mutation ?? null,
-    specId: agent.specId ?? null,
+    // Legacy primary spec (the symbol selected by the Prospector/Builder) stays first-class.
+    specId: typeof agent.specId === 'string' ? agent.specId.trim() || null : null,
+    // v3.2: multi-symbol basket (primary = symbols[0]) + per-symbol spec map.
+    symbols: basketOf(agent),
+    specIds: sanitizeSpecIds(agent.specIds),
     lastCycleAt: agent.lastCycleAt ?? null,
     // Execution tier (docs/CONTROL-PANEL.md): 'day' = short-term/day-trading cadence,
     // 'swing' = mid/long-term cadence. Null until the orchestrator backfills it.

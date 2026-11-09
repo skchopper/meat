@@ -22,7 +22,7 @@ import { loadConfig, statePaths } from '../src/config.js';
 import { createClock, DAY_MS, HOUR_MS, mulberry32, round2, round4 } from '../src/util.js';
 import { createJournal, OBITUARY_INVALID, validateObituary } from '../src/journal.js';
 import { createLedger, TREASURY_ID } from '../src/ledger.js';
-import { createRegistry } from '../src/registry.js';
+import { basketOf, createRegistry, MAX_BASKET_SYMBOLS, sanitizeBasket, sanitizeSpecIds } from '../src/registry.js';
 import { createBrakes } from '../src/brakes.js';
 import { burnPerHour, createTreasurer, effectiveDeathFloor } from '../src/treasurer.js';
 import { createReplicator, MUTABLE, MUTABLE_FIELDS } from '../src/replicator.js';
@@ -987,6 +987,172 @@ describe('registry.js — population and the one-way door', () => {
     assert.equal(reloaded.all().length, 2);
     assert.equal(reloaded.population(), 1);
     assert.equal(reloaded.get('atm-2').status, 'dead');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// registry.js v3.2 — multi-symbol baskets + per-symbol spec maps
+// ---------------------------------------------------------------------------
+
+describe('registry.js — multi-symbol baskets and spec maps (v3.2)', () => {
+  it('back-compat: derives symbols from genome.symbol/genome.symbols and specIds={} for legacy records', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    registry.register({ id: 'atm-legacy', generation: 0, genome: { symbol: 'AAPL', family: 'momentum' } });
+    const legacy = registry.get('atm-legacy');
+    assert.deepEqual(legacy.symbols, ['AAPL']);
+    assert.deepEqual(legacy.specIds, {});
+    assert.equal(legacy.specId, null);
+    assert.deepEqual(basketOf(legacy), ['AAPL'], 'basketOf helper mirrors the normalized field');
+
+    // genome.symbols wins over genome.symbol and is sanitized
+    registry.register({ id: 'atm-genome-basket', genome: { symbol: 'AAPL', symbols: ['msft', 'NVDA', 'msft'] } });
+    assert.deepEqual(registry.get('atm-genome-basket').symbols, ['MSFT', 'NVDA']);
+
+    // no genome at all → empty basket (never throws)
+    registry.register({ id: 'atm-empty' });
+    assert.deepEqual(registry.get('atm-empty').symbols, []);
+    assert.deepEqual(registry.get('atm-empty').specIds, {});
+    assert.deepEqual(basketOf({}), []);
+  });
+
+  it('sanitizes baskets: uppercase, unique, invalid dropped, order preserved, capped at 8', () => {
+    assert.deepEqual(sanitizeBasket(['aapl', ' AAPL ', 'msft', 'msft', '', 42, null, 'bad!!', 'brk.b']), [
+      'AAPL',
+      'MSFT',
+      'BRK.B',
+    ]);
+    assert.equal(MAX_BASKET_SYMBOLS, 8);
+    assert.equal(sanitizeBasket(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']).length, 8);
+    assert.deepEqual(sanitizeBasket('tsla'), ['TSLA']);
+    assert.deepEqual(sanitizeBasket(undefined), []);
+    assert.deepEqual(sanitizeBasket(null), []);
+    assert.deepEqual(sanitizeBasket({ nope: true }), []);
+    assert.deepEqual(sanitizeSpecIds({ aapl: 'spec-a', ' MSFT ': ' spec-m ', bad: '', 'bad!!': 'x', 42: 'spec-42' }), {
+      AAPL: 'spec-a',
+      MSFT: 'spec-m',
+    });
+    assert.deepEqual(sanitizeSpecIds(null), {});
+    assert.deepEqual(sanitizeSpecIds(['AAPL']), {});
+  });
+
+  it('register/save/load round-trips symbols and specIds while legacy specId stays primary', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    registry.register({
+      id: 'atm-basket',
+      generation: 1,
+      name: 'Momentum AAPL',
+      genome: { symbol: 'AAPL', family: 'momentum', symbols: ['AAPL', 'MSFT', 'NVDA'] },
+      // deliberately messy basket + spec map: the registry sanitizes, never trusts
+      symbols: ['aapl', 'MSFT', 'nvda', 'aapl', 'bad!!'],
+      specId: 'spec-primary',
+      specIds: { aapl: 'spec-a', 'MSFT': 'spec-m', bad: '', '!!': 'spec-bad' },
+    });
+    const agent = registry.get('atm-basket');
+    assert.deepEqual(agent.symbols, ['AAPL', 'MSFT', 'NVDA']);
+    assert.deepEqual(agent.specIds, { AAPL: 'spec-a', MSFT: 'spec-m' });
+    assert.equal(agent.specId, 'spec-primary');
+    assert.equal(agent.name, 'Momentum AAPL');
+
+    registry.save();
+    const reloaded = createRegistry({ paths: env.paths, config: env.config, clock });
+    reloaded.load();
+    const loaded = reloaded.get('atm-basket');
+    assert.deepEqual(loaded.symbols, ['AAPL', 'MSFT', 'NVDA']);
+    assert.deepEqual(loaded.specIds, { AAPL: 'spec-a', MSFT: 'spec-m' });
+    assert.equal(loaded.specId, 'spec-primary');
+    assert.equal(loaded.genome.symbol, 'AAPL');
+  });
+
+  it('loads an old registry file (no symbols/specIds fields) cleanly and derives the basket', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    fs.mkdirSync(path.dirname(env.paths.registry), { recursive: true });
+    fs.writeFileSync(
+      env.paths.registry,
+      JSON.stringify({
+        version: 1,
+        cap: 10,
+        agents: {
+          'atm-old': {
+            id: 'atm-old',
+            generation: 0,
+            bornAt: new Date(T0).toISOString(),
+            status: 'alive',
+            endowmentUsd: 5000,
+            genome: { symbol: 'SPY', family: 'momentum' },
+            specId: 'spec-legacy',
+            notes: [],
+          },
+        },
+      }),
+      'utf8',
+    );
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    registry.load();
+    const old = registry.get('atm-old');
+    assert.deepEqual(old.symbols, ['SPY']);
+    assert.deepEqual(old.specIds, {});
+    assert.equal(old.specId, 'spec-legacy');
+  });
+
+  it('update preserves symbols/specIds when omitted and accepts sanitized replacements', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    registry.register({
+      id: 'atm-updatable',
+      generation: 1,
+      genome: { symbol: 'AAPL', symbols: ['AAPL', 'MSFT'] },
+      specIds: { AAPL: 'spec-a', MSFT: 'spec-m' },
+    });
+    const before = registry.get('atm-updatable');
+    const untouched = registry.update('atm-updatable', { lastCycleAt: clock.iso() });
+    assert.deepEqual(untouched.symbols, before.symbols);
+    assert.deepEqual(untouched.specIds, before.specIds);
+    assert.deepEqual(registry.update('atm-updatable', {}).symbols, before.symbols);
+
+    const replaced = registry.update('atm-updatable', {
+      symbols: ['tsla', 'TSLA', 'amd'],
+      specIds: { TSLA: 'spec-t', amd: 'spec-d' },
+    });
+    assert.deepEqual(replaced.symbols, ['TSLA', 'AMD']);
+    assert.deepEqual(replaced.specIds, { TSLA: 'spec-t', AMD: 'spec-d' });
+    assert.equal(replaced.id, 'atm-updatable');
+    assert.equal(replaced.status, 'alive');
+    // a later patch without the fields keeps the replacements
+    const later = registry.update('atm-updatable', { notes: ['reviewed'] });
+    assert.deepEqual(later.symbols, ['TSLA', 'AMD']);
+    assert.deepEqual(later.specIds, { TSLA: 'spec-t', AMD: 'spec-d' });
+  });
+
+  it('dead records keep their basket across death and reload, and stay immutable', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    registry.register({
+      id: 'atm-dead-basket',
+      generation: 1,
+      genome: { symbol: 'AAPL', symbols: ['AAPL', 'NVDA', 'SPY'] },
+      specIds: { AAPL: 'spec-a', NVDA: 'spec-n', SPY: 'spec-s' },
+    });
+    registry.markDead('atm-dead-basket', { cause: 'drawdown_limit', at: clock.iso(), finalEquityUsd: 1200 });
+    const dead = registry.get('atm-dead-basket');
+    assert.deepEqual(dead.symbols, ['AAPL', 'NVDA', 'SPY']);
+    assert.deepEqual(dead.specIds, { AAPL: 'spec-a', NVDA: 'spec-n', SPY: 'spec-s' });
+    assert.throws(
+      () => registry.update('atm-dead-basket', { symbols: ['TSLA'] }),
+      (error) => error.code === 'AGENT_DEAD',
+    );
+    registry.save();
+    const reloaded = createRegistry({ paths: env.paths, config: env.config, clock });
+    reloaded.load();
+    const reloadedDead = reloaded.get('atm-dead-basket');
+    assert.deepEqual(reloadedDead.symbols, ['AAPL', 'NVDA', 'SPY']);
+    assert.deepEqual(reloadedDead.specIds, { AAPL: 'spec-a', NVDA: 'spec-n', SPY: 'spec-s' });
   });
 });
 

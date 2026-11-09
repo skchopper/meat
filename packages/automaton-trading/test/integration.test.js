@@ -47,9 +47,9 @@ import { OBITUARY_FIELDS, validateObituary } from '../src/journal.js';
 import { burnPerHour, createTreasurer, deriveInstrumentPermissions } from '../src/treasurer.js';
 import { createBrakes } from '../src/brakes.js';
 import { createExecutor } from '../src/executor.js';
-import { MUTABLE_FIELDS } from '../src/replicator.js';
-import { createClock, round2 } from '../src/util.js';
-import { targetFamilyForIndex } from '../src/strategy-types.js';
+import { createReplicator, MUTABLE, MUTABLE_FIELDS } from '../src/replicator.js';
+import { createClock, mulberry32, round2 } from '../src/util.js';
+import { targetFamilyForIndex, tierForFamily } from '../src/strategy-types.js';
 import { resolveInstrumentPermissions } from '../src/instruments.js';
 import { DEATH_CAUSES } from '../src/contracts.js';
 
@@ -355,9 +355,17 @@ describe('end-to-end (mode=sim): population, metabolism, orders, demo death, per
       );
       const [, orderAgent] = String(order.clientOrderId).split(':');
       assert.equal(agentIds.has(orderAgent), true, `order attribution ${orderAgent} is not a registered agent`);
-      assert.ok(['buy', 'sell'].includes(order.side));
+      // v3.2 basket bots can open defined-risk verticals as one mleg order; those carry the
+      // buy/sell direction on their legs rather than a single top-level side.
+      const mleg = order.orderClass === 'mleg' || (Array.isArray(order.legs) && order.legs.length >= 2);
+      if (mleg) {
+        assert.ok(order.legs.length >= 2);
+        for (const leg of order.legs) assert.ok(['buy', 'sell'].includes(leg.side));
+      } else {
+        assert.ok(['buy', 'sell'].includes(order.side));
+      }
       assert.equal(order.status, 'filled');
-      assert.match(String(order.symbol), /^[A-Z.]{1,10}$/);
+      assert.match(String(order.symbol ?? order.legs?.[0]?.symbol), /^[A-Z][A-Z0-9.]{0,20}$/);
     }
     // Slippage/spread and marks move the account only slightly in this tiny sample.
     const accountDrift = Math.abs(broker.getAccount().equityUsd - 100000);
@@ -372,7 +380,13 @@ describe('end-to-end (mode=sim): population, metabolism, orders, demo death, per
       assert.match(specId, /^spec-[0-9a-f]{8}$/);
       assert.equal(fs.existsSync(path.join(world.paths.specsDir, `${specId}.json`)), true, `spec ${specId} must be on disk`);
     }
-    for (const order of ordersAfterTicks) assert.ok(config.symbols.includes(order.symbol), `${order.symbol} outside universe`);
+    for (const order of ordersAfterTicks) {
+      // v3.2 basket bots can trade option contracts; the D4 whitelist applies to the UNDERLYING.
+      const underlying = String(order.symbol ?? order.legs?.[0]?.symbol ?? '').match(/^([A-Z]+)\d{6}/)?.[1]
+        ?? order.underlying
+        ?? order.symbol;
+      assert.ok(config.symbols.includes(underlying), `${underlying} outside universe`);
+    }
     for (const trace of ticks) {
       const fatal = trace.errors.filter((error) => error.code && error.code !== 'BRAKE_DENIED');
       assert.deepEqual(fatal, [], `unexpected cycle error: ${JSON.stringify(fatal)}`);
@@ -592,13 +606,23 @@ describe('end-to-end (mode=sim): population, metabolism, orders, demo death, per
     assert.equal(registry.population(), populationBefore + 1);
     assert.ok(registry.population() <= registry.cap, 'replication must respect the population cap');
 
-    // exactly ONE genome field mutates
+    // exactly ONE genome field mutates (deep equality: inherited arrays such as `symbols`
+    // are cloned by the registry, so reference comparison would mis-count them as mutations).
+    // A `symbol` mutation also reorders the inherited basket; that is one logical mutation.
+    const symbolMutated = parentGenomeBefore.symbol !== child.genome.symbol;
     const changed = Object.keys({ ...parentGenomeBefore, ...child.genome }).filter(
-      (field) => parentGenomeBefore[field] !== child.genome[field],
+      (field) => {
+        if (field === 'symbols' && symbolMutated) return false;
+        return JSON.stringify(parentGenomeBefore[field]) !== JSON.stringify(child.genome[field]);
+      },
     );
     assert.equal(changed.length, 1, `expected exactly one mutation, changed: ${JSON.stringify(changed)}`);
     const field = changed[0];
     assert.equal(MUTABLE_FIELDS.includes(field), true, `${field} is not in the MUTABLE catalogue`);
+    // v3.2: the mutation must not grow the inherited multi-symbol basket.
+    if (Array.isArray(parent.symbols) && parent.symbols.length > 0) {
+      assert.equal(child.symbols.length, parent.symbols.length, 'child basket keeps the parent basket size');
+    }
     assert.deepEqual(child.mutation, { field, from: parentGenomeBefore[field], to: child.genome[field] });
     assert.deepEqual(replication.mutation, child.mutation);
     assert.notEqual(child.mutation.from, child.mutation.to, 'a mutation must actually change the value');
@@ -2232,5 +2256,1141 @@ describe('v3.0 multi-instrument: death liquidation, status surface, paper defaul
       };
     });
     assert.equal(allowedAgain.decision, 'ALLOW', JSON.stringify(allowedAgain));
+  });
+});
+
+// ===========================================================================
+// v3.2: multi-symbol portfolio bots and the 70/30 day/swing mix
+// ===========================================================================
+
+/** Config for the v3.2 population/migration tests (30 bots at $50 on a $100k sim account). */
+function makeV32Env(overrides = {}) {
+  return makeEnv({
+    population: { initial: 30, cap: 60 },
+    endowmentUsd: 50,
+    deathFloorUsd: 1,
+    deathFloorPct: 0,
+    maxDrawdownPct: 0.9,
+    risk: { maxDailyLossPct: 1 },
+    replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+    strategyMix: { dayPct: 0.7 },
+    // Isolate the portfolio/mix mechanics from the v3 instrument-symbol migration.
+    instruments: { enabled: false },
+    ...overrides,
+  });
+}
+
+function v32Boot(env, { seed = 7 } = {}) {
+  const clock = makeClock(T0);
+  const broker = createSimBroker(env.config, { seed, accountEquityUsd: 100000, clock });
+  return { clock, broker };
+}
+
+/**
+ * Seed a pre-v3.2 registry/ledger: 30 agents in a legacy 50/50 mix (15 swing, 15 day),
+ * one primary symbol each, legacy single spec + specIds, no portfolio-v32 marker.
+ */
+async function seedLegacyPopulation(env, clock) {
+  const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  const agents = [];
+  for (let index = 0; index < 30; index += 1) {
+    const family = index < 8 ? 'momentum' : index < 15 ? 'meanrev' : index < 23 ? 'breakout' : 'gapfade';
+    const id = `atm-legacy-${String(index).padStart(2, '0')}`;
+    const symbol = env.config.symbols[index % env.config.symbols.length];
+    const genome = {
+      symbol,
+      family,
+      lookback: 60,
+      entryZ: 1.2,
+      exitZ: 0.3,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 8,
+      sizePct: 0.15,
+      sessionFilter: 'any',
+    };
+    await registry.register({
+      id,
+      name: `Legacy ${index}`,
+      generation: 0,
+      bornAt: clock.iso(),
+      status: 'alive',
+      endowmentUsd: 50,
+      genome,
+      symbols: [symbol],
+      specId: `spec-legacy-${index}`,
+      specIds: { [symbol]: `spec-legacy-${index}` },
+      mutation: null,
+      tier: tierForFamily(family),
+      notes: ['legacy'],
+    });
+    ledger.ensureAgent(id, { endowmentUsd: 50, at: clock.iso() });
+    ledger.grant(id, 50, { reason: 'genesis', at: clock.iso() });
+    agents.push({ id, family, symbol });
+  }
+  await registry.save();
+  await ledger.save();
+  return { registry, ledger, agents };
+}
+
+describe('v3.2 multi-symbol portfolio: 70/30 genesis, migration and basket inheritance', () => {
+  it('fresh 70/30 genesis: 21 day / 9 swing, 4/3-symbol baskets, unique strategies, marker + status targets', async () => {
+    const env = makeV32Env();
+    const { clock, broker } = v32Boot(env);
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const registry = automaton._internals.registry;
+    const ledger = automaton._internals.ledger;
+    const agents = registry.alive();
+
+    assert.equal(agents.length, 30);
+    const tiers = { day: 0, swing: 0 };
+    const families = {};
+    for (const agent of agents) {
+      const tier = tierForFamily(agent.genome.family);
+      tiers[tier] += 1;
+      families[agent.genome.family] = (families[agent.genome.family] ?? 0) + 1;
+      assert.equal(agent.tier, tier, `${agent.id}: tier must follow the strategy family`);
+      assert.ok(Array.isArray(agent.symbols), `${agent.id}: registry must carry the basket`);
+      assert.deepEqual(agent.genome.symbols, agent.symbols, `${agent.id}: genome basket and registry basket must agree`);
+      assert.equal(agent.symbols[0], agent.genome.symbol, `${agent.id}: primary symbol is the first basket entry`);
+      const expectedSize = tier === 'day'
+        ? env.config.portfolio.basketSizeDay
+        : env.config.portfolio.basketSizeSwing;
+      assert.equal(agent.symbols.length, expectedSize, `${agent.id}: ${tier} basket size`);
+      assert.equal(new Set(agent.symbols).size, agent.symbols.length, `${agent.id}: basket symbols must be unique`);
+      for (const symbol of agent.symbols) {
+        assert.ok(env.config.symbols.includes(symbol), `${agent.id}: ${symbol} must be in the configured universe`);
+      }
+      assert.equal(agent.specId, null, `${agent.id}: no spec should be assigned before a tick`);
+      assert.deepEqual(agent.specIds, {});
+      assert.equal(agent.endowmentUsd, 50);
+      assert.equal(ledger.snapshot(agent.id).cashUsd, 50, `${agent.id}: genesis cash is granted`);
+      assert.equal(ledger.equity(agent.id, {}).equityUsd, 50);
+    }
+    assert.deepEqual(tiers, { day: 21, swing: 9 }, '70% of 30 bots are day/short-term');
+    assert.deepEqual(families, { momentum: 5, meanrev: 4, breakout: 11, gapfade: 10 });
+    assert.equal(registry.cap, 60);
+    // the genesis claim: every (primary symbol, family) strategy is unique for 30 bots on 14 symbols
+    const pairs = new Set(agents.map((agent) => `${agent.genome.symbol}:${agent.genome.family}`));
+    assert.equal(pairs.size, 30, 'every bot has a unique primary symbol+family strategy');
+
+    const marker = JSON.parse(fs.readFileSync(path.join(env.paths.stateDir, 'portfolio-v32.json'), 'utf8'));
+    assert.equal(marker.version, 1);
+    assert.equal(marker.changed, 30);
+
+    const status = await automaton.status();
+    assert.equal(status.mode, 'sim');
+    assert.deepEqual(status.engine.portfolio, { ...env.config.portfolio, strategyMix: { dayPct: 0.7 } });
+    assert.deepEqual(status.strategyMix.target, { dayPct: 0.7, dayCount: 21, swingCount: 9 });
+    assert.equal(status.strategyMix.day.count, 21);
+    assert.equal(status.strategyMix.swing.count, 9);
+    assert.equal(status.agents.length, 30);
+    for (const row of status.agents) {
+      assert.ok(Array.isArray(row.symbols) && row.symbols.length > 0);
+      assert.ok(Array.isArray(row.specs));
+      assert.equal(row.tier, tierForFamily(row.genome.family));
+    }
+  });
+
+  it('genesis gives every bot its own basket combination (no duplicate 4/3-symbol baskets)', async () => {
+    const env = makeV32Env();
+    const { clock, broker } = v32Boot(env);
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const baskets = automaton._internals.registry.alive().map((agent) => agent.symbols.join(','));
+    assert.equal(new Set(baskets).size, baskets.length, `duplicate baskets: ${JSON.stringify(baskets)}`);
+  });
+
+  it('pre-v3.2 50/50 population migrates to 70/30 with baskets, preserving ids/ledgers and clearing specs (idempotent)', async () => {
+    const env = makeV32Env();
+    const { clock, broker } = v32Boot(env);
+    const seeded = await seedLegacyPopulation(env, clock);
+    const before = Object.fromEntries(
+      seeded.registry.all().map((agent) => [agent.id, {
+        endowmentUsd: agent.endowmentUsd,
+        genomeSymbol: agent.genome.symbol,
+        cashUsd: seeded.ledger.snapshot(agent.id).cashUsd,
+        equityUsd: seeded.ledger.equity(agent.id, {}).equityUsd,
+      }]),
+    );
+    assert.equal(before['atm-legacy-00'].cashUsd, 50);
+
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const registry = automaton._internals.registry;
+    const ledger = automaton._internals.ledger;
+    const agents = registry.alive();
+    assert.equal(agents.length, 30);
+    const tiers = { day: 0, swing: 0 };
+    for (const agent of agents) {
+      const tier = tierForFamily(agent.genome.family);
+      tiers[tier] += 1;
+      const previous = before[agent.id];
+      assert.ok(previous, `${agent.id}: the migration must preserve ids`);
+      assert.equal(agent.endowmentUsd, previous.endowmentUsd);
+      assert.equal(ledger.snapshot(agent.id).cashUsd, previous.cashUsd, `${agent.id}: ledger cash untouched`);
+      assert.equal(ledger.equity(agent.id, {}).equityUsd, previous.equityUsd);
+      assert.equal(agent.tier, tier, `${agent.id}: tier follows the migrated family`);
+      assert.equal(agent.specId, null, `${agent.id}: legacy specs are cleared`);
+      assert.deepEqual(agent.specIds, {}, `${agent.id}: legacy per-symbol specs are cleared`);
+      assert.equal(agent.symbols.length, tier === 'day' ? 4 : 3, `${agent.id}: basket matches its NEW tier`);
+      assert.equal(agent.symbols[0], agent.genome.symbol, `${agent.id}: primary is the first basket entry`);
+      assert.deepEqual(agent.genome.symbols, agent.symbols);
+    }
+    assert.deepEqual(tiers, { day: 21, swing: 9 }, '50/50 -> 70/30 migration');
+    const marker = JSON.parse(fs.readFileSync(path.join(env.paths.stateDir, 'portfolio-v32.json'), 'utf8'));
+    assert.equal(marker.version, 1);
+    assert.equal(marker.changed, 30);
+
+    // Idempotence: a second boot with the same target changes nothing further.
+    const snapshotAfterFirst = agents
+      .map((agent) => [agent.id, agent.genome.family, agent.symbols.join(',')])
+      .sort();
+    const automaton2 = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton2.init();
+    const agents2 = automaton2._internals.registry.alive();
+    const snapshotAfterSecond = agents2
+      .map((agent) => [agent.id, agent.genome.family, agent.symbols.join(',')])
+      .sort();
+    assert.deepEqual(snapshotAfterSecond, snapshotAfterFirst, 'the migration must be idempotent');
+    const markerAgain = JSON.parse(fs.readFileSync(path.join(env.paths.stateDir, 'portfolio-v32.json'), 'utf8'));
+    assert.equal(markerAgain.at, marker.at, 'the marker is not rewritten by a no-op boot');
+  });
+
+  it('a 50/50 -> 70/30 mix change on an EXISTING v3.2 state (portfolio marker present) also re-derives baskets', async () => {
+    const env = makeV32Env({ strategyMix: { dayPct: 0.5 } });
+    const { clock, broker } = v32Boot(env);
+    const automaton50 = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton50.init();
+    const markerBefore = JSON.parse(fs.readFileSync(path.join(env.paths.stateDir, 'portfolio-v32.json'), 'utf8'));
+    const tiersBefore = automaton50._internals.registry.alive().reduce((counts, agent) => {
+      const tier = tierForFamily(agent.genome.family);
+      counts[tier] = (counts[tier] ?? 0) + 1;
+      return counts;
+    }, {});
+    assert.deepEqual(tiersBefore, { day: 15, swing: 15 }, 'the first boot is the legacy 50/50 population');
+
+    // Operator changes strategyMix.dayPct to 0.7: load a new config for the SAME state dir.
+    const { config: config70 } = loadConfig({
+      cwd: env.dir,
+      env: {},
+      configFile: path.join(env.dir, 'no-such-config.json'),
+      overrides: {
+        mode: 'sim',
+        paths: { stateDir: env.paths.stateDir, envFile: env.paths.envFile },
+        population: { initial: 30, cap: 60 },
+        endowmentUsd: 50,
+        deathFloorUsd: 1,
+        deathFloorPct: 0,
+        maxDrawdownPct: 0.9,
+        risk: { maxDailyLossPct: 1 },
+        replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+        strategyMix: { dayPct: 0.7 },
+        instruments: { enabled: false },
+      },
+    });
+    const clock70 = makeClock(T0);
+    const broker70 = createSimBroker(config70, { seed: 7, accountEquityUsd: 100000, clock: clock70 });
+    const automaton70 = await createAutomaton({ config: config70, paths: statePaths(config70), broker: broker70, clock: clock70 });
+    await automaton70.init();
+    const agents = automaton70._internals.registry.alive();
+    const tiersAfter = { day: 0, swing: 0 };
+    const basketSizes = { day: {}, swing: {} };
+    for (const agent of agents) {
+      const tier = tierForFamily(agent.genome.family);
+      tiersAfter[tier] += 1;
+      basketSizes[tier][agent.symbols.length] = (basketSizes[tier][agent.symbols.length] ?? 0) + 1;
+      assert.equal(agent.tier, tier);
+    }
+    assert.deepEqual(tiersAfter, { day: 21, swing: 9 });
+    assert.deepEqual(basketSizes.day, { 4: 21 }, 'rebalanced day bots must have 4-symbol baskets');
+    assert.deepEqual(basketSizes.swing, { 3: 9 }, 'swing bots must have 3-symbol baskets');
+    const markerAfter = JSON.parse(fs.readFileSync(path.join(env.paths.stateDir, 'portfolio-v32.json'), 'utf8'));
+    assert.equal(markerAfter.at, markerBefore.at, 'the one-time basket marker is not rewritten');
+  });
+
+  it('replicator: child inherits the parent basket, keeps its size, and has exactly one logical genome mutation', async () => {
+    const seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    const seenFields = new Set();
+    for (const seed of seeds) {
+      const env = makeV32Env({
+        population: { initial: 0, cap: 100 },
+        endowmentUsd: 5000,
+        replication: { childEndowmentUsd: 2500, surplus7dUsd: 2, minRunwayHours: 24 },
+        instruments: { enabled: false },
+      });
+      const { clock } = v32Boot(env);
+      const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+      const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+      const journal = createJournal({ paths: env.paths, config: env.config });
+      const parentId = `atm-parent-${seed}`;
+      const parentBasket = ['F', 'SOFI', 'BAC', 'INTC'];
+      const parentGenome = {
+        symbol: parentBasket[0],
+        symbols: [...parentBasket],
+        family: 'momentum',
+        lookback: 60,
+        entryZ: 1.2,
+        exitZ: 0.3,
+        stopPct: 0.02,
+        targetPct: 0.04,
+        maxHoldBars: 8,
+        sizePct: 0.15,
+        sessionFilter: 'any',
+      };
+      await registry.register({
+        id: parentId,
+        generation: 0,
+        bornAt: clock.iso(),
+        status: 'alive',
+        endowmentUsd: 5000,
+        genome: parentGenome,
+        symbols: [...parentBasket],
+        specIds: {},
+        mutation: null,
+        specId: null,
+        tier: 'day',
+      });
+      ledger.ensureAgent(parentId, { endowmentUsd: 5000, at: clock.iso() });
+      ledger.grant(parentId, 5000, { reason: 'genesis', at: clock.iso() });
+      const treasurer = {
+        fundChild(parentID, childId, amountUsd) {
+          ledger.transfer(parentID, childId, amountUsd, { reason: 'child-endowment', at: clock.iso() });
+        },
+      };
+      const replicator = createReplicator({
+        treasurer,
+        registry,
+        ledger,
+        journal,
+        config: env.config,
+        clock,
+        rng: mulberry32(seed),
+      });
+      const gate = { mayReplicate: true, surplus7dUsd: 1000, runwayHours: 1000, agentViews: [{ agentId: parentId, equityUsd: 5000 }] };
+      const spawned = await replicator.spawn(parentId, gate);
+      const { child, mutation } = spawned;
+      seenFields.add(mutation.field);
+
+      // Exactly one MUTABLE-catalogue field changes (arrays compared deeply, per v3.2).
+      const changedMutable = MUTABLE_FIELDS.filter(
+        (field) => JSON.stringify(parentGenome[field]) !== JSON.stringify(child.genome[field]),
+      );
+      assert.deepEqual(changedMutable, [mutation.field], `seed ${seed}: exactly one logical mutation`);
+      assert.equal(child.mutation.from, parentGenome[mutation.field] ?? null);
+      assert.equal(child.mutation.to, child.genome[mutation.field]);
+
+      // v3.2 basket inheritance: the child keeps the parent's basket SIZE (never grows it).
+      assert.equal(child.symbols.length, parentBasket.length, `seed ${seed} (${mutation.field}): basket must not grow`);
+      assert.equal(child.genome.symbols.length, parentBasket.length);
+      assert.deepEqual(child.genome.symbols, child.symbols, 'genome basket and registry basket agree');
+      assert.equal(child.genome.symbol, child.symbols[0]);
+      if (mutation.field === 'symbol') {
+        assert.equal(child.symbols[0], mutation.to, 'the mutated symbol becomes the basket primary');
+        const retained = parentBasket.includes(mutation.to)
+          ? parentBasket.filter((symbol) => symbol !== mutation.to)
+          : parentBasket.slice(1);
+        assert.deepEqual(child.symbols.slice(1), retained, 'the rest of the inherited basket is retained in order');
+      } else {
+        assert.deepEqual(child.symbols, parentBasket, 'non-symbol mutations leave the inherited basket untouched');
+        assert.deepEqual(child.genome.symbols, parentBasket);
+      }
+      assert.equal(child.tier, tierForFamily(child.genome.family), 'tier follows the mutated family');
+      assert.equal(ledger.snapshot(child.id).cashUsd, env.config.replication.childEndowmentUsd);
+    }
+    assert.equal(seenFields.size >= 4, true, `mutation sweep should cover several fields, got ${JSON.stringify([...seenFields])}`);
+    assert.equal(seenFields.has('symbol'), true, 'the seed sweep must cover the symbol mutation');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.2 executor: basket entries/exits, tier caps, brakes-first, legacy mode
+// ---------------------------------------------------------------------------
+
+const V32_HOUR_MS = 60 * 60 * 1000;
+
+/** Executor world with a multi-symbol basket; options disabled so playbooks fall back to long stock. */
+function makeV32PortfolioWorld({ endowmentUsd = 5000, basket = ['AAPL', 'MSFT', 'NVDA', 'AMD'] } = {}) {
+  const env = makeEnv({
+    population: { initial: 0, cap: 20 },
+    endowmentUsd,
+    deathFloorUsd: 1,
+    deathFloorPct: 0,
+    maxDrawdownPct: 0.9,
+    risk: { maxDailyLossPct: 1, maxOpenPositions: 6, maxOrdersPerCycle: 1 },
+    strategyMix: { dayPct: 0.7 },
+    instruments: { enabled: true, allowOptions: false, allowSpreads: false, allowCoveredCalls: false, allowShort: true },
+  });
+  const clock = makeClock(T0);
+  const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+  const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  const brakes = createBrakes({ config: env.config, paths: env.paths, clock });
+  const executor = createExecutor({ broker, brakes, ledger, config: env.config, clock });
+  const id = 'atm-v32port';
+  registry.register({
+    id,
+    generation: 0,
+    bornAt: clock.iso(),
+    status: 'alive',
+    endowmentUsd,
+    genome: {
+      symbol: basket[0],
+      symbols: [...basket],
+      family: 'breakout',
+      lookback: 60,
+      entryZ: 1,
+      exitZ: 0.5,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 12,
+      sizePct: 0.2,
+      sessionFilter: 'any',
+    },
+    symbols: [...basket],
+    specIds: {},
+    mutation: null,
+    specId: null,
+    tier: 'day',
+  });
+  ledger.ensureAgent(id, { endowmentUsd, at: clock.iso() });
+  ledger.grant(id, endowmentUsd, { reason: 'genesis', at: clock.iso() });
+  ledger.anchorToBrokerEquity(100000);
+  const mandate = {
+    agentId: id,
+    issuedAt: clock.iso(),
+    expiresAt: new Date(T0 + 10 * 60 * 1000).toISOString(),
+    state: 'STABLE',
+    sizeBudgetUsd: 1000,
+    maxOrderNotionalUsd: 1000,
+    maxDailyOrdersRemaining: 12,
+    allowedSymbols: [...env.config.symbols],
+    allowExitOnly: false,
+    instruments: deriveInstrumentPermissions(env.config, endowmentUsd),
+    accountEquityUsd: 100000,
+    allocatedEquityUsd: endowmentUsd,
+    buyingPowerUsd: 100000,
+  };
+  return { env, config: env.config, paths: env.paths, clock, broker, registry, ledger, brakes, executor, id, mandate, basket, endowmentUsd };
+}
+
+function v32Spec(world, symbol, { family = 'breakout', params = {} } = {}) {
+  return {
+    specId: `spec-${String(symbol).toLowerCase()}`,
+    hypothesisId: `hyp-${symbol}`,
+    agentId: world.id,
+    symbol,
+    family,
+    createdAt: new Date(T0).toISOString(),
+    proofRef: `https://data.alpaca.markets/v2/stocks/bars?symbols=${symbol}`,
+    proof: { observedAt: new Date(T0 - V32_HOUR_MS).toISOString(), sampleSize: 20 },
+    params: {
+      lookback: 60,
+      entryZ: 1,
+      exitZ: 0.5,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 12,
+      sizePct: 0.2,
+      sessionFilter: 'any',
+      ...params,
+    },
+  };
+}
+
+/** Bars whose last close breaks above the prior range: a bullish breakout signal. */
+function v32BreakoutBars(last) {
+  const bars = [];
+  for (let i = 0; i < 39; i += 1) {
+    bars.push({ t: T0 - (40 - i) * V32_HOUR_MS, o: last, h: last + 0.4, l: last - 0.4, c: last, v: 1000 });
+  }
+  bars.push({ t: T0, o: last + 1, h: last + 2, l: last + 0.9, c: last * 1.05, v: 5000 });
+  return bars;
+}
+
+function v32Market(world, symbols) {
+  const quotes = {};
+  const bars = {};
+  for (const symbol of symbols) {
+    const quote = world.broker.getLatestQuote(symbol);
+    quotes[symbol] = quote;
+    bars[symbol] = v32BreakoutBars(quote.last);
+  }
+  return { quotes, bars };
+}
+
+function v32DayStats(world) {
+  return { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 };
+}
+
+async function v32Run(world, { specs, portfolio, quotes, bars, policy = null, dayStats = null } = {}) {
+  return world.executor.run({
+    agent: world.registry.get(world.id),
+    spec: specs?.[0] ?? null,
+    specs,
+    portfolio,
+    mandate: {
+      ...world.mandate,
+      issuedAt: world.clock.iso(),
+      expiresAt: new Date(T0 + 10 * 60 * 1000).toISOString(),
+    },
+    quotes,
+    bars,
+    dayStats: dayStats ?? v32DayStats(world),
+    now: T0,
+    policy,
+  });
+}
+
+/** Seed one long stock position through the sim broker and mirror it into the ledger. */
+function v32SeedPosition(world, symbol, qty = 1) {
+  const order = world.broker.submitOrder({ symbol, side: 'buy', qty, type: 'market' });
+  world.ledger.applyFill(world.id, {
+    symbol,
+    side: 'buy',
+    qty: order.filledQty,
+    priceUsd: order.avgFillPriceUsd,
+    at: world.clock.iso(),
+    orderId: order.id,
+  });
+  return order;
+}
+
+describe('v3.2 multi-symbol executor: basket entries/exits, caps, brakes-first, legacy mode', () => {
+  it('opens entries across several basket symbols with one order per symbol and the shared per-cycle cap', async () => {
+    const world = makeV32PortfolioWorld();
+    const symbols = world.basket.slice(0, 3);
+    const specs = symbols.map((symbol) => v32Spec(world, symbol));
+    const { quotes, bars } = v32Market(world, symbols);
+    const result = await v32Run(world, { specs, portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 }, quotes, bars });
+    assert.deepEqual(result.denied, [], JSON.stringify(result.denied));
+    assert.equal(result.orders.length, 2, 'the shared maxOrdersPerCycle cap applies across symbols');
+    const orderedSymbols = result.orders.map((order) => order.symbol);
+    assert.equal(new Set(orderedSymbols).size, 2, 'one order per symbol');
+    for (const order of result.orders) {
+      assert.equal(order.side, 'buy');
+      assert.equal(order.status, 'filled');
+      const specId = specs.find((spec) => spec.symbol === order.symbol).specId;
+      assert.match(String(order.clientOrderId), new RegExp(`^atm:${world.id}:${specId}:\\d+$`), 'each order is attributed to that symbol\'s spec');
+    }
+    assert.equal(Object.keys(world.ledger.book(world.id).positions).length, 2, 'two distinct positions are open');
+    assert.equal(result.actions.filter((action) => action.type === 'entry').length, 2);
+    assert.ok(result.actions.some((action) => action.type === 'skip' && action.reason === 'max_orders_per_cycle'));
+  });
+
+  it('per-symbol exits: only the symbol whose stop is hit is sold; other basket positions are untouched', async () => {
+    const world = makeV32PortfolioWorld();
+    const symbols = ['AAPL', 'MSFT'];
+    const specs = symbols.map((symbol) => v32Spec(world, symbol));
+    v32SeedPosition(world, 'AAPL');
+    v32SeedPosition(world, 'MSFT');
+    const msftQuote = world.broker.getLatestQuote('MSFT');
+    const quotes = {
+      AAPL: { symbol: 'AAPL', bid: world.ledger.snapshot(world.id).positions.AAPL.avgPriceUsd * 0.9, ask: world.ledger.snapshot(world.id).positions.AAPL.avgPriceUsd * 0.9, last: world.ledger.snapshot(world.id).positions.AAPL.avgPriceUsd * 0.9 },
+      MSFT: msftQuote,
+    };
+    const bars = { AAPL: v32BreakoutBars(quotes.AAPL.last), MSFT: v32BreakoutBars(msftQuote.last) };
+    const result = await v32Run(world, { specs, portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 3 }, quotes, bars });
+    assert.deepEqual(result.denied, []);
+    assert.equal(result.orders.length, 1, 'only the stopped symbol may be sold');
+    assert.equal(result.orders[0].symbol, 'AAPL');
+    assert.equal(result.orders[0].side, 'sell');
+    assert.ok(result.actions.some((action) => action.type === 'exit' && action.symbol === 'AAPL' && action.reason === 'stop'));
+    const positions = world.ledger.book(world.id).positions;
+    assert.equal(positions.AAPL, undefined, 'the stopped position is closed');
+    assert.ok(positions.MSFT, 'the other basket position must be untouched');
+    assert.equal(positions.MSFT.qtySigned, 1);
+    // the remaining position can still be exited on the next run (no cross-symbol corruption);
+    // the shared order budget is 1 so the exit cannot be followed by a re-entry in the same run
+    const close = await v32Run(world, {
+      specs,
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 1 },
+      quotes: { AAPL: quotes.AAPL, MSFT: msftQuote },
+      bars,
+      policy: { stance: 'trade', atMs: T0, exitPressure: 'exit' },
+    });
+    assert.deepEqual(close.denied, []);
+    assert.deepEqual(close.orders.map((order) => order.symbol), ['MSFT']);
+    assert.deepEqual(world.ledger.book(world.id).positions, {});
+  });
+
+  it('enforces the tier maxOpenPositions cap and shares the order budget between exits and entries', async () => {
+    // 1) tier position cap: three bullish symbols, cap = 1 -> a single entry
+    const capped = makeV32PortfolioWorld();
+    const cappedSymbols = capped.basket.slice(0, 3);
+    const cappedSpecs = cappedSymbols.map((symbol) => v32Spec(capped, symbol));
+    const cappedMarket = v32Market(capped, cappedSymbols);
+    const first = await v32Run(capped, {
+      specs: cappedSpecs,
+      portfolio: { maxOpenPositions: 1, maxOrdersPerCycle: 3 },
+      quotes: cappedMarket.quotes,
+      bars: cappedMarket.bars,
+    });
+    assert.deepEqual(first.denied, []);
+    assert.equal(first.orders.length, 1, 'maxOpenPositions=1 allows only one entry in the run');
+    assert.equal(Object.keys(capped.ledger.book(capped.id).positions).length, 1);
+    assert.equal(
+      first.actions.filter((action) => action.type === 'skip' && action.reason === 'max_open_positions').length,
+      2,
+    );
+
+    // 2) shared budget: an exit consumes the only order slot, so no entry is placed in the same run
+    const shared = makeV32PortfolioWorld();
+    v32SeedPosition(shared, 'AAPL');
+    const aaplAvg = shared.ledger.snapshot(shared.id).positions.AAPL.avgPriceUsd;
+    const stalledQuote = { symbol: 'AAPL', bid: aaplAvg * 0.9, ask: aaplAvg * 0.9, last: aaplAvg * 0.9 };
+    const otherSymbols = shared.basket.slice(1, 3);
+    const otherQuotes = Object.fromEntries(otherSymbols.map((symbol) => [symbol, shared.broker.getLatestQuote(symbol)]));
+    const sharedSpecs = ['AAPL', ...otherSymbols].map((symbol) => v32Spec(shared, symbol));
+    const sharedResult = await v32Run(shared, {
+      specs: sharedSpecs,
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 1 },
+      quotes: { AAPL: stalledQuote, ...otherQuotes },
+      bars: {
+        AAPL: v32BreakoutBars(stalledQuote.last),
+        ...Object.fromEntries(otherSymbols.map((symbol) => [symbol, v32BreakoutBars(otherQuotes[symbol].last)])),
+      },
+    });
+    assert.deepEqual(sharedResult.denied, []);
+    assert.equal(sharedResult.orders.length, 1, 'the shared order budget is one');
+    assert.equal(sharedResult.orders[0].symbol, 'AAPL');
+    assert.equal(sharedResult.orders[0].side, 'sell');
+    assert.deepEqual(shared.ledger.book(shared.id).positions, {}, 'no entry may follow the exit in the same run');
+
+    // 3) brakes-first: the kill switch denies every basket order, then removal allows them again
+    const armed = makeV32PortfolioWorld();
+    const armedSymbols = armed.basket.slice(0, 2);
+    const armedSpecs = armedSymbols.map((symbol) => v32Spec(armed, symbol));
+    const armedMarket = v32Market(armed, armedSymbols);
+    fs.mkdirSync(path.dirname(armed.paths.killSwitch), { recursive: true });
+    fs.writeFileSync(armed.paths.killSwitch, JSON.stringify({ armedAt: new Date(T0).toISOString(), reason: 'verifier' }), 'utf8');
+    const blocked = await v32Run(armed, {
+      specs: armedSpecs,
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+      quotes: armedMarket.quotes,
+      bars: armedMarket.bars,
+    });
+    assert.equal(blocked.orders.length, 0);
+    assert.ok(blocked.denied.length >= 1);
+    assert.equal(blocked.denied.every((denial) => denial.code === 'KILL_SWITCH'), true, JSON.stringify(blocked.denied));
+    fs.rmSync(armed.paths.killSwitch, { force: true });
+    const allowed = await v32Run(armed, {
+      specs: armedSpecs,
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+      quotes: armedMarket.quotes,
+      bars: armedMarket.bars,
+    });
+    assert.deepEqual(allowed.denied, []);
+    assert.equal(allowed.orders.length >= 1, true);
+  });
+
+  it('legacy single-spec mode is unchanged: one symbol for entries, every held position for exits', async () => {
+    const world = makeV32PortfolioWorld();
+    const specs = ['AAPL', 'MSFT'].map((symbol) => v32Spec(world, symbol));
+    const { quotes, bars } = v32Market(world, ['AAPL', 'MSFT']);
+    // legacy: only `spec` (no `specs`, no `portfolio`) -> old single-symbol entry path
+    const legacy = await world.executor.run({
+      agent: world.registry.get(world.id),
+      spec: specs[0],
+      mandate: world.mandate,
+      quotes,
+      bars,
+      dayStats: v32DayStats(world),
+      now: T0,
+    });
+    assert.deepEqual(legacy.denied, []);
+    assert.equal(legacy.orders.length, 1, 'legacy risk.maxOrdersPerCycle is still 1');
+    assert.equal(legacy.orders[0].symbol, 'AAPL', 'legacy entries only use the single spec symbol');
+    // basket mode on a fresh market places up to two orders (one per symbol)
+    const basketWorld = makeV32PortfolioWorld();
+    const basketSpecs = ['AAPL', 'MSFT'].map((symbol) => v32Spec(basketWorld, symbol));
+    const basketMarket = v32Market(basketWorld, ['AAPL', 'MSFT']);
+    const basket = await v32Run(basketWorld, {
+      specs: basketSpecs,
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+      quotes: basketMarket.quotes,
+      bars: basketMarket.bars,
+    });
+    assert.deepEqual(basket.denied, []);
+    assert.equal(basket.orders.length, 2);
+    // legacy exits still manage every held position (policy exit pressure); one order per run
+    v32SeedPosition(world, 'MSFT');
+    assert.equal(Object.keys(world.ledger.book(world.id).positions).length, 2);
+    const close = await world.executor.run({
+      agent: world.registry.get(world.id),
+      spec: specs[0],
+      mandate: world.mandate,
+      quotes,
+      bars,
+      dayStats: v32DayStats(world),
+      now: T0,
+      policy: { stance: 'trade', atMs: T0, exitPressure: 'exit' },
+    });
+    assert.deepEqual(close.denied, []);
+    assert.equal(close.orders.length, 1, 'legacy risk.maxOrdersPerCycle still bounds each run (1 exit)');
+    assert.equal(Object.keys(world.ledger.book(world.id).positions).length, 1, 'one position remains for the next run');
+    const closeSecond = await world.executor.run({
+      agent: world.registry.get(world.id),
+      spec: specs[0],
+      mandate: world.mandate,
+      quotes,
+      bars,
+      dayStats: v32DayStats(world),
+      now: T0,
+      policy: { stance: 'trade', atMs: T0, exitPressure: 'exit' },
+    });
+    assert.deepEqual(closeSecond.denied, []);
+    assert.equal(closeSecond.orders.length, 1, 'the second legacy run closes the remaining position');
+    assert.equal([...close.orders, ...closeSecond.orders].every((order) => order.side === 'sell'), true);
+    assert.deepEqual(world.ledger.book(world.id).positions, {});
+  });
+
+  it('options still trade in basket/portfolio mode through the real brake wall', async () => {
+    const world = makeInstrumentWorld();
+    const primary = instrumentSpec(world, { symbol: world.symbol });
+    const secondSymbol = world.config.symbols.find((symbol) => symbol !== world.symbol);
+    const secondary = instrumentSpec(world, { symbol: secondSymbol, specId: 'spec-second' });
+    const primaryQuote = world.broker.getLatestQuote(world.symbol);
+    const secondQuote = world.broker.getLatestQuote(secondSymbol);
+    const result = await world.executor.run({
+      agent: world.registry.get(world.id),
+      spec: primary,
+      specs: [primary, secondary],
+      portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 1 },
+      mandate: world.mandate,
+      quotes: { [world.symbol]: primaryQuote, [secondSymbol]: secondQuote },
+      bars: {
+        [world.symbol]: instrumentBars(primaryQuote.last, 1),
+        [secondSymbol]: instrumentBars(secondQuote.last, 1),
+      },
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 },
+      now: T0,
+      policy: instrumentPolicy(world, 'long_call'),
+    });
+    assert.deepEqual(result.denied, [], JSON.stringify(result.denied));
+    assert.equal(result.orders.length, 1, 'the shared order cap is one');
+    const order = result.orders[0];
+    assert.equal(order.assetClass, 'us_option', 'the instrument playbook still opens options in basket mode');
+    assert.match(String(order.symbol), /^[A-Z]{1,6}\d{6}[CP]\d{8}$/);
+    const optionPosition = world.ledger.snapshot(world.id).positionsList.find((position) => position.assetClass === 'us_option');
+    assert.ok(optionPosition);
+    assert.equal(optionPosition.symbol, order.symbol);
+    assert.equal(optionPosition.multiplier, 100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.2 status surface, engine.marketView analytics, halted/CRITICAL recovery
+// ---------------------------------------------------------------------------
+
+describe('v3.2 status + analytics: portfolio/strategyMix, spec coherence, effective capabilities, marketView', () => {
+  it('orchestrator status exposes portfolio/strategyMix.target and coherent per-agent symbols/specs/specIds', async () => {
+    const env = makeEnv({
+      population: { initial: 6, cap: 20 },
+      endowmentUsd: 50,
+      deathFloorUsd: 1,
+      deathFloorPct: 0,
+      maxDrawdownPct: 0.9,
+      risk: { maxDailyLossPct: 1 },
+      replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+      strategyMix: { dayPct: 0.7 },
+      instruments: { enabled: false },
+    });
+    const { clock, broker } = v32Boot(env);
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      clock.advance(60 * 1000);
+      // eslint-disable-next-line no-await-in-loop
+      const trace = await automaton.tick();
+      assert.equal(trace.halted, false);
+    }
+    const status = await automaton.status();
+    const registry = automaton._internals.registry;
+    const state = automaton._internals.state;
+    assert.deepEqual(status.engine.portfolio, { ...env.config.portfolio, strategyMix: { dayPct: 0.7 } });
+    assert.deepEqual(status.strategyMix.target, { dayPct: 0.7, dayCount: 4, swingCount: 2 });
+    assert.equal(status.strategyMix.total, 6);
+    let agentsWithSpecs = 0;
+    for (const row of status.agents) {
+      const agent = registry.get(row.id);
+      assert.deepEqual(row.symbols, agent.symbols);
+      assert.equal(row.tier, tierForFamily(agent.genome.family));
+      assert.equal(row.symbols.length, row.tier === 'day' ? 4 : 3);
+      assert.equal(new Set(row.symbols).size, row.symbols.length);
+      for (const spec of row.specs) {
+        assert.ok(row.symbols.includes(spec.symbol), `${row.id}: only basket symbols may get specs`);
+        assert.equal(spec.family, agent.genome.family);
+        assert.match(String(spec.specId), /^spec-/);
+        const compiled = state.specs.get(spec.specId);
+        assert.ok(compiled, `${row.id}: spec ${spec.specId} must be loaded in memory`);
+        assert.equal(compiled.symbol, spec.symbol);
+      }
+      const specIds = agent.specIds ?? {};
+      for (const [symbol, specId] of Object.entries(specIds)) {
+        const rowSpec = row.specs.find((spec) => spec.symbol === symbol);
+        assert.ok(rowSpec, `${row.id}: specIds entry ${symbol} must be in the status specs`);
+        assert.equal(rowSpec.specId, specId);
+      }
+      if (row.spec !== null) {
+        assert.equal(row.spec.symbol, agent.genome.symbol, 'the primary spec belongs to the primary symbol');
+        assert.equal(row.spec.specId, agent.specId);
+      }
+      if (row.specs.length > 0) agentsWithSpecs += 1;
+    }
+    assert.ok(agentsWithSpecs >= 1, 'at least one bot must have compiled basket specs after two cycles');
+    const lastTrace = state.lastTrace;
+    const build = lastTrace.builds.find((entry) => Array.isArray(entry.specs) && entry.specs.length > 0);
+    assert.ok(build, 'a build trace must carry the compiled basket specs list');
+    assert.ok(Array.isArray(build.basket) && build.basket.length > 0);
+    assert.ok(build.specs.every((entry) => typeof entry === 'string' && entry.includes(':')));
+  });
+
+  it('restricted paper account: effective instrument capabilities are gated while permissions remain', async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 10 },
+      endowmentUsd: 50,
+      deathFloorUsd: 1,
+      deathFloorPct: 0,
+      maxDrawdownPct: 0.9,
+      risk: { maxDailyLossPct: 1 },
+      replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+      strategyMix: { dayPct: 0.7 },
+    });
+    const clock = makeClock(T0);
+    const sim = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const restricted = {
+      ...sim,
+      async getAccount() {
+        const account = await sim.getAccount();
+        return { ...account, shortingEnabled: false, marginMultiplier: 1, optionsTradingLevel: 3 };
+      },
+    };
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker: restricted, clock });
+    await automaton.init();
+    clock.advance(60 * 1000);
+    await automaton.tick();
+    const status = await automaton.status();
+    const instruments = status.engine.instruments;
+    assert.equal(instruments.enabled, true);
+    assert.equal(instruments.shortStock, true, 'the granted permission still exists');
+    assert.equal(instruments.effective.shortStock, false, 'but the broker account cannot short right now');
+    assert.equal(instruments.effective.margin, false);
+    assert.equal(instruments.effective.creditOptions, false);
+    assert.ok(instruments.effective.structures.includes('long_call'));
+    assert.equal(instruments.effective.structures.includes('covered_call'), false);
+    assert.equal(instruments.effective.structures.includes('call_credit_spread'), false);
+    assert.equal(instruments.account.shortingEnabled, false);
+    assert.equal(instruments.account.marginMultiplier, 1);
+  });
+});
+
+describe('v3.2 engine.marketView analytics and halted/CRITICAL recovery', () => {
+  it('marketView: full analytics shape from the sim broker, cached, no secrets, never trades', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v32mv-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const engine = createEngine({
+      cwd: dir,
+      configFile: path.join(dir, 'no-such-config.json'),
+      envFile: path.join(dir, '.env'),
+      clock,
+      overrides: { stateDir: path.join(dir, 'state'), mode: 'sim', seed: 7, accountEquityUsd: 100000 },
+    });
+    const ticked = await engine.tick();
+    assert.equal(ticked.trace.halted, false);
+    const view = await engine.marketView();
+    assert.equal(view.ok, true);
+    assert.ok(Number.isFinite(Date.parse(view.at)));
+    assert.equal(typeof view.marketOpen, 'boolean');
+    const symbols = engine.config.symbols;
+    assert.equal(Object.keys(view.quotes).length, symbols.length, 'the tape covers the configured universe');
+    for (const symbol of symbols) {
+      const quote = view.quotes[symbol];
+      assert.ok(quote, `missing quote for ${symbol}`);
+      assert.ok(Number.isFinite(quote.priceUsd) && quote.priceUsd > 0);
+      assert.ok(Number.isFinite(quote.bid) && Number.isFinite(quote.ask));
+    }
+    assert.equal(Object.keys(view.sparklines).length, symbols.length);
+    for (const symbol of symbols) {
+      assert.ok(Array.isArray(view.sparklines[symbol]), `sparkline ${symbol}`);
+      assert.ok(view.sparklines[symbol].length > 0);
+      assert.ok(view.sparklines[symbol].every((value) => Number.isFinite(value)));
+    }
+    for (const key of ['equityUsd', 'cashUsd', 'buyingPowerUsd', 'dayPnlUsd', 'dayPnlPct', 'grossExposureUsd', 'netExposureUsd', 'positions']) {
+      assert.ok(Object.hasOwn(view.portfolio, key), `portfolio.${key}`);
+    }
+    assert.ok(Number.isFinite(view.portfolio.equityUsd));
+    assert.ok(Array.isArray(view.agents));
+    assert.equal(view.agents.length, 3);
+    for (const agent of view.agents) {
+      assert.equal(typeof agent.id, 'string');
+      assert.ok(Array.isArray(agent.basket) && agent.basket.length > 0, 'agent rows carry the v3.2 basket');
+      assert.ok(['day', 'swing'].includes(agent.tier));
+    }
+    assert.ok(Array.isArray(view.equityHistory) && view.equityHistory.length >= 1);
+    for (const point of view.equityHistory) {
+      assert.ok(Number.isFinite(Date.parse(point.at)));
+      assert.ok(Number.isFinite(point.equityUsd));
+      assert.ok(Number.isFinite(point.cashUsd));
+    }
+    assert.equal(view.engine.running, false);
+    assert.equal(view.error, null);
+    const text = JSON.stringify(view);
+    for (const pattern of [/AKIA/, /secret/i, /password/i, /api[_-]?key/i, /token/i]) {
+      assert.equal(pattern.test(text), false, `marketView leaked ${pattern}`);
+    }
+    assert.equal(engine.isRunning(), false, 'a read-only view must not start the loop');
+    const again = await engine.marketView();
+    assert.equal(again, view, 'the whole view is cached for 2 s');
+    clock.advance(5000);
+    const fresh = await engine.marketView();
+    assert.ok(Date.parse(fresh.at) >= Date.parse(view.at));
+    assert.equal(fresh.ok, true);
+  });
+
+  it('marketView on broker errors returns the last good view + error and never throws', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v32mvf-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    let failing = false;
+    const engine = createEngine({
+      cwd: dir,
+      configFile: path.join(dir, 'no-such-config.json'),
+      envFile: path.join(dir, '.env'),
+      clock,
+      overrides: { stateDir: path.join(dir, 'state'), mode: 'sim', seed: 7, accountEquityUsd: 100000 },
+      brokerFactory: (mode, config) => {
+        const sim = createSimBroker(config, { seed: 7, accountEquityUsd: 100000, clock });
+        return {
+          ...sim,
+          async getClock() {
+            if (failing) throw new Error('simulated clock outage');
+            return sim.getClock();
+          },
+          async getSnapshots(...args) {
+            if (failing) throw new Error('simulated snapshot outage');
+            return sim.getSnapshots(...args);
+          },
+          async getBars(...args) {
+            if (failing) throw new Error('simulated bars outage');
+            return sim.getBars(...args);
+          },
+        };
+      },
+    });
+    await engine.tick();
+    const first = await engine.marketView();
+    assert.equal(first.ok, true);
+    assert.ok(Object.keys(first.quotes).length > 0);
+    assert.equal(first.error, null);
+    clock.advance(20000);
+    failing = true;
+    const failingView = await engine.marketView();
+    assert.equal(failingView.ok, true, 'a transient broker error must not fail the whole view');
+    assert.ok(failingView.error, 'the error is surfaced in the view');
+    assert.ok(failingView.quotes && Object.keys(failingView.quotes).length > 0, 'the last known quotes are kept');
+    assert.deepEqual(Object.keys(failingView.quotes).sort(), Object.keys(first.quotes).sort());
+    failing = false;
+    clock.advance(20000);
+    const recovered = await engine.marketView();
+    assert.equal(recovered.ok, true);
+    assert.equal(recovered.error, null, 'the next successful view clears the error');
+  });
+
+  it('marketView returns an error object instead of throwing when the broker cannot be constructed', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v32mvn-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    // paper mode without credentials: makeBroker() throws CONFIG_INVALID if marketView is not defensive
+    const engine = createEngine({
+      cwd: dir,
+      configFile: path.join(dir, 'no-such-config.json'),
+      envFile: path.join(dir, '.env'),
+      clock,
+      overrides: { stateDir: path.join(dir, 'state'), mode: 'paper' },
+    });
+    let threw = null;
+    let view = null;
+    try {
+      view = await engine.marketView();
+    } catch (error) {
+      threw = error;
+    }
+    assert.equal(threw, null, `marketView must not throw: ${threw?.code} ${threw?.message}`);
+    assert.ok(view && typeof view === 'object');
+    assert.equal(view.ok, false, 'no last good view exists, so the view reports failure');
+    assert.ok(view.error && (view.error.code || view.error.message), 'the construction error is reported');
+  });
+
+  it('a broker_unavailable halt is reported and cleared by the next successful tick (no auto-reward)', async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 10 },
+      endowmentUsd: 50,
+      deathFloorUsd: 1,
+      deathFloorPct: 0,
+      maxDrawdownPct: 0.9,
+      risk: { maxDailyLossPct: 1 },
+      replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+      strategyMix: { dayPct: 0.7 },
+      instruments: { enabled: false },
+    });
+    const clock = makeClock(T0);
+    const sim = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    let fail = false;
+    const flaky = {
+      ...sim,
+      async getAccount() {
+        if (fail) throw new Error('simulated broker outage');
+        return sim.getAccount();
+      },
+      async getPositions() {
+        if (fail) throw new Error('simulated broker outage');
+        return sim.getPositions();
+      },
+    };
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker: flaky, clock });
+    await automaton.init();
+    clock.advance(60 * 1000);
+    const healthy = await automaton.tick();
+    assert.equal(healthy.halted, false);
+    fail = true;
+    clock.advance(60 * 1000);
+    const halted = await automaton.tick();
+    assert.equal(halted.halted, true);
+    assert.ok(halted.haltReasons.includes('broker_unavailable'), JSON.stringify(halted.haltReasons));
+    const haltedStatus = await automaton.status();
+    assert.equal(haltedStatus.halted, true);
+    assert.ok(haltedStatus.haltReasons.includes('broker_unavailable'));
+    fail = false;
+    clock.advance(60 * 1000);
+    const recovered = await automaton.tick();
+    assert.equal(recovered.halted, false, 'the next successful tick must clear the halt');
+    const recoveredStatus = await automaton.status();
+    assert.equal(recoveredStatus.halted, false);
+    assert.deepEqual(recoveredStatus.haltReasons, []);
+    assert.equal(recoveredStatus.engine.lastError, null);
+  });
+
+  it('treasury CRITICAL does not permanently stop trading, and funding restores STABLE', async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 10 },
+      endowmentUsd: 5000,
+      maxDrawdownPct: 0.99,
+      risk: { maxDailyLossPct: 1 },
+      strategyMix: { dayPct: 0.7 },
+      instruments: { enabled: false },
+    });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const { ledger, registry } = automaton._internals;
+    for (const agent of registry.alive()) {
+      const cash = ledger.get(agent.id).cashUsd;
+      ledger.charge(agent.id, cash - 251, { category: 'inference', role: 'executor', at: clock.now() });
+    }
+    ledger.save();
+    clock.advance(60 * 1000);
+    const critical = await automaton.tick();
+    assert.equal(critical.halted, false, 'CRITICAL is a warning state, not a halt');
+    assert.equal(critical.treasury.state, 'CRITICAL');
+    assert.equal(critical.treasury.cycleBudgetUsd, env.config.cycleBudget.CRITICAL);
+    assert.equal(critical.deaths.length, 0, 'CRITICAL must not kill the population');
+    const criticalStatus = await automaton.status();
+    assert.equal(criticalStatus.halted, false);
+    assert.equal(criticalStatus.treasury.state, 'CRITICAL');
+    for (const agent of registry.alive()) {
+      ledger.transfer('__treasury__', agent.id, 1000, { reason: 'verifier refill', at: clock.now() });
+    }
+    ledger.save();
+    clock.advance(60 * 1000);
+    const recovered = await automaton.tick();
+    assert.equal(recovered.halted, false);
+    assert.equal(recovered.treasury.state, 'STABLE', 'funding must restore a healthy treasury');
+    assert.equal(recovered.treasury.cycleBudgetUsd, env.config.cycleBudget.STABLE);
+    assert.equal(recovered.deaths.length, 0);
+  });
+
+  it('the engine actually trades multiple basket symbols end-to-end; every fill stays inside the bot basket', async () => {
+    const env = makeEnv({
+      population: { initial: 6, cap: 20 },
+      endowmentUsd: 50,
+      deathFloorUsd: 1,
+      deathFloorPct: 0,
+      maxDrawdownPct: 0.9,
+      risk: { maxDailyLossPct: 1 },
+      replication: { childEndowmentUsd: 20, surplus7dUsd: 2, minRunwayHours: 24 },
+      strategyMix: { dayPct: 0.7 },
+      instruments: { enabled: true, allowOptions: false, allowSpreads: false, allowCoveredCalls: false, allowShort: true },
+      data: { lookbackBars: 120 },
+    });
+    const { clock, broker } = v32Boot(env);
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const registry = automaton._internals.registry;
+    const violations = [];
+    for (let cycle = 0; cycle < 15; cycle += 1) {
+      clock.advance(60 * 1000);
+      // eslint-disable-next-line no-await-in-loop
+      const trace = await automaton.tick();
+      for (const execution of trace.executions) {
+        if (!(execution.orders > 0)) continue;
+        const agent = registry.get(execution.agentId);
+        for (const action of execution.detail ?? []) {
+          if (!['entry', 'exit'].includes(action.type)) continue;
+          if (!agent.symbols.includes(action.symbol)) violations.push([agent.id, action.symbol, agent.symbols]);
+        }
+      }
+    }
+    const tradedSymbols = new Set();
+    let fills = 0;
+    for (const agent of registry.alive()) {
+      for (const fill of automaton._internals.ledger.history(agent.id, { limit: 100 })) {
+        fills += 1;
+        tradedSymbols.add(fill.symbol);
+        if (!agent.symbols.includes(fill.symbol)) violations.push([agent.id, fill.symbol, agent.symbols]);
+      }
+    }
+    assert.ok(fills >= 1, 'the sim population must trade within 15 cycles (deterministic seed)');
+    assert.deepEqual(violations, [], 'no fill/detail may reference a symbol outside the bot basket');
+    assert.ok(tradedSymbols.size >= 2, `the population should trade several basket symbols, got ${JSON.stringify([...tradedSymbols])}`);
+    const status = await automaton.status();
+    for (const row of status.agents) {
+      for (const position of row.positions) {
+        const underlying = String(position.option?.underlying ?? position.symbol).toUpperCase();
+        assert.ok(row.symbols.includes(underlying), `${row.id}: position ${underlying} outside basket ${JSON.stringify(row.symbols)}`);
+      }
+    }
+  });
+
+  it('a stopped (or never-started) engine still serves status and market views safely', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v32stop-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const engine = createEngine({
+      cwd: dir,
+      configFile: path.join(dir, 'no-such-config.json'),
+      envFile: path.join(dir, '.env'),
+      clock,
+      overrides: { stateDir: path.join(dir, 'state'), mode: 'sim', seed: 7, accountEquityUsd: 100000 },
+    });
+    const beforeStart = await engine.marketView();
+    assert.equal(beforeStart.ok, true, 'marketView works before the engine is started');
+    assert.equal(beforeStart.engine.running, false);
+    const statusBefore = await engine.status();
+    assert.equal(statusBefore.engine.running, false);
+    await engine.tick();
+    await engine.stop();
+    await engine.stop();
+    assert.equal(engine.isRunning(), false);
+    const stoppedView = await engine.marketView();
+    assert.equal(stoppedView.ok, true);
+    assert.equal(stoppedView.engine.running, false);
+    const stoppedStatus = await engine.status();
+    assert.equal(stoppedStatus.engine.running, false);
+    assert.ok(Array.isArray(stoppedStatus.agents));
   });
 });

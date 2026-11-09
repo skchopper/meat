@@ -20,7 +20,9 @@ obituary the living read.
 | Sidebar entry | `sidebar.panellist`: one "Automaton" entry in the sidebar's global panel list (strategy/skull glyph, localized label) |
 | Control panel | `main` keyed panel `automaton-trading`: the full dashboard opened from the sidebar in the central column — header stats, operator controls, the 30-agent table, per-agent drill-down, generation rollup and obituary feed |
 | Settings page | Settings → Built-in plugins → **MEAT — Mortality Engineered Auto-Trading** (`settings.plugins.tab`): the same dashboard as a full page |
-| State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 3 s (auto-refresh with pause) |
+| State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 5 s (auto-refresh with pause) |
+| Market route | `GET /automaton/market` — loopback-only, GET-only redacted live view from `engine.marketView()` (quotes, sparklines, portfolio, live agent P&L, equity history); soft 503 when the engine has no market view |
+| Live analytics dashboard | Google-Analytics-style UI: top bar (brand/mode/running/market clock/refresh/pause), KPI cards, inline-SVG equity chart + sparklines + 70/30 strategy mix, live market tape with up/down flash, filterable agent table with live P&L, and tabs Overview / Agents / Markets / Research / Rewards / Settings |
 | Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop and the research/reward settings actions) |
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
 | Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), winner rewards (period + 1st/2nd/3rd % of account cash + caps) and daily/weekly/monthly leaderboards, all applied through loopback-only control actions |
@@ -210,6 +212,46 @@ Two diagnostic rows under the engine header answer **"why are the bots (not) tra
   `effectiveInstrumentBadges` back these rows and are exported for tests; every field is
   optional and a bare/older snapshot renders the empty states.
 
+### Live analytics dashboard (v3.2)
+
+The panel is a Google-Analytics-style live dashboard (theme-token only, no external chart
+dependencies) while every existing control and detail view stays available:
+
+- **Top bar** — MEAT brand, paper/live badge, running/stopped + kill switch, live-feed
+  pill, market session + local clock (1 s tick), **manual refresh**, auto-refresh
+  pause/resume, and the unchanged Start / Stop / Emergency Stop controls underneath.
+- **KPI cards** — account equity with a live ▲/▼ delta, day P&L $/%, cash / buying
+  power, gross exposure (net in the sub-line), population alive/total, trades today,
+  win rate and treasury runway/state.
+- **Charts (inline SVG, hover tooltips)** — portfolio equity area chart from
+  `equityHistory`, sparkline paths for the watchlist and per-agent trends, and a
+  **Day vs Swing** mix with actual bars against the **70/30 target** (`targetDayPct`).
+- **Live market tape** — symbol, last, change $/%, bid/ask and sparkline; up/down rows
+  flash green/red on a price change, stale quotes are marked, and a closed market shows
+  “market closed · last close”.
+- **Agents** — search, sort, status/category filters; basket, strategy type, stance
+  badges, live day P&L and sparkline; clicking a row opens the existing detail drawer
+  (holdings/transactions/plan/bot-agent/research/playbook/rankings) and the selection
+  persists across polling.
+- **Tabs** — Overview (KPIs, charts, watchlist, agents), Agents, Markets (full tape +
+  instruments/last-cycle diagnostics), Research (coverage + cadence control), Rewards
+  (rewards card + leaderboards) and Settings (operator controls, Reaper row, diagnostics).
+- **Polling** — `GET /automaton/state` every **5 s** and `GET /automaton/market` every
+  **2 s** while the tab is visible; the pause toggle stops both, a hidden tab pauses
+  polling, manual refresh pulls both immediately, and timers/subscriptions are cleaned up.
+  If the market route is missing or fails (old Host), the UI shows
+  “live feed unavailable — state-only” and keeps rendering KPIs/agents from state; charts
+  and the tape show empty states instead of breaking.
+- **Pure helpers** (exported for tests): `marketTapeRows`, `kpiCards`,
+  `equityChartPoints` / `sparklinePath`, `agentTableRows`, `strategyMixBreakdown`,
+  `marketSession`, `liveViewMapping`, `changeDirection` / `marketChangePctText`.
+
+`GET /automaton/market` is loopback-only, GET/HEAD only, redacted (never secrets), and
+delegates to `engine.marketView()`. A missing/failing engine view returns
+`503 {"ok":false,"error":{"code":"MARKET_UNAVAILABLE",…}}`; a non-loopback request gets
+`403 FORBIDDEN` and a non-GET method `405 METHOD_NOT_ALLOWED`. No new agent tools and no
+new control actions were added.
+
 ### Research sidecar — isolated hourly analyst
 
 Every living agent gets an **isolated** hourly LLM briefing about *its own* strategy and
@@ -397,6 +439,13 @@ so the new client module + routes load), verify:
     shorting/margin shows no Short/Margin badge and a "disabled by broker account"
     tooltip. With an older engine (no `lastCycle`/`effective`) the panel shows "no cycle
     data yet" and no warning.
+15. Live analytics: the dashboard has the top bar (brand/mode/running/feed pill/market
+    clock/manual refresh/pause), KPI cards, equity chart + strategy mix, a live market
+    tape that flashes green/red, and the six tabs; `GET /automaton/market` returns
+    `{ok:true,quotes,sparklines,portfolio,agents,equityHistory,…}` locally and 403 for a
+    non-loopback caller. State polls every 5 s and the market feed every 2 s; pausing or
+    hiding the tab stops both, and with an old engine (no `engine.marketView`) the panel
+    shows "live feed unavailable — state-only" without breaking.
 
 ## Configuration
 
@@ -521,13 +570,14 @@ network, a broker, or the Harness profile. (Under the Windows DSH sandbox the de
 `node --test <file>` runner cannot spawn its per-file worker — `spawn EPERM` — so run the
 file in-process with `node test/plugin.test.js` or disable test isolation as shown.)
 
-Layout: `index.js` (Host tools + state/control routes + engine lifecycle + validator for
-research/reward settings + the operator-only Reaper stop helper; passes `rankings`,
-`strategyMix`, `instruments`, `rewards` and `engine.agents` through from the engine
-status), `client.js` (shared dashboard: sidebar entry + keyed `main` panel + settings
-page; names/genome-vs-spec/holdings/activity/research/cadence/rewards/leaderboards/plan/
-transactions/strategy-type/bot-agent-policy/instrument-positions/playbook/last-cycle/
-capability mapping are pure functions exported as `helpers` for tests), `locale/{en,zh}.json`
-(plugin metadata), `icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the
-core project).
+Layout: `index.js` (Host tools + state/market/control routes + engine lifecycle +
+validator for research/reward settings + the operator-only Reaper stop helper; passes
+`rankings`, `strategyMix`, `instruments`, `rewards` and `engine.agents` through from the
+engine status, and proxies `engine.marketView()` on the market route), `client.js`
+(shared dashboard: sidebar entry + keyed `main` panel + settings page, live analytics
+components; names/genome-vs-spec/holdings/activity/research/cadence/rewards/leaderboards/
+plan/transactions/strategy-type/bot-agent-policy/instrument-positions/playbook/last-cycle/
+capability/market-tape/KPI/equity-chart/strategy-mix/live-view mapping are pure functions
+exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata), `icon.svg`,
+`test/plugin.test.js`, `src/**` (engine implemented by the core project).
 

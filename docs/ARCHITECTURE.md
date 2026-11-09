@@ -109,8 +109,22 @@ Full contract: `docs/BOT-AGENTS.md`.
 
 **Strategy classes.** Momentum/mean-reversion bots are swing/mid-long (1-hour lane); breakout/gap-fade
 bots are day/intraday (1-minute lane). The tier is derived from the strategy family, replication
-inherits it from the mutated child genome, and genesis mixes a new population ~50/50. Status exposes
-the taxonomy per agent and a population `strategyMix` for the panel's category tabs.
+inherits it from the mutated child genome, and genesis mixes a new population by
+`strategyMix.dayPct` (live profile 70% day / 30% swing). Status exposes the taxonomy per agent and a
+population `strategyMix` for the panel's category tabs.
+
+### Multi-symbol portfolio bots and live analytics (v3.2)
+
+Each bot manages a **basket of companies** (4 symbols for day bots, 3 for swing bots; the genome
+carries `symbols` and the registry caches one compiled strategy spec per symbol in `agent.specIds`).
+The orchestrator compiles/reuses coherent per-symbol specs, the portfolio executor evaluates every
+basket symbol, manages all held positions with that symbol's stop/target/max-hold rules and enforces
+tier caps (`maxOpenPositionsDay/Swing`, `maxOrdersPerCycle`) under the same 18-brake wall. Baskets and
+the 70/30 mix migrate once on start without touching ids/ledgers/history. A read-only
+`marketView()` combines multi-symbol broker snapshots, 1-minute sparklines, portfolio/agent equity and
+an equity history for the Host's loopback `GET /automaton/market` route; the control panel renders it
+as a live Google-Analytics-style dashboard (KPIs, SVG charts, market tape with price flashes, basket
+and live-P&L agent rows). Contract: `docs/PORTFOLIO-ANALYTICS.md`; operations: `docs/RUNBOOK.md` §8f.
 
 ### Multi-instrument execution (v3.0)
 
@@ -118,7 +132,7 @@ The population may express a strategy through more than long stock: **short stoc
 covered calls and defined-risk vertical spreads**, with **margin** enabled inside hard caps. The
 instrument is chosen by the bot's own agent (`policy.instrument`) or its deterministic family
 playbook; the executor picks expiry/strikes within the DTE window, sizes by option-premium budget
-(25% of equity / $25 per order / mandate cap), and falls back to stock/short when options do not fit.
+(35% of equity / $30 per order / mandate cap), and falls back to stock/short when options do not fit.
 Covered calls require 100 owned shares (rare at $50/bot, and denied without them); naked short
 options are never constructed and are denied by the brake wall. Every order is checked by brakes
 D2/D15–D18 (instrument permission, short sale, options structure/premium/DTE, margin debt,

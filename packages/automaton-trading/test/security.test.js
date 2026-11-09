@@ -59,7 +59,7 @@ import { createReaper } from '../src/reaper.js';
 import { createTreasurer, deriveInstrumentPermissions } from '../src/treasurer.js';
 import { createAutomaton } from '../src/orchestrator.js';
 import { ENGINE_ENTRY, createEngine } from '../src/engine.js';
-import { apply, TOOL_NAMES } from '../index.js';
+import { apply, TOOL_NAMES, MARKET_PATH, ROUTE_PATH, CONTROL_PATH } from '../index.js';
 import { main as reaperMain, parseArgs as parseReaperArgs } from '../src/reaper-process.js';
 import { createClock, HOUR_MS, mulberry32, round2 } from '../src/util.js';
 
@@ -2079,5 +2079,210 @@ describe('v3 security: instrument config guards, whitelist, margin and paper/liv
     for (const secret of [keyId, 'v3-status-secret-value', token]) {
       assert.equal(res.body.includes(secret), false, `/automaton/state leaked ${secret}`);
     }
+  });
+});
+
+// ===========================================================================
+// K. v3.2 analytics route, basket sanitization, no new surface
+// ===========================================================================
+
+/** Fake engine with the v3.2 marketView shape (and deliberately leaky secret-named fields). */
+function createMarketFakeEngine(options = {}) {
+  const engine = createLeakyFakeEngine(options);
+  const view = options.view ?? {
+    ok: true,
+    at: new Date(T0).toISOString(),
+    marketOpen: true,
+    quotes: { AAPL: { symbol: 'AAPL', priceUsd: 100, bid: 99.9, ask: 100.1, changeUsd: 1, changePct: 1 } },
+    sparklines: { AAPL: [99, 100] },
+    portfolio: { equityUsd: 100000, cashUsd: 50000, buyingPowerUsd: 50000, dayPnlUsd: 0, dayPnlPct: 0, grossExposureUsd: 0, netExposureUsd: 0, positions: 0 },
+    agents: [{ id: 'a', name: 'Momentum AAPL', tier: 'swing', basket: ['AAPL', 'MSFT'], equityUsd: 5000, dayPnlPct: 0, positions: 0, stance: null }],
+    engine: { running: false, marketOpen: true, lastCycle: null, research: null, agents: null, halted: false, haltReasons: [] },
+    equityHistory: [{ at: new Date(T0).toISOString(), equityUsd: 100000, cashUsd: 50000 }],
+    error: null,
+    // A future view must never leak credential-shaped fields through the route.
+    account: { apiKeyId: 'AKIA-V32-ROUTE-LEAK', secretKey: 'v32-route-secret', token: 'v32-route-token' },
+    secret: 'v32-route-top-secret',
+  };
+  engine.marketView = async () => {
+    if (options.marketThrow) throw new Error(options.marketThrow);
+    if (options.undefinedView) return undefined;
+    return view;
+  };
+  return { engine, view };
+}
+
+function loopbackRequest(method = 'GET', address = '127.0.0.1') {
+  return {
+    ...fakeRequest(method),
+    url: '/automaton/market',
+    socket: { remoteAddress: address },
+    connection: { remoteAddress: address },
+  };
+}
+
+describe('v3.2 analytics route: GET /automaton/market is loopback-only, read-only and secret-free', () => {
+  it('registers the market route next to state/control and serves a redacted loopback view', async () => {
+    const { engine } = createMarketFakeEngine();
+    const fake = applyPlugin(engine);
+    const paths = fake.routes.map((entry) => entry.path);
+    assert.ok(paths.includes(ROUTE_PATH));
+    assert.ok(paths.includes(MARKET_PATH));
+    assert.ok(paths.includes(CONTROL_PATH));
+    assert.equal(fake.tools.size, 10, 'v3.2 must not add agent tools');
+    assert.equal(TOOL_NAMES.some((name) => /market|portfolio|basket|snapshot/i.test(name)), false);
+
+    const route = fake.routes.find((entry) => entry.path === MARKET_PATH);
+    assert.ok(route && typeof route.handler === 'function');
+    const res = fakeResponse();
+    await route.handler(loopbackRequest('GET'), res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(String(res.headers['content-type']).includes('application/json'), true);
+    assert.equal(res.headers['cache-control'], 'no-store');
+    const payload = JSON.parse(res.body);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.route, MARKET_PATH);
+    assert.equal(payload.loopbackOnly, true);
+    assert.equal(payload.mode, 'paper');
+    // analytics fields pass through...
+    assert.equal(payload.quotes.AAPL.priceUsd, 100);
+    assert.deepEqual(payload.agents[0].basket, ['AAPL', 'MSFT']);
+    assert.equal(Array.isArray(payload.equityHistory), true);
+    // ...and credential-shaped fields are redacted even if a future view adds them
+    assert.equal(payload.account.apiKeyId, '***');
+    assert.equal(payload.account.secretKey, '***');
+    assert.equal(payload.account.token, '***');
+    assert.equal(payload.secret, '***');
+    for (const secret of ['AKIA-V32-ROUTE-LEAK', 'v32-route-secret', 'v32-route-token', 'v32-route-top-secret']) {
+      assert.equal(res.body.includes(secret), false, `/automaton/market leaked ${secret}`);
+    }
+  });
+
+  it('rejects non-loopback requests with 403 and non-GET/HEAD methods with 405 (HEAD allowed)', async () => {
+    const { engine } = createMarketFakeEngine();
+    const fake = applyPlugin(engine);
+    const route = fake.routes.find((entry) => entry.path === MARKET_PATH);
+
+    const remote = fakeResponse();
+    await route.handler(loopbackRequest('GET', '10.0.0.5'), remote);
+    assert.equal(remote.statusCode, 403);
+    assert.equal(JSON.parse(remote.body).error.code, 'FORBIDDEN');
+
+    const noAddress = fakeResponse();
+    await route.handler({ method: 'GET', url: '/automaton/market', headers: {} }, noAddress);
+    assert.equal(noAddress.statusCode, 403, 'a request with no identifiable socket must be denied (fail closed)');
+
+    const post = fakeResponse();
+    await route.handler(loopbackRequest('POST'), post);
+    assert.equal(post.statusCode, 405);
+    assert.equal(JSON.parse(post.body).error.code, 'METHOD_NOT_ALLOWED');
+
+    const head = fakeResponse();
+    await route.handler(loopbackRequest('HEAD'), head);
+    assert.equal(head.statusCode, 200);
+    assert.equal(head.body, '', 'HEAD carries no body');
+  });
+
+  it('returns structured 503s for missing/failed/throwing market views and scrubs credential text', async () => {
+    // engine without marketView in this build
+    const missing = applyPlugin(createLeakyFakeEngine());
+    const missingRoute = missing.routes.find((entry) => entry.path === MARKET_PATH);
+    const missingRes = fakeResponse();
+    await missingRoute.handler(loopbackRequest('GET'), missingRes);
+    assert.equal(missingRes.statusCode, 503);
+    assert.equal(JSON.parse(missingRes.body).error.code, 'MARKET_UNAVAILABLE');
+
+    // engine.marketView() resolves undefined
+    const undefinedEngine = createMarketFakeEngine({ undefinedView: true });
+    const undefinedFake = applyPlugin(undefinedEngine.engine);
+    const undefinedRes = fakeResponse();
+    await undefinedFake.routes.find((entry) => entry.path === MARKET_PATH).handler(loopbackRequest('GET'), undefinedRes);
+    assert.equal(undefinedRes.statusCode, 503);
+
+    // engine.marketView() reports ok:false
+    const failedEngine = createMarketFakeEngine({ view: { ok: false, error: { code: 'MARKET_UNAVAILABLE', message: 'market down' } } });
+    const failedFake = applyPlugin(failedEngine.engine);
+    const failedRes = fakeResponse();
+    await failedFake.routes.find((entry) => entry.path === MARKET_PATH).handler(loopbackRequest('GET'), failedRes);
+    assert.equal(failedRes.statusCode, 503);
+    assert.equal(failedRes.body.includes('market down'), true);
+
+    // engine.marketView() throws with a credential-shaped message: structured 503, scrubbed body
+    const throwEngine = createMarketFakeEngine({ marketThrow: 'broker said AKIAABCDEFGHIJKLMNOP and secret=topsecretvalue' });
+    const throwFake = applyPlugin(throwEngine.engine);
+    const throwRes = fakeResponse();
+    await throwFake.routes.find((entry) => entry.path === MARKET_PATH).handler(loopbackRequest('GET'), throwRes);
+    assert.equal(throwRes.statusCode, 503);
+    assert.equal(throwRes.body.includes('AKIAABCDEFGHIJKLMNOP'), false, 'the 503 body must not echo an API key shape');
+    assert.equal(throwRes.body.includes('topsecretvalue'), false, 'the 503 body must not echo a secret assignment');
+  });
+
+  it('basket and specIds fields are sanitized in the registry and persisted through reload', async () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    await registry.register({
+      id: 'atm-messy-basket',
+      generation: 0,
+      bornAt: clock.iso(),
+      endowmentUsd: 5000,
+      genome: { symbol: 'aapl', symbols: ['msft', 'AAPL', 'bad symbol', 'TOOLONGTICKER12345'] },
+      symbols: ['aapl', 'AAPL', 'bad symbol', 'TOOLONGTICKER12345', 'msft', 42, '  '],
+      specIds: { aapl: ' spec-1 ', 'bad symbol': 'x', MSFT: '', SPY: '   ', META: 'spec-2  ' },
+      mutation: null,
+      specId: null,
+    });
+    const messy = registry.get('atm-messy-basket');
+    assert.deepEqual(messy.symbols, ['AAPL', 'MSFT'], 'basket is uppercased, deduped, pattern-validated');
+    assert.deepEqual(messy.specIds, { AAPL: 'spec-1', META: 'spec-2' }, 'specIds keys/values are sanitized');
+
+    await registry.register({
+      id: 'atm-capped-basket',
+      generation: 0,
+      bornAt: clock.iso(),
+      endowmentUsd: 5000,
+      genome: { symbol: 'AAPL' },
+      symbols: ['AAPL', 'MSFT', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'TSLA', 'SPY', 'QQQ'],
+      mutation: null,
+      specId: null,
+    });
+    assert.equal(registry.get('atm-capped-basket').symbols.length, 8, 'baskets are hard-capped at 8 symbols');
+
+    await registry.register({
+      id: 'atm-genome-basket',
+      generation: 0,
+      bornAt: clock.iso(),
+      endowmentUsd: 5000,
+      genome: { symbol: 'msft', symbols: ['msft', 'aapl', 'bad symbol'] },
+      mutation: null,
+      specId: null,
+    });
+    assert.deepEqual(registry.get('atm-genome-basket').symbols, ['MSFT', 'AAPL'], 'legacy genome.symbols fallback is sanitized');
+
+    registry.save();
+    const reloaded = createRegistry({ paths: env.paths, config: env.config, clock });
+    await reloaded.load();
+    assert.deepEqual(reloaded.get('atm-messy-basket').symbols, ['AAPL', 'MSFT']);
+    assert.deepEqual(reloaded.get('atm-messy-basket').specIds, { AAPL: 'spec-1', META: 'spec-2' });
+    assert.equal(reloaded.get('atm-capped-basket').symbols.length, 8);
+  });
+
+  it('adds no new order/transfer surface: read-only market data only', () => {
+    const env = makeEnv({ mode: 'sim' });
+    const sim = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000 });
+    assert.equal(typeof sim.getSnapshots, 'function', 'the analytics data method exists');
+    assert.equal(typeof sim.getBars, 'function');
+    assert.equal(typeof sim.getAccount, 'function');
+    assertNoForbiddenBrokerMethods(sim, 'broker-sim');
+    const alpaca = createAlpacaBroker(makeEnv({ mode: 'paper' }).config, {
+      secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' },
+      fetchImpl: stubFetch(defaultFetchHandler),
+    });
+    assert.equal(typeof alpaca.getSnapshots, 'function');
+    assertNoForbiddenBrokerMethods(alpaca, 'broker-alpaca');
+    // the analytics route is a GET/HEAD read, never an order/control surface
+    assert.equal(MARKET_PATH, '/automaton/market');
+    assert.equal(TOOL_NAMES.length, 10);
+    assert.equal(TOOL_NAMES.includes('automaton_market'), false);
   });
 });

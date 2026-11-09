@@ -22,7 +22,7 @@
   },
   "risk": {
     "maxPositionPct": 0.5,
-    "maxOpenPositions": 2,
+    "maxOpenPositions": 6,
     "maxSpreadBps": 100,
     "maxDailyOrders": 20,
     "maxDailyLossPct": 0.2,
@@ -37,7 +37,7 @@
       "09:35",
       "15:50"
     ],
-    "maxOrdersPerCycle": 1,
+    "maxOrdersPerCycle": 2,
     "maxBuildSpendPct": 0.4
   },
   "data": {
@@ -114,5 +114,15 @@
     "autoCloseDTE": 1,
     "allowNakedShortOptions": false,
     "optionDataFeed": "indicative"
+  },
+  "strategyMix": {
+    "dayPct": 0.7
+  },
+  "portfolio": {
+    "basketSizeDay": 4,
+    "basketSizeSwing": 3,
+    "maxOpenPositionsDay": 5,
+    "maxOpenPositionsSwing": 3,
+    "maxOrdersPerCycle": 2
   }
 }

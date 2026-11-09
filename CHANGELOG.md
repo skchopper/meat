@@ -12,6 +12,49 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v3.2.0 — 2026-11-09 — multi-symbol portfolio bots, 70% day mix and live analytics dashboard
+
+The population now trades **baskets of companies** instead of one ticker, the live profile is
+**70% day/short-term / 30% swing**, and the control panel became a real-time analytics dashboard.
+
+- **Multi-symbol portfolio bots.** Every bot's genome carries a `symbols` basket (4 symbols for day
+  bots, 3 for swing bots, configurable via `portfolio.basketSizeDay/Swing`). The orchestrator compiles
+  and caches **one strategy spec per basket symbol** (`agent.specIds`), the executor evaluates every
+  basket symbol independently, manages all held positions with the matching per-symbol rules, and
+  enforces tier caps (`portfolio.maxOpenPositionsDay/Swing`, `portfolio.maxOrdersPerCycle`) while the
+  18-brake wall remains the ceiling. Legacy single-spec calls stay byte-compatible. One bot can now
+  hold and trade several companies at once.
+- **70% day-trading population.** Config `strategyMix.dayPct` (live profile **0.7**) drives genesis
+  and an automatic one-time migration of an existing population (plus a second migration assigning
+  baskets); the tier/family mix is exposed as `strategyMix.counts` + `strategyMix.target`. At 30 bots
+  this is **21 day bots (breakout/gapfade, 1-minute lane)** and **9 swing bots (momentum/meanrev,
+  1-hour lane)**.
+- **Real-time market and portfolio feed.** Broker `getSnapshots()` (Alpaca multi-symbol snapshots,
+  2 s cache) and engine `marketView()` deliver quotes (price/bid/ask/change/open/high/low/prev close/
+  volume/stale), 1-minute sparklines, portfolio equity/cash/exposure/day P&L and per-agent live
+  values; an in-memory equity history powers the chart. Host adds loopback-only
+  `GET /automaton/market` (GET/HEAD, redacted, structured 503 fallback, no new tools/actions).
+- **Google-Analytics-style dashboard.** The panel now has an analytics layout: top bar with
+  brand/mode/running/halted/kill/live-feed/market clock, manual refresh and pause; eight KPI cards;
+  inline-SVG portfolio equity chart, sparklines and **Day-vs-Swing 70/30** bars with the target
+  marker; a live market tape with 2-second **green/red price-flash animation**, change $/% and
+  closed-market “last close” state; a filterable/sortable agents table with basket, live equity, day
+  P&L, positions, stance and trend sparkline (row click keeps the full detail drawer); and
+  Overview/Agents/Markets/Research/Rewards/Settings tabs preserving every previous control,
+  leaderboard, reward setting and bot-agent/research section. State polls at 5 s and market at 2 s
+  with pause-on-hidden, manual refresh and a graceful state-only fallback for older Hosts.
+- **Status contract additions.** Agents expose `symbols`, `specs[]` and a primary `spec`;
+  `status.engine.portfolio` and `strategyMix.target` expose the v3.2 mix/caps; `engine.marketView()`
+  and `GET /automaton/market` expose the live view without secrets.
+- **Tests:** 10 suites, **346 tests**, all passing (mortality 76, market 50, plugin 46, integration
+  53, security 58, research 13, rankings 16, control 18, bot-agent 9, instruments 7), including new
+  coverage for baskets/specIds registry round-trips, 70/30 genesis/baskets, multi-symbol executor
+  entries/exits/caps, snapshot mapping/cache, engine market view, market route security/fallback and
+  the analytics mappings.
+- **Compatibility:** baskets and the 70/30 mix migrate once on first start (ids, ledgers and
+  histories untouched; old single-symbol agents gain baskets and recompiled per-symbol specs). The
+  paper default, 18 brakes, instrument capability gating and live triple-gate are unchanged.
+
 ## v3.1.0 — 2026-11-01 — trade-activity diagnosis, fractional-aware bots, coherent strategies
 
 This release fixes why most bots appeared inactive in v3.0 and hardens the trading loop around the

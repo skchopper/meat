@@ -22,7 +22,7 @@ import { createProspector } from '../src/prospector.js';
 import { createBuilder, PARAM_BOUNDS } from '../src/builder.js';
 import { createExecutor } from '../src/executor.js';
 import { createBrakes } from '../src/brakes.js';
-import { createClock, DAY_MS, HOUR_MS } from '../src/util.js';
+import { createClock, DAY_MS, HOUR_MS, round2, round4 } from '../src/util.js';
 
 const T0 = Date.UTC(2024, 0, 10, 15, 0, 0);
 
@@ -2431,6 +2431,396 @@ test('executor: falls back to stock when no option is affordable; brakes-first D
   assert.ok(brakeCheck.order.option);
   assert.equal(brakeCheck.order.structure, 'long_call');
   assert.ok(Number.isFinite(brakeCheck.order.notionalUsd));
+});
+
+// ===========================================================================
+// v3.2 multi-symbol portfolio: broker snapshots
+// ===========================================================================
+
+test('alpaca broker: getSnapshots mapping, stale flag, tolerant fields and 2s cache', async () => {
+  const snapshotAt = '2024-01-10T15:00:00Z';
+  const nowMs = Date.parse(snapshotAt);
+  const fetchImpl = stubFetch((url) => {
+    if (url.includes('/v2/stocks/snapshots')) {
+      return jsonResponse(200, {
+        snapshots: {
+          AAPL: {
+            latestTrade: { p: '190.5', t: snapshotAt },
+            latestQuote: { bp: '190.4', ap: '190.6', t: snapshotAt },
+            minuteBar: { o: '189', h: '191', l: '188.8', c: '190.5', v: '1000' },
+            dailyBar: { o: '185', h: '192', l: '184', c: '190', v: '5000' },
+            prevDailyBar: { c: '188' },
+          },
+          MSFT: {
+            latestTrade: { p: '400' },
+            prevDailyBar: { c: '398' },
+          },
+          // partially missing symbol: must still appear with null fields
+          EMPTY: {},
+        },
+      });
+    }
+    return jsonResponse(404, {});
+  });
+  const broker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl },
+  );
+
+  const snapshots = await broker.getSnapshots(['AAPL', 'MSFT', 'EMPTY'], { feed: 'iex', nowMs });
+  assert.deepEqual(Object.keys(snapshots).sort(), ['AAPL', 'EMPTY', 'MSFT']);
+  const aapl = snapshots.AAPL;
+  assert.equal(aapl.symbol, 'AAPL');
+  assert.equal(aapl.priceUsd, 190.5);
+  assert.equal(aapl.bid, 190.4);
+  assert.equal(aapl.ask, 190.6);
+  assert.equal(aapl.prevCloseUsd, 188);
+  assert.equal(aapl.changeUsd, 2.5);
+  assert.equal(aapl.changePct, 2.5 / 188);
+  assert.equal(aapl.openUsd, 185);
+  assert.equal(aapl.highUsd, 192);
+  assert.equal(aapl.lowUsd, 184);
+  assert.equal(aapl.volume, 5000);
+  assert.equal(aapl.ts, nowMs);
+  assert.equal(aapl.stale, false);
+
+  // No timestamp => stale; change still computed when price+prevClose exist.
+  assert.equal(snapshots.MSFT.priceUsd, 400);
+  assert.equal(snapshots.MSFT.changeUsd, 2);
+  assert.equal(snapshots.MSFT.ts, null);
+  assert.equal(snapshots.MSFT.stale, true);
+  // Missing everything => nulls, never dropped.
+  assert.equal(snapshots.EMPTY.priceUsd, null);
+  assert.equal(snapshots.EMPTY.stale, true);
+
+  const snapshotCall = fetchImpl.calls.find((call) => call.url.includes('/v2/stocks/snapshots'));
+  assert.ok(snapshotCall.url.startsWith('https://data.alpaca.markets/v2/stocks/snapshots?'));
+  const url = new URL(snapshotCall.url);
+  assert.equal(url.searchParams.get('symbols'), 'AAPL,MSFT,EMPTY');
+  assert.equal(url.searchParams.get('feed'), 'iex');
+  assert.equal(snapshotCall.init.headers['APCA-API-KEY-ID'], 'k');
+
+  // 2s cache per (feed, symbol set): repeat + within-TTL calls reuse one request.
+  const before = fetchImpl.calls.filter((call) => call.url.includes('/v2/stocks/snapshots')).length;
+  await broker.getSnapshots(['AAPL', 'MSFT', 'EMPTY'], { feed: 'iex', nowMs: nowMs + 1_500 });
+  assert.equal(
+    fetchImpl.calls.filter((call) => call.url.includes('/v2/stocks/snapshots')).length,
+    before,
+    'within-TTL repeat uses the cache',
+  );
+  // expired cache refreshes
+  await broker.getSnapshots(['AAPL', 'MSFT', 'EMPTY'], { feed: 'iex', nowMs: nowMs + 2_500 });
+  assert.equal(
+    fetchImpl.calls.filter((call) => call.url.includes('/v2/stocks/snapshots')).length,
+    before + 1,
+  );
+  // a different symbol set is a different cache entry
+  await broker.getSnapshots(['AAPL'], { feed: 'iex', nowMs: nowMs + 2_600 });
+  assert.equal(
+    fetchImpl.calls.filter((call) => call.url.includes('/v2/stocks/snapshots')).length,
+    before + 2,
+  );
+});
+
+test('sim broker: deterministic market snapshots (same shape as Alpaca)', () => {
+  const config = testConfig({ mode: 'sim' });
+  const brokerA = createSimBroker(config, { seed: 42 });
+  const brokerB = createSimBroker(config, { seed: 42 });
+  const snapshotsA = brokerA.getSnapshots(['AAPL', 'MSFT']);
+  const snapshotsB = brokerB.getSnapshots(['AAPL', 'MSFT']);
+  assert.deepEqual(snapshotsA, snapshotsB, 'same seed => identical snapshots');
+  for (const symbol of ['AAPL', 'MSFT']) {
+    const snapshot = snapshotsA[symbol];
+    assert.equal(snapshot.symbol, symbol);
+    assert.equal(snapshot.simulated, true);
+    assert.equal(snapshot.stale, false);
+    assert.ok(snapshot.priceUsd > 0);
+    assert.ok(snapshot.bid > 0 && snapshot.ask >= snapshot.bid);
+    assert.ok(snapshot.highUsd >= snapshot.lowUsd);
+    assert.ok(snapshot.lowUsd > 0);
+    assert.ok(Number.isFinite(snapshot.prevCloseUsd));
+    assert.ok(Number.isFinite(snapshot.ts));
+    assert.ok(Number.isFinite(snapshot.volume) && snapshot.volume > 0);
+    assert.equal(snapshot.openUsd, snapshot.openUsd); // present/number
+  }
+  // advances deterministically with the synthetic market
+  brokerA.advanceBar(1);
+  brokerB.advanceBar(1);
+  assert.deepEqual(brokerA.getSnapshots(['AAPL']), brokerB.getSnapshots(['AAPL']));
+  // unknown symbol is tolerated
+  const unknown = brokerA.getSnapshots(['NOTREAL']);
+  assert.equal(unknown.NOTREAL.stale, true);
+  assert.equal(unknown.NOTREAL.priceUsd, null);
+  // omitted symbols -> configured universe
+  assert.ok(Object.keys(brokerA.getSnapshots()).length >= 2);
+});
+
+// ===========================================================================
+// v3.2 multi-symbol portfolio: executor baskets
+// ===========================================================================
+
+function makePortfolioBrokerDouble({ spots = {}, fillPriceBySymbol = {} } = {}) {
+  const submitted = [];
+  const spotFor = (symbol) => (Number.isFinite(Number(spots[symbol])) ? Number(spots[symbol]) : 100);
+  const broker = {
+    submitted,
+    async getLatestQuote(symbol) {
+      const spot = spotFor(symbol);
+      return { symbol, bid: round2(spot - 0.1), ask: round2(spot + 0.1), last: spot, ts: T0 };
+    },
+    async getBars() {
+      return {};
+    },
+    async getAsset(symbol) {
+      return { symbol, assetClass: 'us_equity', tradable: true, shortable: true, marginable: true, fractionable: true };
+    },
+    async getOptionChain() {
+      return [];
+    },
+    async getOptionQuote() {
+      return null;
+    },
+    async submitOrder(order = {}) {
+      submitted.push(order);
+      const price = Number.isFinite(Number(fillPriceBySymbol[order.symbol]))
+        ? Number(fillPriceBySymbol[order.symbol])
+        : spotFor(order.symbol);
+      return {
+        id: `pf-ord-${submitted.length}`,
+        clientOrderId: order.clientOrderId ?? null,
+        symbol: order.symbol,
+        side: order.side,
+        qty: order.qty,
+        filledQty: order.qty,
+        avgFillPriceUsd: round4(price),
+        status: 'filled',
+        assetClass: order.assetClass ?? 'us_equity',
+        submittedAt: T0,
+      };
+    },
+    async getOrders() {
+      return [];
+    },
+    async getOrder() {
+      return null;
+    },
+    getAccount() {
+      throw new Error('executor must never call broker.getAccount()');
+    },
+  };
+  return broker;
+}
+
+function basketSpecsFor(symbols, paramsBySymbol = {}) {
+  return symbols.map((symbol) => baseSpec({
+    specId: `spec-${symbol.toLowerCase()}`,
+    symbol,
+    family: 'breakout',
+    ...(paramsBySymbol[symbol] ? { params: { ...baseSpec().params, ...paramsBySymbol[symbol] } } : {}),
+  }));
+}
+
+function portfolioHarness({
+  symbols = ['AAPL', 'MSFT', 'NVDA'],
+  spots = {},
+  positions = {},
+  specs,
+  brakesHandler,
+  configOverrides,
+  mandate,
+  portfolio = { maxOpenPositions: 5, maxOrdersPerCycle: 3 },
+} = {}) {
+  const config = testConfig({ mode: 'paper', ...(configOverrides ?? {}) });
+  const clock = createClock({ now: () => T0 });
+  const broker = makePortfolioBrokerDouble({ spots });
+  const brakes = makeBrakesDouble(brakesHandler);
+  const ledger = makeLedgerDouble({ positions, equityUsd: 5000, cashUsd: 100_000 });
+  const executor = createExecutor({ broker, brakes, ledger, config, clock });
+  const specList = specs ?? basketSpecsFor(symbols);
+  const quotes = {};
+  const bars = {};
+  for (const symbol of symbols) {
+    const spot = Number.isFinite(Number(spots[symbol])) ? Number(spots[symbol]) : 100;
+    quotes[symbol] = { bid: round2(spot - 0.1), ask: round2(spot + 0.1), last: spot, ts: T0 };
+    bars[symbol] = breakoutBars();
+  }
+  return {
+    config,
+    clock,
+    broker,
+    brakes,
+    ledger,
+    executor,
+    agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbols, symbol: symbols[0], family: 'breakout' } },
+    spec: specList[0],
+    specs: specList,
+    portfolio,
+    mandate: mandate ?? baseMandate({ allowedSymbols: [...symbols] }),
+    quotes,
+    bars,
+    dayStats: { dayKey: '2024-01-10', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+  };
+}
+
+function runPortfolio(harness, extra = {}) {
+  return harness.executor.run({
+    agent: harness.agent,
+    spec: harness.spec,
+    specs: harness.specs,
+    portfolio: harness.portfolio,
+    mandate: harness.mandate,
+    quotes: harness.quotes,
+    bars: harness.bars,
+    dayStats: harness.dayStats,
+    now: T0,
+    ...extra,
+  });
+}
+
+test('executor portfolio: enters the basket across symbols with a shared run order cap', async () => {
+  const harness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT', 'NVDA'],
+    spots: { AAPL: 110, MSFT: 210, NVDA: 310 },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+  });
+  const result = await runPortfolio(harness);
+  assert.equal(result.denied.length, 0, JSON.stringify(result.denied));
+  assert.equal(result.orders.length, 2, 'maxOrdersPerCycle caps entries for the whole run');
+  assert.equal(harness.broker.submitted.length, 2);
+  const enteredSymbols = result.actions.filter((action) => action.type === 'entry').map((action) => action.symbol);
+  assert.equal(enteredSymbols.length, 2);
+  assert.equal(new Set(enteredSymbols).size, 2, 'one order per symbol per run');
+  for (const symbol of enteredSymbols) {
+    assert.ok(['AAPL', 'MSFT', 'NVDA'].includes(symbol));
+  }
+  assert.ok(result.actions.some((action) => action.type === 'skip' && action.reason === 'max_orders_per_cycle'));
+
+  // a larger run cap enters the whole 3-symbol basket
+  const fullHarness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT', 'NVDA'],
+    spots: { AAPL: 110, MSFT: 210, NVDA: 310 },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 3 },
+  });
+  const fullResult = await runPortfolio(fullHarness);
+  assert.equal(fullResult.orders.length, 3);
+  assert.deepEqual(
+    fullResult.actions.filter((action) => action.type === 'entry').map((action) => action.symbol).sort(),
+    ['AAPL', 'MSFT', 'NVDA'],
+  );
+});
+
+test('executor portfolio: maxOpenPositions caps new positions (brake ceiling still applies)', async () => {
+  const harness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT', 'NVDA'],
+    spots: { AAPL: 110, MSFT: 210, NVDA: 310 },
+    portfolio: { maxOpenPositions: 1, maxOrdersPerCycle: 5 },
+  });
+  const result = await runPortfolio(harness);
+  assert.equal(result.orders.length, 1);
+  assert.equal(harness.broker.submitted.length, 1);
+  const capped = result.actions.filter((action) => action.type === 'skip' && action.reason === 'max_open_positions');
+  assert.equal(capped.length, 2);
+  assert.equal(capped[0].maxOpenPositions, 1);
+  assert.equal(capped[0].openPositions, 1);
+});
+
+test('executor portfolio: exits every held basket position with its own symbol spec', async () => {
+  const openedAt = new Date(T0 - 2 * HOUR_MS).toISOString();
+  // AAPL is at its stop under its own (primary) 2% stop; MSFT uses a wide-stop spec and
+  // must NOT be stopped by AAPL's parameters -> proves per-symbol spec selection.
+  const specs = basketSpecsFor(['AAPL', 'MSFT'], {
+    MSFT: { stopPct: 0.5, targetPct: 0.5, maxHoldBars: 48 },
+  });
+  const harness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT'],
+    specs,
+    spots: { AAPL: 90, MSFT: 96 },
+    positions: {
+      AAPL: { qty: 10, qtySigned: 10, avgPriceUsd: 100, assetClass: 'us_equity', openedAt },
+      MSFT: { qty: 10, qtySigned: 10, avgPriceUsd: 100, assetClass: 'us_equity', openedAt },
+    },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+  });
+  const result = await runPortfolio(harness);
+  assert.equal(result.denied.length, 0, JSON.stringify(result.denied));
+  assert.equal(result.orders.length, 1, 'only AAPL exits (MSFT wide-stop spec holds)');
+  const exitActions = result.actions.filter((action) => action.type === 'exit');
+  assert.equal(exitActions.length, 1);
+  assert.equal(exitActions[0].symbol, 'AAPL');
+  assert.equal(exitActions[0].reason, 'stop');
+  const msftHold = result.actions.find((action) => action.type === 'hold' && action.symbol === 'MSFT');
+  assert.ok(msftHold, 'MSFT keeps a hold action under its own spec');
+  // the order's brake input carried the matching symbol spec
+  const aaplSpec = specs.find((spec) => spec.symbol === 'AAPL');
+  assert.equal(harness.brakes.calls[0].spec.specId, aaplSpec.specId);
+  assert.equal(harness.broker.submitted[0].symbol, 'AAPL');
+  assert.equal(harness.broker.submitted[0].side, 'sell');
+
+  // both positions exit when each spec's own rule is hit (MSFT target under its own params)
+  const bothSpecs = basketSpecsFor(['AAPL', 'MSFT'], {
+    MSFT: { stopPct: 0.02, targetPct: 0.02, maxHoldBars: 48 },
+  });
+  const bothHarness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT'],
+    specs: bothSpecs,
+    spots: { AAPL: 90, MSFT: 104 },
+    positions: {
+      AAPL: { qty: 10, qtySigned: 10, avgPriceUsd: 100, assetClass: 'us_equity', openedAt },
+      MSFT: { qty: 10, qtySigned: 10, avgPriceUsd: 100, assetClass: 'us_equity', openedAt },
+    },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+  });
+  const bothResult = await runPortfolio(bothHarness);
+  assert.equal(bothResult.orders.length, 2);
+  assert.deepEqual(
+    bothResult.actions.filter((action) => action.type === 'exit').map((action) => [action.symbol, action.reason]).sort(),
+    [['AAPL', 'stop'], ['MSFT', 'target']],
+  );
+});
+
+test('executor portfolio: legacy single-spec calls behave exactly as before', async () => {
+  const harness = executorHarness();
+  // no `specs`/`portfolio` at all: the old single-spec contract
+  const legacy = await runHarness(harness);
+  assert.equal(legacy.orders.length, 1);
+  assert.equal(legacy.orders[0].symbol, 'AAPL');
+  assert.equal(legacy.actions.find((action) => action.type === 'entry').symbol, 'AAPL');
+  // the same call with a one-item basket + portfolio caps still produces one order
+  const basketOfOne = await harness.executor.run({
+    agent: harness.agent,
+    spec: harness.spec,
+    specs: [harness.spec],
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+    mandate: harness.mandate,
+    quotes: harness.quotes,
+    bars: harness.bars,
+    dayStats: harness.dayStats,
+    now: T0,
+  });
+  assert.equal(basketOfOne.orders.length, 1);
+  assert.equal(basketOfOne.orders[0].symbol, 'AAPL');
+  // describe() exposes the portfolio capability
+  const view = harness.executor.describe();
+  assert.equal(view.portfolio.supported, true);
+});
+
+test('executor portfolio: brakes still run first for every basket order (DENY is contained)', async () => {
+  const harness = portfolioHarness({
+    symbols: ['AAPL', 'MSFT'],
+    spots: { AAPL: 110, MSFT: 210 },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 3 },
+    brakesHandler: (input) => (input.order.symbol === 'MSFT'
+      ? { decision: 'DENY', code: 'MARKET_CLOSED', rule: 'D3', reason: 'closed for MSFT' }
+      : { decision: 'ALLOW', code: null, rule: null, reason: 'ok' }),
+  });
+  const result = await runPortfolio(harness);
+  assert.equal(result.orders.length, 1);
+  assert.equal(harness.broker.submitted.length, 1);
+  assert.equal(harness.broker.submitted[0].symbol, 'AAPL');
+  const denial = result.denied.find((entry) => entry.code === 'MARKET_CLOSED');
+  assert.ok(denial, 'the denied symbol is recorded');
+  assert.equal(denial.symbol, 'MSFT');
+  assert.equal(harness.brakes.calls.length, 2, 'both orders reached the brake wall first');
 });
 
 // ===========================================================================

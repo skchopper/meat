@@ -348,7 +348,7 @@ applies next cycle, so minute-level reactions never wait on a model turn.
   the drill-down; engine header bot-agent bridge line. Disable with `agents.enabled: false` (reviews
   stop, existing policies become stale and ignored after `maxAgeSec`).
 - **Strategy categories**: momentum/mean-reversion = Swing · mid-long (1-hour lane), breakout/gap-fade
-  = Day · intraday (1-minute lane). Genesis mixes a new population ~50/50; existing populations are
+  = Day · intraday (1-minute lane). Genesis mixes a new population by strategyMix.dayPct (live 70/30, v3.2); existing populations are
   rebalanced once on first start (genome family + strategy name refreshed, specs recompiled; ids,
   ledgers, positions and trade history are never touched).
 
@@ -463,6 +463,53 @@ restricted-account warning; `GET /automaton/state` exposes it programmatically.
 7. **Costs vs progress**: bots pay metabolism each trading cycle (inference/data/hosting). Off-hours
    gating stops weekend burn. A bot with equity ≈ $19.4 after the old $20 era is topped up to $50 by
    the one-time treasury reallocation on the first v3.1 start; check `limits.endowmentUsd`/agents.
+
+## 8f. Multi-symbol portfolios, 70/30 mix and the live analytics dashboard (v3.2)
+
+```json
+"strategyMix": { "dayPct": 0.7 },
+"portfolio": {
+  "basketSizeDay": 4,
+  "basketSizeSwing": 3,
+  "maxOpenPositionsDay": 5,
+  "maxOpenPositionsSwing": 3,
+  "maxOrdersPerCycle": 2
+},
+"risk": { "maxOpenPositions": 6, "maxOrdersPerCycle": 2 }
+```
+
+- **Baskets:** every bot trades a basket of symbols. Day bots use 4 symbols, swing bots 3 (config
+  `portfolio.basketSize*`); the genome carries `symbols` and the registry caches one compiled spec per
+  symbol in `agent.specIds` (primary `specId` stays tied to the primary symbol). The executor
+  evaluates every basket symbol, manages every held position with the matching per-symbol spec and
+  enforces the tier caps; the 18-brake wall remains the absolute ceiling. One order per symbol per
+  cycle; `maxOrdersPerCycle` covers exits+entries.
+- **70/30 mix:** `strategyMix.dayPct` (live 0.7) sets the genesis/migration split. Existing
+  populations migrate once on start: families/tiers are rebalanced to the target, each alive bot is
+  given a basket, and its old single-symbol spec is cleared so per-symbol specs recompile. Ids,
+  ledgers, positions and history are untouched. Baskets are assigned by rotating the configured
+  universe; overlapping baskets mean several bots can watch the same company.
+- **Status:** `agents[].symbols` (basket), `agents[].specs[]` (per-symbol specs) and primary
+  `agents[].spec`; `status.engine.portfolio` and `strategyMix.target` expose the caps/target. The panel
+  shows the basket in the agent table and detail drawer.
+- **Live analytics feed:** engine `marketView()` (2 s cache) combines broker snapshots, 1-minute
+  sparklines (15 s cache), the latest status snapshot and a 240-point portfolio equity history. Host
+  exposes **loopback `GET /automaton/market`** (GET/HEAD only; redacted; structured 503 when the view
+  is unavailable; no new tools/control actions). Data is read-only and secret-free.
+- **Dashboard:** the panel is now a Google-Analytics-style dashboard: top bar (mode/running/halted/
+  kill/live feed/market clock/manual refresh/pause + Start/Stop/Emergency), eight KPI cards, inline
+  SVG equity chart + sparklines + Day-vs-Swing 70/30 bars, live tape with 2 s green/red flashes and a
+  “market closed · last close” state, filterable/sortable agents table with basket/live P&L/positions/
+  stance/sparkline and the existing detail drawer, plus Overview/Agents/Markets/Research/Rewards/
+  Settings tabs. State polls every 5 s, market every 2 s; polling pauses when the tab is hidden or the
+  pause toggle is on, and manual refresh pulls both. Missing market feed → state-only fallback.
+- **Starting from a stopped/halted engine:** the panel Start control starts the loop; a
+  `broker_unavailable` halt clears on the next successful broker tick. The market feed still renders
+  the last quotes/status while paused/stopped, labelled accordingly.
+- **Stale states in this deployment:** the last recorded tick was 2026-11-07 with a transient
+  `broker_unavailable` halt and treasury CRITICAL (allocation nearly at cap after weekly reward
+  payouts). Restart the Host, then press Start; the first successful tick should recover the
+  treasury and the new migrations (70/30, baskets) run once on startup.
 
 ## 9. Troubleshooting
 

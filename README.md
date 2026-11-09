@@ -170,19 +170,33 @@ the operating config).
   options level 3, long stock and long/debit options remain). The engine header now shows a
   **Last cycle** diagnostic (market state, executions, orders, errors, top skip reasons) and a
   restricted-account warning. Ops: `docs/RUNBOOK.md` §8e.
+- **Multi-symbol portfolio bots + 70% day mix + live analytics (v3.2):** every bot now manages its own
+  **basket of 4 stocks (day) or 3 stocks (swing)**, with one compiled spec per symbol, so one bot can
+  hold/trade several companies instead of a single ticker. The population mix is configurable and the
+  live profile is **70% day/short-term (21 bots) / 30% swing (9 bots)**, with an automatic one-time
+  migration for existing populations, basket assignment and spec rebuilds. The execution layer now
+  evaluates every basket symbol, manages all held positions with per-symbol rules, and enforces
+  per-tier max-open-position and per-cycle order caps while staying behind the 18-brake wall. The
+  control panel was rebuilt as a **Google-Analytics-style live dashboard**: brand/status/control top
+  bar, 8 KPI cards, inline-SVG portfolio equity chart, Day-vs-Swing 70/30 mix bars, a live market tape
+  with 2-second price/change flashes and sparklines, filterable agents table with basket/live P&L and
+  the existing detail drawer, and Overview/Agents/Markets/Research/Rewards/Settings tabs. A new
+  loopback `GET /automaton/market` route feeds real-time quotes/sparklines/portfolio/agent equity at
+  2 s (state at 5 s), with a state-only fallback for older Hosts. Contract:
+  `docs/PORTFOLIO-ANALYTICS.md`; ops: `docs/RUNBOOK.md` §8f.
 
 ## Status (this build)
 
-- 10 test suites: mortality 70, market 43, plugin 43, independent integration 34, security 53,
-  research 13, rankings 16, control 17, bot-agent 9 and instruments 7 — **305 tests, 305 pass,
+- 10 test suites: mortality 76, market 50, plugin 46, independent integration 53, security 58,
+  research 13, rankings 16, control 18, bot-agent 9 and instruments 7 — **346 tests, 346 pass,
   0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
   `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live
   reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/
   monthly leaderboards; period-boundary rewards with cap scaling, once-per-period and live reward
   reconfigure) and in `test/rankings.test.js` (16 tests). Host control actions and every dashboard
-  mapping are covered by the plugin suite (42 tests). Live UI verification follows the next Host
-  restart.
+  mapping are covered by the plugin suite (46 tests, including the v3.2 market route and analytics
+  helpers). Live UI verification follows the next Host restart.
 - Research sidecar verified end-to-end: `test/research.test.js` (isolation, schema clamp,
   malformed-reply containment, per-agent charging, hourly scheduling, stale expiry) plus
   `scripts/research-smoke.mjs` (10/10: real `createAutomaton` composition, per-agent journals,

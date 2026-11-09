@@ -720,11 +720,203 @@ export function createEngine(options = {}) {
     };
   }
 
+  /**
+   * v3.2 real-time market/analytics view for the Web panel (docs/PORTFOLIO-ANALYTICS.md).
+   * Combines broker snapshots (2s cache), 1-minute sparklines (15s cache), the current status
+   * snapshot and an in-memory portfolio equity history. Read-only, redacted and never throws:
+   * transient broker errors return the last known data with an `error` field.
+   */
+  const marketCache = {
+    view: null,
+    at: 0,
+    sparkAt: 0,
+    sparklines: {},
+    clockAt: 0,
+    clockOpen: null,
+    history: [],
+    historyAt: 0,
+  };
+  const round2 = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+  async function marketView() {
+    const nowMs = clock.now();
+    if (marketCache.view && nowMs - marketCache.at < 2000) return marketCache.view;
+    let state;
+    let snapshotStatus;
+    try {
+      state = await load();
+      snapshotStatus = await status();
+    } catch (error) {
+      const failure = errorInfo(error);
+      if (marketCache.view) return { ...marketCache.view, at: new Date(nowMs).toISOString(), error: failure };
+      return { ok: false, at: new Date(nowMs).toISOString(), error: failure };
+    }
+    const symbols = Array.isArray(state.config.symbols) ? state.config.symbols : [];
+    const feed = state.config.data?.feed ?? 'iex';
+    let activeBroker;
+    try {
+      activeBroker = broker ?? makeBroker(state.config, state.secrets);
+    } catch (error) {
+      // Never throw from marketView: a missing broker/credentials must degrade to the last good
+      // view (or a structured ok:false) so the Host route/panel stays alive.
+      const failure = errorInfo(error);
+      if (marketCache.view) return { ...marketCache.view, at: new Date(nowMs).toISOString(), error: failure };
+      return { ok: false, at: new Date(nowMs).toISOString(), error: failure };
+    }
+    let error = null;
+    let quotes = {};
+    let marketOpen = marketCache.clockOpen;
+    try {
+      if (nowMs - marketCache.clockAt > 10_000 && typeof activeBroker.getClock === 'function') {
+        const brokerClock = await activeBroker.getClock();
+        marketCache.clockAt = nowMs;
+        marketCache.clockOpen = brokerClock?.isOpen ?? null;
+        marketOpen = marketCache.clockOpen;
+      }
+    } catch (clockError) {
+      error = errorInfo(clockError);
+    }
+    try {
+      if (typeof activeBroker.getSnapshots === 'function') {
+        const snapshots = await activeBroker.getSnapshots(symbols, { feed });
+        for (const symbol of symbols) {
+          const snapshot = snapshots?.[symbol];
+          if (!snapshot) continue;
+          quotes[symbol] = {
+            symbol,
+            priceUsd: snapshot.priceUsd ?? null,
+            bid: snapshot.bid ?? null,
+            ask: snapshot.ask ?? null,
+            changeUsd: snapshot.changeUsd ?? null,
+            changePct: snapshot.changePct ?? null,
+            openUsd: snapshot.openUsd ?? null,
+            highUsd: snapshot.highUsd ?? null,
+            lowUsd: snapshot.lowUsd ?? null,
+            prevCloseUsd: snapshot.prevCloseUsd ?? null,
+            volume: snapshot.volume ?? null,
+            ts: snapshot.ts ?? null,
+            stale: snapshot.stale === true,
+            simulated: snapshot.simulated === true,
+          };
+        }
+      }
+    } catch (snapshotError) {
+      error = errorInfo(snapshotError);
+    }
+    try {
+      if (symbols.length > 0 && (nowMs - marketCache.sparkAt > 15_000 || Object.keys(marketCache.sparklines).length === 0)) {
+        const bars = await activeBroker.getBars({
+          symbols,
+          timeframe: '1Min',
+          limit: 60,
+          feed,
+        });
+        const sparklines = {};
+        for (const [symbol, rows] of Object.entries(bars ?? {})) {
+          if (!Array.isArray(rows)) continue;
+          sparklines[symbol] = rows.slice(-60).map((row) => Number(row.c)).filter((value) => Number.isFinite(value));
+        }
+        marketCache.sparklines = sparklines;
+        marketCache.sparkAt = nowMs;
+      }
+    } catch (barsError) {
+      error = errorInfo(barsError);
+    }
+    // Fallback quotes from the last sparkline close when snapshots are unavailable.
+    for (const symbol of symbols) {
+      if (quotes[symbol]?.priceUsd) continue;
+      const closes = marketCache.sparklines[symbol] ?? [];
+      if (closes.length === 0) continue;
+      const price = closes[closes.length - 1];
+      const prev = closes.length > 1 ? closes[0] : price;
+      quotes[symbol] = {
+        symbol,
+        priceUsd: price,
+        bid: null,
+        ask: null,
+        changeUsd: round2(price - prev),
+        changePct: prev > 0 ? Math.round(((price - prev) / prev) * 1000000) / 10000 : null,
+        openUsd: null,
+        highUsd: null,
+        lowUsd: null,
+        prevCloseUsd: prev,
+        volume: null,
+        ts: nowMs,
+        stale: true,
+        simulated: false,
+      };
+    }
+    if (Object.keys(quotes).length === 0 && marketCache.view?.quotes) {
+      quotes = marketCache.view.quotes;
+    }
+    const account = snapshotStatus?.account ?? {};
+    const agents = (snapshotStatus?.agents ?? []).map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      tier: agent.tier,
+      strategy: agent.strategy?.typeLabel ?? null,
+      basket: Array.isArray(agent.symbols) ? agent.symbols : [],
+      equityUsd: agent.equityUsd ?? null,
+      dayPnlPct: agent.pnl?.dayPct ?? null,
+      positions: Array.isArray(agent.positions) ? agent.positions.length : 0,
+      stance: agent.policy?.stance ?? null,
+    }));
+    let dayPnlUsd = 0;
+    let positionsCount = 0;
+    for (const agent of agents) {
+      positionsCount += agent.positions;
+      if (Number.isFinite(Number(agent.dayPnlPct)) && Number.isFinite(Number(agent.equityUsd))) {
+        dayPnlUsd += (Number(agent.equityUsd) * Number(agent.dayPnlPct)) / 100;
+      }
+    }
+    const equityUsd = Number(account.equityUsd) || 0;
+    const cashUsd = Number(account.cashUsd) || 0;
+    const portfolio = {
+      equityUsd,
+      cashUsd,
+      buyingPowerUsd: account.buyingPowerUsd ?? null,
+      dayPnlUsd: round2(dayPnlUsd),
+      dayPnlPct: equityUsd > 0 ? Math.round((dayPnlUsd / equityUsd) * 1000000) / 10000 : null,
+      grossExposureUsd: snapshotStatus?.treasury?.grossExposureUsd ?? null,
+      netExposureUsd: snapshotStatus?.treasury?.netExposureUsd ?? null,
+      positions: positionsCount,
+    };
+    if (nowMs - marketCache.historyAt >= 1000) {
+      marketCache.historyAt = nowMs;
+      marketCache.history.push({ at: new Date(nowMs).toISOString(), equityUsd, cashUsd });
+      if (marketCache.history.length > 240) marketCache.history.splice(0, marketCache.history.length - 240);
+    }
+    const view = {
+      ok: true,
+      at: new Date(nowMs).toISOString(),
+      marketOpen: marketOpen ?? snapshotStatus?.engine?.lastCycle?.marketOpen ?? null,
+      quotes,
+      sparklines: marketCache.sparklines,
+      portfolio,
+      agents,
+      engine: {
+        running: automaton ? automaton.isRunning() : false,
+        marketOpen: marketOpen ?? null,
+        lastCycle: snapshotStatus?.engine?.lastCycle ?? null,
+        research: snapshotStatus?.engine?.research ?? null,
+        agents: snapshotStatus?.engine?.agents ?? null,
+        halted: snapshotStatus?.halted === true,
+        haltReasons: snapshotStatus?.haltReasons ?? [],
+      },
+      equityHistory: marketCache.history.slice(-240),
+      error: error ? { message: error.message ?? String(error), code: error.code ?? null } : null,
+    };
+    marketCache.view = view;
+    marketCache.at = nowMs;
+    return view;
+  }
+
   return {
     start,
     stop,
     tick,
     status,
+    marketView,
     probe,
     obituaries,
     brakesView,

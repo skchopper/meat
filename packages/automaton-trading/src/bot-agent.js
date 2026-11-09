@@ -49,11 +49,13 @@ const ATTEMPTS = 2;
 
 const SYSTEM_PROMPT = [
   'You are the private trading agent for exactly ONE automated bot in a mortality-engineered population.',
-  'You see only your own bot: its strategy genome, its virtual book, market data for its symbol, its',
-  'research briefing and your own previous reviews. You know nothing about other bots and must not',
-  'mention them. You do not place orders and cannot change your budget; a deterministic executor',
-  'applies your policy inside a hard brake wall. Human capital is at risk: be conservative when the',
-  'evidence is weak.',
+  'You manage a BASKET of company stocks (not just one): the deterministic executor evaluates every',
+  'basket symbol and your policy applies to the whole basket, so size/risk decisions must work for',
+  'multiple simultaneous positions. You see only your own bot: its strategy genome, basket, virtual',
+  'book, market data, research briefing and your own previous reviews. You know nothing about other',
+  'bots and must not mention them. You do not place orders and cannot change your budget; a',
+  'deterministic executor applies your policy inside a hard brake wall. Human capital is at risk: be',
+  'conservative when the evidence is weak.',
   'You may choose HOW this bot expresses its edge: long or short stock, a long call/put, a covered',
   'call (only if the bot owns 100+ shares), or a defined-risk vertical spread. Use the instrument',
   'that best fits the setup and is affordable in the provided INSTRUMENT CONTEXT; prefer options or',
@@ -289,9 +291,23 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
       dteWindow: [config?.instruments?.minDTE ?? 2, config?.instruments?.maxDTE ?? 14],
       playbook: { bullish: playbook.bullish, bearish: playbook.bearish, neutral: playbook.neutral, summary: playbook.summary },
     };
+    const basket = (() => {
+      const raw = Array.isArray(agent?.symbols) && agent.symbols.length > 0
+        ? agent.symbols
+        : Array.isArray(agent?.genome?.symbols) && agent.genome.symbols.length > 0
+          ? agent.genome.symbols
+          : [symbol].filter(Boolean);
+      const out = [];
+      for (const item of raw) {
+        const value = String(item ?? '').trim().toUpperCase();
+        if (value && !out.includes(value)) out.push(value);
+      }
+      return out;
+    })();
     const sections = [
       `BOT: ${agent.name ?? agent.id} (id ${agent.id}, generation ${agent.generation ?? 0}, tier ${agent.tier ?? type.category})`,
-      `STRATEGY: ${type.typeLabel} on ${symbol || 'n/a'} (family ${agent?.genome?.family ?? 'unknown'})`,
+      `BASKET: ${JSON.stringify(basket)} (the executor trades every symbol in this basket where its signal fires; you set the policy for the whole basket)`,
+      `STRATEGY: ${type.typeLabel} managing ${basket.join(', ') || 'n/a'} (family ${agent?.genome?.family ?? 'unknown'})`,
       `GENOME: ${JSON.stringify(agent?.genome ?? {})}`,
       spec ? `ACTIVE_SPEC: ${JSON.stringify({ symbol: spec.symbol, family: spec.family, params: spec.params ?? {} })}` : 'ACTIVE_SPEC: none compiled yet',
       `TRADING_RULES: ${JSON.stringify(tradingRules)}`,

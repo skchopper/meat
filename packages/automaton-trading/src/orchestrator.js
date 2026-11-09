@@ -68,6 +68,7 @@ const DEFAULT_GENOME = {
 const GENOME_LOOKBACKS = [10, 15, 20, 30, 40, 60];
 const GENOME_HOLDS = [4, 6, 8, 12, 24];
 const GENOME_SESSIONS = ['any', 'morning', 'afternoon'];
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
 /**
  * Build a distinct, deterministic genome for each genesis agent.
@@ -82,10 +83,13 @@ function genesisGenome(config, index) {
   const symbols = config.symbols.length > 0 ? config.symbols : ['SPY'];
   const seed = Number(config.engine?.seed ?? 7) >>> 0;
   const rng = mulberry32((seed * 2654435761 + index * 40503 + 1) >>> 0);
-  // Balanced population mix (docs/BOT-AGENTS.md): half swing (momentum/meanrev, 1-hour lane) and
-  // half day (breakout/gapfade, 1-minute lane); the tier is implied by the family.
-  const family = targetFamilyForIndex(index, Math.max(1, Number(config.population?.initial) || 30));
+  // v3.2 population mix (docs/PORTFOLIO-ANALYTICS.md): configurable day share (default 50%,
+  // live profile 70%); day families use the 1-minute lane, swing families the 1-hour lane.
+  const dayPct = Number(config.strategyMix?.dayPct ?? 0.5);
+  const family = targetFamilyForIndex(index, Math.max(1, Number(config.population?.initial) || 30), dayPct);
+  const tier = tierForFamily(family);
   const symbol = symbols[index % symbols.length];
+  const basket = basketForAgent(config, index, tier, symbol);
   const round = (value, digits) => {
     const factor = 10 ** digits;
     return Math.round(value * factor) / factor;
@@ -93,6 +97,7 @@ function genesisGenome(config, index) {
   return {
     ...DEFAULT_GENOME,
     symbol,
+    symbols: basket,
     family,
     lookback: GENOME_LOOKBACKS[Math.floor(rng() * GENOME_LOOKBACKS.length)],
     entryZ: round(0.8 + rng() * 1.4, 2),
@@ -105,6 +110,33 @@ function genesisGenome(config, index) {
     sizePct: round(0.12 + rng() * 0.23, 3),
     sessionFilter: GENOME_SESSIONS[Math.floor(rng() * GENOME_SESSIONS.length)],
   };
+}
+
+/**
+ * v3.2: select a multi-symbol basket for a bot (docs/PORTFOLIO-ANALYTICS.md).
+ * The primary symbol stays first; the rest rotate through the configured universe so baskets
+ * overlap but every bot covers its own combination.
+ */
+function basketForAgent(config, index, tier, primary = null) {
+  const symbols = (Array.isArray(config.symbols) ? config.symbols : []).map((symbol) => String(symbol).toUpperCase());
+  if (symbols.length === 0) return primary ? [primary] : [];
+  const portfolio = config.portfolio ?? {};
+  const requested = tier === 'day'
+    ? Number(portfolio.basketSizeDay) || 4
+    : Number(portfolio.basketSizeSwing) || 3;
+  const size = Math.max(1, Math.min(symbols.length, Math.trunc(requested)));
+  // Co-prime stride + a per-lap offset so bots with the same primary symbol still get distinct
+  // baskets (30 bots, 14 symbols -> 26 unique combinations under index*3; this yields all unique).
+  const start = ((Math.max(0, Number(index) || 0) * 5
+    + Math.floor(Math.max(0, Number(index) || 0) / symbols.length) * 3) % symbols.length
+    + symbols.length) % symbols.length;
+  const basket = [];
+  if (primary && symbols.includes(primary)) basket.push(primary);
+  for (let offset = 0; basket.length < size && offset < symbols.length * 2; offset += 1) {
+    const symbol = symbols[(start + offset) % symbols.length];
+    if (!basket.includes(symbol)) basket.push(symbol);
+  }
+  return basket;
 }
 
 /** Last close (or last/ask fallback) per symbol, used for marking positions. */
@@ -317,72 +349,102 @@ export async function createAutomaton(options = {}) {
     return agent?.genome ?? null;
   }
 
+  /** v3.2: sanitized multi-symbol basket for an agent (fallback to single symbol). */
+  function basketSymbols(agent) {
+    const genome = agent?.genome ?? {};
+    const raw = Array.isArray(agent?.symbols) && agent.symbols.length > 0
+      ? agent.symbols
+      : Array.isArray(genome.symbols) && genome.symbols.length > 0
+        ? genome.symbols
+        : [genome.symbol];
+    const out = [];
+    for (const symbol of raw) {
+      const value = String(symbol ?? '').trim().toUpperCase();
+      if (value && !out.includes(value)) out.push(value);
+    }
+    return out;
+  }
+
   /**
-   * Choose the hypothesis this agent will trade this cycle.
-   * Preference chain keeps the population diverse instead of collapsing every agent
-   * onto the single highest-ranked hypothesis:
-   *   1. exact symbol+family match for the agent's inherited genome
-   *   2. same family (genome's strategy family), any symbol
-   *   3. a hypothesis no other agent is already using this cycle
-   *   4. the top-ranked hypothesis
+   * v3.2: compile/reuse one spec per basket symbol (docs/PORTFOLIO-ANALYTICS.md).
+   * A bot only trades hypotheses in its own family whose symbol is in its basket; specs are
+   * cached per symbol in `agent.specIds`, with the primary spec kept in `agent.specId`.
+   * Returns { specs, primary, specIds } or { __noMatch } / { __compileError }.
    */
-  async function ensureSpec(agent, hypotheses, cycleBudgetUsd, usedPairs = new Set()) {
-    const cached = agent.specId ? state.specs.get(agent.specId) : null;
+  async function ensureSpecs(agent, hypotheses, cycleBudgetUsd, usedPairs = new Set()) {
     const genome = genomeForSpec(agent);
-    const specMatchesGenome = (candidate) => Boolean(
-      candidate && (!genome || (candidate.symbol === genome.symbol && candidate.family === genome.family)),
+    const basket = basketSymbols(agent);
+    if (!genome || basket.length === 0) return { __noMatch: true };
+    const ranked = [...(hypotheses ?? [])].sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
+    if (ranked.length === 0) return { __noMatch: true };
+    const existing = isPlainObject(agent.specIds) ? agent.specIds : {};
+    const book = ledger.book?.(agent.id);
+    const positionSymbols = new Set();
+    for (const [symbol, position] of Object.entries(book?.positions ?? {})) {
+      const key = String(symbol ?? '').toUpperCase();
+      if (key) positionSymbols.add(key);
+      const underlying = String(position?.option?.underlying ?? '').toUpperCase();
+      if (underlying) positionSymbols.add(underlying);
+    }
+    const maxSpecAgeMs = Math.min(
+      ((Number(config.data?.maxProofAgeDays) || 7) * 24 * 60 * 60 * 1000) / 2,
+      12 * 60 * 60 * 1000,
     );
-    if (cached) {
-      // A spec is executable only while its proof is fresh. Recompile from this cycle's
-      // hypotheses when the proof has aged past half of maxProofAgeDays, but never
-      // mid-position: exits must use the spec that opened the trade.
-      const proofAgeMs = clock.now() - (Date.parse(cached.createdAt ?? '') || 0);
-      const maxSpecAgeMs = Math.min(
-        ((Number(config.data?.maxProofAgeDays) || 7) * 24 * 60 * 60 * 1000) / 2,
-        12 * 60 * 60 * 1000,
-      );
-      const book = ledger.book?.(agent.id);
-      const hasPosition = Boolean(book && Object.keys(book.positions ?? {}).length > 0);
-      // A cached spec compiled from an unrelated family/symbol is not this bot's strategy: drop it
-      // and recompile from the genome unless a position opened under it still needs managing.
-      if (specMatchesGenome(cached) || hasPosition) {
-        if (!Number.isFinite(proofAgeMs) || proofAgeMs <= maxSpecAgeMs || hasPosition) {
-          return { spec: cached, cached: true };
+    const specIds = {};
+    const specs = [];
+    let firstError = null;
+    for (const symbol of basket) {
+      const cachedId = existing[symbol]
+        ?? (agent.specId && state.specs.get(agent.specId)?.symbol === symbol ? agent.specId : null);
+      const cached = cachedId ? state.specs.get(cachedId) : null;
+      const hasPosition = positionSymbols.has(symbol);
+      if (cached && cached.symbol === symbol && cached.family === genome.family) {
+        const proofAgeMs = clock.now() - (Date.parse(cached.createdAt ?? '') || 0);
+        if (hasPosition || !Number.isFinite(proofAgeMs) || proofAgeMs <= maxSpecAgeMs) {
+          specIds[symbol] = cached.specId;
+          specs.push(cached);
+          continue;
         }
+      } else if (cached && hasPosition) {
+        // Never drop the spec that opened an existing position: exits need its stop/target rules.
+        specIds[symbol] = cached.specId;
+        specs.push(cached);
+        continue;
+      }
+      const hypothesis = ranked.find((entry) => String(entry?.symbol).toUpperCase() === symbol && entry?.family === genome.family);
+      if (!hypothesis) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const compiled = await builder.compile({
+          hypothesis,
+          agentId: agent.id,
+          cycleBudgetUsd,
+          genome,
+        });
+        const spec = compiled?.spec ?? compiled;
+        if (!spec?.specId || spec.family !== genome.family || String(spec.symbol).toUpperCase() !== symbol) continue;
+        // eslint-disable-next-line no-await-in-loop
+        await ensureDir(paths.specsDir);
+        // eslint-disable-next-line no-await-in-loop
+        await writeJsonAtomic(path.join(paths.specsDir, `${spec.specId}.json`), spec);
+        state.specs.set(spec.specId, spec);
+        specIds[symbol] = spec.specId;
+        specs.push(spec);
+        usedPairs.add(`${symbol}:${spec.family}`);
+      } catch (error) {
+        firstError = firstError ?? errorInfo(error);
       }
     }
-    const ranked = [...(hypotheses ?? [])].sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
-    if (ranked.length === 0) return null;
-    const pairKey = (hypothesis) => `${hypothesis.symbol}:${hypothesis.family}`;
-    const exact = ranked.find((h) => h.symbol === genome?.symbol && h.family === genome?.family);
-    // Stay coherent with the agent's inherited strategy: exact genome pair first, then another
-    // symbol of the SAME family. Never compile an unrelated strategy into this bot (the old
-    // "unused pair"/"top ranked" fallbacks caused Momentum F to trade AMD breakout setups).
-    const sameFamilyUnused = ranked.find((h) => h.family === genome?.family && !usedPairs.has(pairKey(h)));
-    const sameFamily = ranked.find((h) => h.family === genome?.family);
-    const match = exact ?? sameFamilyUnused ?? sameFamily ?? null;
-    if (!match) return { __noMatch: true };
-    usedPairs.add(pairKey(match));
-    try {
-      const compiled = await builder.compile({
-        hypothesis: match,
-        agentId: agent.id,
-        cycleBudgetUsd,
-        genome,
-      });
-      const spec = compiled?.spec ?? compiled;
-      if (!spec || !spec.specId) return null;
-      // Builder may still derive from the hypothesis; reject unrelated results rather than
-      // silently trading a different strategy.
-      if (!specMatchesGenome(spec)) return { __noMatch: true };
-      await ensureDir(paths.specsDir);
-      await writeJsonAtomic(path.join(paths.specsDir, `${spec.specId}.json`), spec);
-      state.specs.set(spec.specId, spec);
-      await registry.update(agent.id, { specId: spec.specId });
-      return { spec, cached: false };
-    } catch (error) {
-      return { __compileError: errorInfo(error), hypothesisId: match?.id };
+    if (specs.length === 0) {
+      return firstError ? { __compileError: firstError } : { __noMatch: true };
     }
+    const genomeSpec = specs.find((spec) => String(spec.symbol).toUpperCase() === String(genome.symbol).toUpperCase()) ?? null;
+    // `specId`/status `spec` stay tied to the bot's PRIMARY genome symbol for coherence. If only
+    // basket siblings have proven hypotheses this cycle, they still trade via specIds/specs but the
+    // primary spec view stays empty until its own symbol is proven.
+    const primary = genomeSpec ?? specs[0];
+    await registry.update(agent.id, { specIds, specId: genomeSpec?.specId ?? null });
+    return { specs, primary, specIds, genomeSpec };
   }
 
   /** Charge one cycle of metabolism to one agent, attributed by role. */
@@ -447,6 +509,9 @@ export async function createAutomaton(options = {}) {
         status: 'alive',
         endowmentUsd: config.endowmentUsd,
         genome,
+        // v3.2: each bot manages a basket of symbols; per-symbol compiled specs live in specIds.
+        symbols: Array.isArray(genome.symbols) ? genome.symbols : [genome.symbol],
+        specIds: {},
         mutation: null,
         specId: null,
         // Split the genesis population across the two execution tiers (docs/CONTROL-PANEL.md):
@@ -526,18 +591,26 @@ export async function createAutomaton(options = {}) {
    */
   async function rebalanceStrategyMix() {
     const alive = registry.alive();
-    if (alive.length < 8) return;
+    if (alive.length < 6) return;
+    const targetDayPct = Number(config.strategyMix?.dayPct ?? 0.5);
     const counts = { swing: 0, day: 0 };
     for (const agent of alive) counts[tierForFamily(agent?.genome?.family)] += 1;
-    const swingRatio = counts.swing / alive.length;
-    if (swingRatio >= 0.4 && swingRatio <= 0.6) return;
+    const dayRatio = counts.day / alive.length;
+    // v3.2: migrate once when the live mix is more than 5 percentage points away from target.
+    if (Math.abs(dayRatio - targetDayPct) <= 0.05) return;
     let changed = 0;
     for (let index = 0; index < alive.length; index += 1) {
       const agent = alive[index];
-      const target = targetFamilyForIndex(index, alive.length);
+      const target = targetFamilyForIndex(index, alive.length, targetDayPct);
       if ((agent?.genome?.family ?? null) === target) continue;
-      const genome = { ...(agent.genome ?? {}), family: target };
-      const patch = { genome, tier: tierForFamily(target), specId: null };
+      const tier = tierForFamily(target);
+      const currentPrimary = String(agent?.genome?.symbol ?? '').toUpperCase();
+      const primary = config.symbols.includes(currentPrimary) ? currentPrimary : config.symbols[index % config.symbols.length];
+      // Re-derive the basket size for the agent's NEW tier; otherwise a swing→day migration would
+      // leave a 3-symbol basket on a day bot (and vice versa) when the baskets marker already exists.
+      const symbols = basketForAgent(config, index, tier, primary);
+      const genome = { ...(agent.genome ?? {}), family: target, symbol: primary, symbols };
+      const patch = { genome, symbols, tier, specId: null, specIds: {} };
       try {
         if (agent.name) {
           const taken = usedNames(registry.all().filter((candidate) => candidate.id !== agent.id));
@@ -551,7 +624,40 @@ export async function createAutomaton(options = {}) {
     }
     if (changed > 0) {
       await registry.save();
-      log.info('strategy mix rebalanced', { changed, population: alive.length, before: counts });
+      log.info('strategy mix rebalanced', { changed, population: alive.length, before: counts, targetDayPct });
+    }
+  }
+
+  /**
+   * v3.2 one-time basket migration: give every living bot a multi-symbol basket and clear its old
+   * single-symbol spec (docs/PORTFOLIO-ANALYTICS.md). Marker `portfolio-v32.json` makes it once.
+   */
+  async function assignBasketsV32() {
+    const marker = path.join(paths.stateDir, 'portfolio-v32.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 1) return;
+    const alive = registry.alive();
+    if (!alive.length) return;
+    let changed = 0;
+    for (let index = 0; index < alive.length; index += 1) {
+      const agent = alive[index];
+      const tier = agent.tier === 'day' ? 'day' : tierForFamily(agent?.genome?.family);
+      const currentPrimary = String(agent?.genome?.symbol ?? '').toUpperCase();
+      const primary = config.symbols.includes(currentPrimary) ? currentPrimary : config.symbols[index % config.symbols.length];
+      const symbols = basketForAgent(config, index, tier, primary);
+      const genome = { ...(agent.genome ?? {}), symbol: primary, symbols };
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await registry.update(agent.id, { genome, symbols, specId: null, specIds: {} });
+        changed += 1;
+      } catch {
+        /* immutable/dead record */
+      }
+    }
+    if (changed > 0) {
+      await registry.save();
+      await writeJsonAtomic(marker, { version: 1, at: clock.iso(), changed });
+      log.info('multi-symbol baskets assigned', { changed });
     }
   }
 
@@ -729,6 +835,7 @@ export async function createAutomaton(options = {}) {
     await backfillAgentTiers();
     await rebalanceStrategyMix();
     await introduceAffordableSymbols();
+    await assignBasketsV32();
     await capitalizePopulation(Number(account?.equityUsd) || 0);
     await alignSpecsToGenomes();
     state.initialized = true;
@@ -1036,47 +1143,67 @@ export async function createAutomaton(options = {}) {
         }
         const riskOnly = !due && hasPosition;
 
-        let spec = null;
+        let specs = [];
+        let primary = null;
         let built = null;
         if (due) {
-          built = await ensureSpec(agent, hypotheses, treasuryView.cycleBudgetUsd, usedPairs);
+          built = await ensureSpecs(agent, hypotheses, treasuryView.cycleBudgetUsd, usedPairs);
           if (!built) {
             trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_hypothesis' });
             continue;
           }
           if (built.__noMatch) {
-            // No hypothesis for this bot's own strategy family/symbol this cycle. Wait for a
-            // coherent setup instead of trading a different bot's strategy.
+            // No hypothesis for this bot's basket family/symbols this cycle. Wait for a coherent
+            // setup instead of trading a different bot's strategy.
             trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_matching_hypothesis' });
             continue;
           }
           if (built.__compileError) {
-            trace.builds.push({ agentId: agent.id, specId: null, error: built.__compileError.code, hypothesisId: built.hypothesisId });
+            trace.builds.push({ agentId: agent.id, specId: null, error: built.__compileError.code });
             continue;
           }
-          spec = built.spec;
+          specs = built.specs;
+          primary = built.primary;
         } else {
-          // Risk-only pass: reuse the spec that opened the position (never mid-position rebuild).
-          spec = agent.specId ? state.specs.get(agent.specId) ?? null : null;
-          if (!spec) {
+          // Risk-only pass: reuse every spec that may have opened a position (never rebuild
+          // mid-position). The executor still manages ALL held positions.
+          const ids = new Set(
+            [agent.specId, ...Object.values(isPlainObject(agent.specIds) ? agent.specIds : {})].filter(Boolean),
+          );
+          specs = [...ids].map((id) => state.specs.get(id)).filter(Boolean);
+          primary = specs.find((spec) => spec.specId === agent.specId) ?? specs[0] ?? null;
+          if (!specs.length) {
             trace.executions.push({ agentId: agent.id, tier, skipped: 'no_spec_risk_pass', detail: [{ type: 'cadence_wait' }] });
             continue;
           }
         }
+        if (!primary || specs.length === 0) continue;
 
         trace.builds.push({
           agentId: agent.id,
-          specId: spec.specId,
-          symbol: spec.symbol,
-          family: spec.family,
+          specId: primary.specId,
+          symbol: primary.symbol,
+          family: primary.family,
+          specs: specs.map((spec) => `${spec.symbol}:${spec.specId}`),
+          basket: basketSymbols(agent),
           compiled: built ? !built.cached : false,
           tier,
           riskOnly,
         });
+        const portfolioLimits = {
+          maxOpenPositions: tier === 'day'
+            ? Number(config.portfolio?.maxOpenPositionsDay) || 5
+            : Number(config.portfolio?.maxOpenPositionsSwing) || 3,
+          maxOrdersPerCycle: Number(config.portfolio?.maxOrdersPerCycle) || 2,
+        };
         try {
           const result = await executor.run({
             agent,
-            spec,
+            // Legacy single-spec field retained for compatibility; the portfolio executor uses
+            // `specs` when present and still supports spec-only callers/tests.
+            spec: primary,
+            specs,
+            portfolio: portfolioLimits,
             mandate,
             quotes,
             // One market read per cycle per timeframe lane: the whole population shares it.
@@ -1097,14 +1224,16 @@ export async function createAutomaton(options = {}) {
           if (due) state.lastAnalysisAt.set(agent.id, cadenceNowMs);
           trace.executions.push({
             agentId: agent.id,
-            specId: spec.specId,
+            specId: primary.specId,
+            specs: specs.length,
+            basket: basketSymbols(agent),
             tier,
             riskOnly,
             actions: result?.actions?.length ?? 0,
             orders: result?.orders?.length ?? 0,
             denied: result?.denied?.length ?? 0,
             spentUsd: result?.spentUsd ?? 0,
-            detail: (result?.actions ?? []).slice(0, 4).map((action) => ({
+            detail: (result?.actions ?? []).slice(0, 6).map((action) => ({
               type: action.type,
               symbol: action.symbol,
               reason: action.reason,
@@ -1427,6 +1556,27 @@ export async function createAutomaton(options = {}) {
         cause: agent.cause,
         endowmentUsd: agent.endowmentUsd,
         genome: agent.genome,
+        // v3.2: multi-symbol basket + one compiled spec per basket symbol.
+        symbols: basketSymbols(agent),
+        specs: (() => {
+          const ids = Array.isArray(agent.specIds) ? [] : Object.values(isPlainObject(agent.specIds) ? agent.specIds : {});
+          const specsOut = [];
+          const seen = new Set();
+          for (const candidate of [agent.specId, ...ids]) {
+            if (!candidate || seen.has(candidate)) continue;
+            const compiledSpec = state.specs.get(candidate);
+            if (!compiledSpec) continue;
+            seen.add(candidate);
+            specsOut.push({
+              specId: compiledSpec.specId,
+              symbol: compiledSpec.symbol,
+              family: compiledSpec.family,
+              params: compiledSpec.params ?? {},
+              createdAt: compiledSpec.createdAt ?? null,
+            });
+          }
+          return specsOut;
+        })(),
         mutation: agent.mutation,
         specId: agent.specId,
         spec: spec
@@ -1526,7 +1676,19 @@ export async function createAutomaton(options = {}) {
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };
     });
-    const strategyMixView = computeStrategyMix(agents.map((row) => ({ genome: row.genome, strategy: row.strategy })));
+    const strategyMixView = (() => {
+      const mix = computeStrategyMix(agents.map((row) => ({ genome: row.genome, strategy: row.strategy })));
+      const dayPct = Number(config.strategyMix?.dayPct ?? 0.5);
+      return {
+        ...mix,
+        targetDayPct: dayPct,
+        target: {
+          dayPct,
+          dayCount: Math.round(mix.total * dayPct),
+          swingCount: mix.total - Math.round(mix.total * dayPct),
+        },
+      };
+    })();
     const obituaryStats = journal.stats ? await journal.stats() : null;
     return {
       at: new Date(clock.now()).toISOString(),
@@ -1547,6 +1709,10 @@ export async function createAutomaton(options = {}) {
           },
         },
         agents: botAgents.schedule(),
+        portfolio: {
+          ...(config.portfolio ?? {}),
+          strategyMix: { dayPct: config.strategyMix?.dayPct ?? 0.5 },
+        },
         instruments: (() => {
           const permissions = resolveInstrumentPermissions(config);
           const acct = account ?? {};

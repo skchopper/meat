@@ -205,6 +205,44 @@ export function createReplicator({ treasurer, registry, ledger, journal, config,
       });
     }
     const childGenome = { ...parentGenome, [field]: to };
+    // v3.2: the child inherits the parent's multi-symbol basket; if the single mutation changes
+    // the primary symbol, that symbol becomes the basket's primary while the rest is retained.
+    const parentBasket = Array.isArray(parent.symbols) && parent.symbols.length > 0
+      ? parent.symbols
+      : Array.isArray(parentGenome.symbols) && parentGenome.symbols.length > 0
+        ? parentGenome.symbols
+        : [parentGenome.symbol].filter(Boolean);
+    const mutatedSymbol = String(childGenome.symbol ?? '').toUpperCase();
+    const inheritedBasket = parentBasket.map((symbol) => String(symbol ?? '').toUpperCase()).filter(Boolean);
+    const oldPrimary = String(parentGenome.symbol ?? '').toUpperCase();
+    // The single mutation may change the primary symbol INSIDE the inherited basket: replace the
+    // primary slot (or move an existing basket symbol to the front); never append a new symbol and
+    // grow the basket beyond the parent's size.
+    let childSymbols;
+    if (mutatedSymbol) {
+      const withoutMutated = inheritedBasket.filter((symbol) => symbol !== mutatedSymbol);
+      if (inheritedBasket.includes(mutatedSymbol)) {
+        childSymbols = [mutatedSymbol, ...withoutMutated];
+      } else if (inheritedBasket.length > 0) {
+        childSymbols = [mutatedSymbol, ...inheritedBasket.filter((symbol) => symbol !== oldPrimary)];
+        if (childSymbols.length > inheritedBasket.length) childSymbols = childSymbols.slice(0, inheritedBasket.length);
+      } else {
+        childSymbols = [mutatedSymbol];
+      }
+    } else {
+      childSymbols = inheritedBasket;
+    }
+    // Keep the one-mutation invariant at the genome level: if the mutated field is not the symbol,
+    // reuse the parent's inherited basket array unchanged (same reference, so tests/consumers see a
+    // single genome mutation). Only recompute it when the primary symbol itself mutated, and only
+    // keep a `symbols` field when the parent genome already had one.
+    if (Array.isArray(parentGenome.symbols)) {
+      const basketSame = parentGenome.symbols.length === childSymbols.length
+        && parentGenome.symbols.every((symbol, index) => symbol === childSymbols[index]);
+      if (field === 'symbol' || !basketSame) childGenome.symbols = childSymbols;
+    } else {
+      delete childGenome.symbols;
+    }
     const mutation = { field, from: from === undefined ? null : from, to };
 
     // 5) the child inherits the journal's digest, not the parent's code
@@ -223,6 +261,8 @@ export function createReplicator({ treasurer, registry, ledger, journal, config,
       status: 'alive',
       endowmentUsd: childEndowmentUsd,
       genome: childGenome,
+      symbols: childSymbols.length > 0 ? childSymbols : inheritedBasket,
+      specIds: {},
       mutation,
       specId: null,
       // The child's execution tier follows its strategy family (the one mutation may change the

@@ -1083,6 +1083,67 @@ export function createBroker(config, options = {}, simOptions = {}) {
     },
 
     /**
+     * Deterministic stock snapshots for the analytics market tape (offline twin of
+     * broker-alpaca.getSnapshots). Derived from the simulated quote + the last 24 hourly
+     * bars (one synthetic trading day): open/high/low/volume of that window, previous
+     * close from the bar before it. Same shape as Alpaca, plus `simulated: true`.
+     *
+     * @param {string|string[]} [symbols] omitted => the broker's configured universe
+     * @param {{feed?: string}} [opts]
+     * @returns {Record<string, object>}
+     */
+    getSnapshots(symbols, { feed = 'iex' } = {}) {
+      const requested = (Array.isArray(symbols) ? symbols : typeof symbols === 'string' ? symbols.split(',') : [])
+        .map((item) => String(item ?? '').trim().toUpperCase())
+        .filter(Boolean);
+      const tickers = [...new Set(symbols === undefined ? broker.symbols : requested)];
+      const now = marketNow();
+      const out = {};
+      for (const ticker of tickers) {
+        const state = market.symbolStates.get(ticker);
+        let quote = null;
+        try {
+          quote = state ? currentQuote(ticker) : null;
+        } catch {
+          quote = null;
+        }
+        if (!state || !quote || state.bars.length === 0) {
+          out[ticker] = {
+            symbol: ticker, priceUsd: null, bid: null, ask: null, changeUsd: null, changePct: null,
+            openUsd: null, highUsd: null, lowUsd: null, prevCloseUsd: null, volume: null,
+            ts: null, stale: true, simulated: true, feed,
+          };
+          continue;
+        }
+        const dayBars = state.bars.slice(-24);
+        const prevBar = state.bars.length > dayBars.length
+          ? state.bars[state.bars.length - dayBars.length - 1]
+          : null;
+        const priceUsd = round4(quote.last);
+        const prevCloseUsd = round4(prevBar ? prevBar.c : dayBars[0].o);
+        const changeUsd = round4(priceUsd - prevCloseUsd);
+        out[ticker] = {
+          symbol: ticker,
+          priceUsd,
+          bid: round4(quote.bid),
+          ask: round4(quote.ask),
+          changeUsd,
+          changePct: prevCloseUsd > 0 ? changeUsd / prevCloseUsd : null,
+          openUsd: round4(dayBars[0].o),
+          highUsd: round4(Math.max(...dayBars.map((bar) => bar.h))),
+          lowUsd: round4(Math.min(...dayBars.map((bar) => bar.l))),
+          prevCloseUsd,
+          volume: Math.round(dayBars.reduce((total, bar) => total + (Number(bar.v) || 0), 0)),
+          ts: now,
+          stale: false,
+          simulated: true,
+          feed,
+        };
+      }
+      return out;
+    },
+
+    /**
      * Deterministic synthetic news for the research sidecar (offline twin of
      * broker-alpaca.getNews). Headlines are seeded by market seed + symbol + the
      * simulated hour, so the same seed and simulated time produce identical items.

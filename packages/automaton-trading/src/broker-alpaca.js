@@ -188,6 +188,64 @@ export function sideLabelFor({ assetClass, qtySigned, symbol }) {
   return Number(qtySigned) < 0 ? 'SHORT' : 'LONG';
 }
 
+/** Snapshot prices older than this are flagged `stale` for the market tape. */
+export const SNAPSHOT_STALE_MS = 10 * 60 * 1000;
+
+/**
+ * Map one raw Alpaca stock snapshot to the analytics shape used by the market tape.
+ *
+ * Alpaca fields used: `latestTrade.p` (price), `latestQuote.bp/ap` (NBBO),
+ * `minuteBar`/`dailyBar` for o/h/l/v, `prevDailyBar.c` for the previous close.
+ * Unknown/missing parts become null; the item is never dropped.
+ *
+ * @param {unknown} raw one entry of GET /v2/stocks/snapshots
+ * @param {number} nowMs used for the `stale` flag
+ * @param {string} [symbol]
+ * @returns {{symbol:string, priceUsd:number|null, bid:number|null, ask:number|null,
+ *            changeUsd:number|null, changePct:number|null, openUsd:number|null,
+ *            highUsd:number|null, lowUsd:number|null, prevCloseUsd:number|null,
+ *            volume:number|null, ts:number|null, stale:boolean}}
+ */
+export function mapSnapshot(raw, nowMs = Date.now(), symbol = '') {
+  const snapshot = raw && typeof raw === 'object' ? raw : {};
+  const trade = snapshot.latestTrade && typeof snapshot.latestTrade === 'object' ? snapshot.latestTrade : {};
+  const quote = snapshot.latestQuote && typeof snapshot.latestQuote === 'object' ? snapshot.latestQuote : {};
+  const minute = snapshot.minuteBar && typeof snapshot.minuteBar === 'object' ? snapshot.minuteBar : {};
+  const daily = snapshot.dailyBar && typeof snapshot.dailyBar === 'object' ? snapshot.dailyBar : {};
+  const prevDaily = snapshot.prevDailyBar && typeof snapshot.prevDailyBar === 'object' ? snapshot.prevDailyBar : {};
+  const priceUsd = parseNumber(trade.p, parseNumber(minute.c, parseNumber(daily.c, null)));
+  const bid = parseNumber(quote.bp, null);
+  const ask = parseNumber(quote.ap, null);
+  const prevCloseUsd = parseNumber(prevDaily.c, null);
+  const changeUsd = priceUsd !== null && prevCloseUsd !== null
+    ? Math.round((priceUsd - prevCloseUsd) * 10_000) / 10_000
+    : null;
+  const changePct = changeUsd !== null && prevCloseUsd !== null && prevCloseUsd > 0
+    ? changeUsd / prevCloseUsd
+    : null;
+  const ts = parseTimestamp(trade.t)
+    ?? parseTimestamp(quote.t)
+    ?? parseTimestamp(minute.t)
+    ?? parseTimestamp(daily.t)
+    ?? null;
+  const stale = ts === null || (Number.isFinite(Number(nowMs)) && Number(nowMs) - ts > SNAPSHOT_STALE_MS);
+  return {
+    symbol: String(symbol ?? snapshot.symbol ?? '').trim().toUpperCase(),
+    priceUsd,
+    bid,
+    ask,
+    changeUsd,
+    changePct,
+    openUsd: parseNumber(daily.o, parseNumber(minute.o, null)),
+    highUsd: parseNumber(daily.h, parseNumber(minute.h, null)),
+    lowUsd: parseNumber(daily.l, parseNumber(minute.l, null)),
+    prevCloseUsd,
+    volume: parseNumber(daily.v, parseNumber(minute.v, null)),
+    ts,
+    stale,
+  };
+}
+
 /** Map one raw Alpaca mleg leg to the contract leg shape. */
 export function mapLeg(raw) {
   if (!raw || typeof raw !== 'object') return null;
@@ -403,6 +461,9 @@ export function createBroker(config, options = {}) {
   let credentials = options.credentials ?? null;
   /** Brief per-underlying chain-snapshot cache (one snapshot feed per cycle, not per leg). */
   const optionSnapshotCache = new Map();
+  /** Brief per-symbol-set stock snapshot cache (2 s) so cycles share one market read. */
+  const stockSnapshotCache = new Map();
+  const STOCK_SNAPSHOT_TTL_MS = 2_000;
 
   function creds() {
     if (!credentials) {
@@ -887,6 +948,45 @@ export function createBroker(config, options = {}) {
       }
       items.sort((left, right) => right.createdAt - left.createdAt);
       return items.slice(0, effectiveLimit);
+    },
+
+    /**
+     * Real-time stock snapshots for a symbol set (analytics market tape).
+     *
+     * `GET /v2/stocks/snapshots?symbols=A,B&feed=iex` normalized per symbol:
+     * `{symbol, priceUsd, bid, ask, changeUsd, changePct, openUsd, highUsd, lowUsd,
+     *   prevCloseUsd, volume, ts, stale}`. `changePct` is a fraction (0.0123 = +1.23%).
+     * The result is cached ~2 s per (feed, symbol set); missing vendor fields become null
+     * and a symbol is never dropped from the result.
+     *
+     * @param {string|string[]} symbols
+     * @param {{feed?: string, nowMs?: number}} [opts]
+     * @returns {Promise<Record<string, object>>}
+     */
+    async getSnapshots(symbols, { feed = 'iex', nowMs } = {}) {
+      const list = normalizeSymbols(symbols);
+      if (list.length === 0) return {};
+      const effectiveNow = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+      const cacheKey = `${feed}:${[...list].sort().join(',')}`;
+      const cached = stockSnapshotCache.get(cacheKey);
+      if (cached && effectiveNow - cached.at < STOCK_SNAPSHOT_TTL_MS) {
+        const out = {};
+        for (const symbol of list) out[symbol] = cached.data[symbol] ?? mapSnapshot({}, effectiveNow, symbol);
+        return out;
+      }
+      const raw = await request('/v2/stocks/snapshots', {
+        dataHost: true,
+        query: { symbols: list.join(','), feed },
+      });
+      const rows = raw?.snapshots && typeof raw.snapshots === 'object'
+        ? raw.snapshots
+        : raw && typeof raw === 'object' && !Array.isArray(raw)
+          ? raw
+          : {};
+      const out = {};
+      for (const symbol of list) out[symbol] = mapSnapshot(rows[symbol] ?? {}, effectiveNow, symbol);
+      stockSnapshotCache.set(cacheKey, { at: effectiveNow, data: out });
+      return out;
     },
 
     /**

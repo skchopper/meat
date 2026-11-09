@@ -23,6 +23,7 @@ import {
   inject,
   name,
   CONTROL_PATH,
+  MARKET_PATH,
   createResearchBridge,
   REAPER_HEARTBEAT_FILE,
   REAPER_PID_FILE,
@@ -211,6 +212,7 @@ const nameAt = (index) => `${familyName(familyAt(index))} ${symbolAt(index)}`;
 function baseGenome(index) {
   return {
     symbol: symbolAt(index),
+    symbols: [symbolAt(index), symbolAt(index + 1)],
     family: familyAt(index),
     lookback: 20 + (index % 5) * 10,
     entryZ: 1.2 + (index % 4) * 0.1,
@@ -698,6 +700,51 @@ function lastCycleClosedFixture() {
   };
 }
 
+/** Live market view fixture (engine.marketView) used by the /automaton/market route + mappings. */
+function buildMarketViewPayload(overrides = {}) {
+  const view = {
+    ok: true,
+    at: '2026-01-02T00:00:05.000Z',
+    marketOpen: true,
+    quotes: {
+      AAPL: { symbol: 'AAPL', priceUsd: 195.5, bid: 195.4, ask: 195.6, changeUsd: 2.5, changePct: 1.3, openUsd: 193, highUsd: 196, lowUsd: 192.5, prevCloseUsd: 193, volume: 1234567, ts: '2026-01-02T00:00:04.000Z', stale: false },
+      TSLA: { symbol: 'TSLA', priceUsd: 240.1, bid: 240, ask: 240.2, changeUsd: -3.9, changePct: -1.6, openUsd: 244, highUsd: 244.5, lowUsd: 239.4, prevCloseUsd: 244, volume: 987654, ts: '2026-01-02T00:00:04.000Z', stale: false },
+      SPY: { symbol: 'SPY', priceUsd: 450, bid: 449.98, ask: 450.02, changeUsd: 0, changePct: 0, openUsd: 450, highUsd: 450.2, lowUsd: 449.8, prevCloseUsd: 450, volume: 55555, ts: '2026-01-02T00:00:04.000Z', stale: false },
+      F: { symbol: 'F', priceUsd: 13.05, bid: 13.04, ask: 13.06, changeUsd: 0.05, changePct: 0.5, openUsd: 13, highUsd: 13.1, lowUsd: 12.98, prevCloseUsd: 13, volume: 77777, ts: '2026-01-02T00:00:01.000Z', stale: true },
+    },
+    sparklines: {
+      AAPL: [193, 194, 194.5, 195, 195.5],
+      TSLA: [244, 243, 242, 241, 240.1],
+      SPY: [450, 450, 450, 450, 450],
+      F: [13, 13, 13.02, 13.04, 13.05],
+    },
+    portfolio: {
+      equityUsd: 20500,
+      cashUsd: 15200,
+      buyingPowerUsd: 30500,
+      dayPnlUsd: 500,
+      dayPnlPct: 0.025,
+      grossExposureUsd: 12500,
+      netExposureUsd: 5200,
+      positions: [],
+    },
+    agents: [
+      { id: 'atm-10000000', name: 'Momentum AAPL', tier: 'swing', strategy: 'Momentum swing', basket: ['AAPL', 'MSFT'], equityUsd: 21.5, dayPnlPct: 1.5, positions: [], stance: 'trade' },
+      { id: 'atm-10000005', name: 'MeanRev AMZN', tier: 'swing', strategy: 'Mean-reversion swing', basket: ['AMZN', 'GOOGL'], equityUsd: 19.5, dayPnlPct: -2.5, positions: [], stance: 'cautious' },
+    ],
+    engine: { running: true, marketOpen: true, lastCycle: lastCycleOpenFixture(), research: { enabled: true }, agents: { enabled: true } },
+    equityHistory: [
+      { at: '2026-01-02T00:00:00.000Z', equityUsd: 20000, cashUsd: 15000 },
+      { at: '2026-01-02T00:00:02.000Z', equityUsd: 20100, cashUsd: 15050 },
+      { at: '2026-01-02T00:00:04.000Z', equityUsd: 20500, cashUsd: 15200 },
+    ],
+    // Secret material must never reach the dashboard.
+    apiKeyId: SECRET,
+    secretKey: SECRET_TWO,
+  };
+  return { ...view, ...overrides };
+}
+
 function buildStrategyMixPayload(agents) {
   const mix = {
     swing: { count: 0, families: {} },
@@ -712,6 +759,7 @@ function buildStrategyMixPayload(agents) {
     swing: { key: 'swing', label: 'Swing · mid-long', shortLabel: 'Swing', ...mix.swing },
     day: { key: 'day', label: 'Day · intraday', shortLabel: 'Day', ...mix.day },
     total: mix.swing.count + mix.day.count,
+    targetDayPct: 0.7,
   };
 }
 
@@ -944,6 +992,7 @@ function createFakeEngine(options = {}) {
     emergencyStop: 0,
     updateResearchSettings: 0,
     updateRewardSettings: 0,
+    marketView: 0,
   };
   const engine = {
     running: options.running === true,
@@ -1050,6 +1099,15 @@ function createFakeEngine(options = {}) {
       };
       return { settings: patch, effective };
     },
+    async marketView() {
+      calls.marketView += 1;
+      if (options.marketViewError) {
+        const error = new Error(options.marketViewError);
+        error.code = 'MARKET_FAILED';
+        throw error;
+      }
+      return buildMarketViewPayload(options.marketView ?? {});
+    },
     isRunning() {
       return engine.running;
     },
@@ -1059,6 +1117,7 @@ function createFakeEngine(options = {}) {
     delete engine.updateResearchSettings;
     delete engine.updateRewardSettings;
   }
+  if (options.omitMarketView) delete engine.marketView;
   return { engine, calls };
 }
 
@@ -1202,6 +1261,7 @@ test('plugin module exposes the bundle contract', () => {
   assert.equal(name, 'automaton-trading');
   assert.deepEqual(inject, ['tools']);
   assert.equal(ROUTE_PATH, '/automaton/state');
+  assert.equal(MARKET_PATH, '/automaton/market');
   assert.equal(CONTROL_PATH, '/automaton/control');
   assert.equal(REAPER_PID_FILE, 'reaper.pid');
   assert.equal(REAPER_HEARTBEAT_FILE, 'reaper.heartbeat.json');
@@ -1211,7 +1271,7 @@ test('plugin module exposes the bundle contract', () => {
   assert.equal(TOOL_NAMES.some((toolName) => /reaper/i.test(toolName)), false);
 });
 
-test('apply registers ten tools and both HTTP routes', () => {
+test('apply registers ten tools and the three HTTP routes', () => {
   const fake = createFakeCtx();
   const { engine } = createFakeEngine();
   apply(fake.ctx, baseConfig(engine));
@@ -1219,12 +1279,15 @@ test('apply registers ten tools and both HTTP routes', () => {
   assert.equal(fake.tools.size, 10);
   assert.deepEqual([...fake.tools.keys()].sort(), [...TOOL_NAMES].sort());
 
-  assert.equal(fake.routes.length, 2, 'GET state + POST control');
+  assert.equal(fake.routes.length, 3, 'GET state + GET market + POST control');
   const stateRoute = routeFor(fake.routes, ROUTE_PATH);
+  const marketRoute = routeFor(fake.routes, MARKET_PATH);
   const controlRoute = routeFor(fake.routes, CONTROL_PATH);
   assert.equal(stateRoute.kind, 'exact');
+  assert.equal(marketRoute.kind, 'exact');
   assert.equal(controlRoute.kind, 'exact');
   assert.equal(typeof stateRoute.handler, 'function');
+  assert.equal(typeof marketRoute.handler, 'function');
   assert.equal(typeof controlRoute.handler, 'function');
 
   for (const [toolName, definition] of fake.tools) {
@@ -1367,6 +1430,74 @@ test('state route maps engine failures to a structured 503', async () => {
   assert.equal(typeof json.error.code, 'string');
   assert.match(json.error.message, /broker down/);
   fake.disposeAll();
+});
+
+test('GET /automaton/market returns the redacted live analytics view', async () => {
+  const fake = createFakeCtx();
+  const { engine, calls } = createFakeEngine();
+  apply(fake.ctx, baseConfig(engine));
+  const market = routeFor(fake.routes, MARKET_PATH);
+  assert.equal(market.kind, 'exact');
+
+  const { res, json } = await invokeHandler(market.handler, { method: 'GET' });
+  assert.equal(res.statusCode, 200);
+  assert.equal(json.ok, true);
+  assert.equal(json.route, MARKET_PATH);
+  assert.equal(json.loopbackOnly, true);
+  assert.equal(json.at, '2026-01-02T00:00:05.000Z');
+  assert.equal(json.marketOpen, true);
+  assert.equal(json.quotes.AAPL.priceUsd, 195.5);
+  assert.deepEqual(json.sparklines.TSLA, [244, 243, 242, 241, 240.1]);
+  assert.equal(json.portfolio.equityUsd, 20500);
+  assert.equal(json.agents.length, 2);
+  assert.equal(json.equityHistory.length, 3);
+  assert.equal(json.engine.marketOpen, true);
+  assert.equal(calls.marketView, 1);
+  // Redaction: secret material from the engine view must never reach the browser.
+  const text = JSON.stringify(json);
+  assert.equal(text.includes(SECRET), false, 'market route leaked credential material');
+  assert.equal(text.includes(SECRET_TWO), false, 'market route leaked a secret value');
+  assert.equal(res.headers['cache-control'], 'no-store');
+  fake.disposeAll();
+});
+
+test('market route is loopback-only, GET-only and degrades to a structured 503', async () => {
+  const fake = createFakeCtx();
+  const { engine } = createFakeEngine();
+  apply(fake.ctx, baseConfig(engine));
+  const market = routeFor(fake.routes, MARKET_PATH);
+
+  const remote = await invokeHandler(market.handler, { method: 'GET', remoteAddress: '203.0.113.9' });
+  assert.equal(remote.res.statusCode, 403);
+  assert.equal(remote.json.ok, false);
+  assert.equal(remote.json.error.code, 'FORBIDDEN');
+
+  const post = await invokeHandler(market.handler, { method: 'POST', body: {} });
+  assert.equal(post.res.statusCode, 405);
+  assert.equal(post.json.error.code, 'METHOD_NOT_ALLOWED');
+
+  const throwing = await invokeHandler(market.handler, { method: 'GET' });
+  assert.equal(throwing.res.statusCode, 200, 'the healthy engine still answers after the error cases');
+  fake.disposeAll();
+
+  const oldFake = createFakeCtx();
+  const old = createFakeEngine({ omitMarketView: true });
+  apply(oldFake.ctx, baseConfig(old.engine));
+  const unavailable = await invokeHandler(routeFor(oldFake.routes, MARKET_PATH).handler, { method: 'GET' });
+  assert.equal(unavailable.res.statusCode, 503);
+  assert.equal(unavailable.json.ok, false);
+  assert.equal(unavailable.json.error.code, 'MARKET_UNAVAILABLE');
+  oldFake.disposeAll();
+
+  const failingFake = createFakeCtx();
+  const failing = createFakeEngine({ marketViewError: 'broker feed down' });
+  apply(failingFake.ctx, baseConfig(failing.engine));
+  const failed = await invokeHandler(routeFor(failingFake.routes, MARKET_PATH).handler, { method: 'GET' });
+  assert.equal(failed.res.statusCode, 503);
+  assert.equal(failed.json.ok, false);
+  assert.equal(typeof failed.json.error.message, 'string');
+  assert.equal(JSON.stringify(failed.json).includes(SECRET), false);
+  failingFake.disposeAll();
 });
 
 test('POST /automaton/control maps start and stop to engine.start/stop', async () => {
@@ -1782,13 +1913,13 @@ test('autoStart never starts live and only starts sim/paper once', async () => {
   liveCtx.disposeAll();
 });
 
-test('cleanup disposes tools, both routes, and stops the engine', async () => {
+test('cleanup disposes tools, all three routes, and stops the engine', async () => {
   const fake = createFakeCtx();
   const { engine, calls } = createFakeEngine();
   apply(fake.ctx, baseConfig(engine));
 
   assert.equal(fake.tools.size, 10);
-  assert.equal(fake.routes.length, 2);
+  assert.equal(fake.routes.length, 3);
   assert.equal(fake.effects.length, 3);
 
   await fake.tools.get('automaton_status').execute({}, {});
@@ -1796,7 +1927,7 @@ test('cleanup disposes tools, both routes, and stops the engine', async () => {
 
   fake.disposeAll();
   assert.equal(fake.tools.size, 0, 'all tools must be disposed');
-  assert.equal(fake.routes.length, 0, 'both routes must be disposed');
+  assert.equal(fake.routes.length, 0, 'all routes must be disposed');
   await sleep(25);
   assert.equal(calls.stop, 1, 'plugin teardown must stop the engine loop');
 });
@@ -2286,8 +2417,12 @@ test('pure data mapping: names, genome-vs-spec, holdings, activity and empty sta
     assert.equal(helpers.MAIN_SLOT, 'main');
     assert.equal(helpers.SETTINGS_SLOT, 'settings.plugins.tab');
     assert.equal(helpers.STATE_URL, '/automaton/state');
+    assert.equal(helpers.MARKET_URL, '/automaton/market');
     assert.equal(helpers.CONTROL_URL, '/automaton/control');
-    assert.equal(helpers.POLL_MS, 3000);
+    assert.equal(helpers.STATE_POLL_MS, 5000);
+    assert.equal(helpers.MARKET_POLL_MS, 2000);
+    assert.equal(helpers.POLL_MS, 5000);
+    assert.deepEqual(helpers.DASHBOARD_TABS, ['overview', 'agents', 'markets', 'research', 'rewards', 'settings']);
 
     const rows = helpers.buildAgentRows(status);
     assert.equal(rows.length, POPULATION);
@@ -3318,6 +3453,155 @@ test('pure data mapping: last-cycle diagnostics and restricted broker capability
     assert.equal(bareSummary.brokerCapability.unknown, true);
     assert.equal(bareSummary.instruments.effective.available, false);
     assert.equal(helpers.buildAgentRows(bareStatus).every((row) => row.instrumentBadges.length === 0), true);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const state = buildStatusPayload({ running: true });
+    const view = buildMarketViewPayload();
+
+    // ---- change helpers ----
+    assert.equal(helpers.changeDirection(1.2), 'up');
+    assert.equal(helpers.changeDirection(-0.3), 'down');
+    assert.equal(helpers.changeDirection(0), 'flat');
+    assert.equal(helpers.changeDirection(null), 'flat');
+    assert.equal(helpers.marketChangePctText(0.0125), '+1.25%');
+    assert.equal(helpers.marketChangePctText(-0.6), '-0.60%');
+    assert.equal(helpers.marketChangePctText(0), '0.00%');
+    assert.equal(helpers.marketChangePctText(null), '—');
+
+    // ---- sparkline path ----
+    const spark = helpers.sparklinePath([1, 2, 3]);
+    assert.match(spark, /^M/);
+    assert.match(spark, /L/);
+    assert.equal(helpers.sparklinePath([]), '');
+    assert.equal(helpers.sparklinePath(null), '');
+
+    // ---- market tape: up / down / flat / stale / closed / limit / empty ----
+    const tape = helpers.marketTapeRows(view);
+    assert.equal(tape.length, 4);
+    const aapl = tape.find((row) => row.symbol === 'AAPL');
+    assert.equal(aapl.direction, 'up');
+    assert.equal(aapl.priceUsd, 195.5);
+    assert.equal(aapl.changePctText, '+1.30%');
+    assert.equal(typeof aapl.bidText, 'string');
+    assert.equal(typeof aapl.askText, 'string');
+    assert.ok(aapl.sparklinePath.length > 0);
+    assert.equal(tape.find((row) => row.symbol === 'TSLA').direction, 'down');
+    assert.equal(tape.find((row) => row.symbol === 'SPY').direction, 'flat');
+    assert.equal(tape.find((row) => row.symbol === 'F').stale, true);
+    assert.equal(helpers.marketTapeRows(view, { limit: 2 }).length, 2);
+    const closedTape = helpers.marketTapeRows(buildMarketViewPayload({ marketOpen: false }));
+    assert.equal(closedTape.every((row) => row.closed === true), true);
+    assert.deepEqual(helpers.marketTapeRows(null), []);
+    assert.deepEqual(helpers.marketTapeRows({}), []);
+
+    // ---- equity chart geometry ----
+    const chart = helpers.equityChartPoints(view.equityHistory);
+    assert.equal(chart.hasData, true);
+    assert.equal(chart.points.length, 3);
+    assert.match(chart.path, /^M/);
+    assert.match(chart.path, /L/);
+    assert.match(chart.area, /Z$/);
+    assert.equal(chart.last.equityUsd, 20500);
+    assert.equal(chart.first.equityUsd, 20000);
+    assert.equal(chart.deltaUsd, 500);
+    assert.equal(chart.deltaPct, 2.5);
+    assert.equal(chart.min, 20000);
+    assert.equal(chart.max, 20500);
+    const emptyChart = helpers.equityChartPoints([]);
+    assert.equal(emptyChart.hasData, false);
+    assert.equal(emptyChart.path, '');
+    assert.equal(emptyChart.deltaUsd, null);
+
+    // ---- KPI cards (live + state-only fallback) ----
+    const cards = helpers.kpiCards(state, view);
+    assert.equal(cards.length, 8);
+    assert.deepEqual(cards.map((card) => card.key), ['equity', 'dayPnl', 'cashBp', 'exposure', 'population', 'tradesToday', 'winRate', 'treasury']);
+    const equityCard = cards.find((card) => card.key === 'equity');
+    assert.equal(equityCard.value, '$20,500.00');
+    assert.equal(equityCard.direction, 'up');
+    assert.equal(equityCard.deltaPct, 0.025);
+    assert.equal(cards.find((card) => card.key === 'dayPnl').direction, 'up');
+    const cashCard = cards.find((card) => card.key === 'cashBp');
+    assert.match(cashCard.value, /15,200/);
+    assert.match(cards.find((card) => card.key === 'exposure').value, /12,500/);
+    assert.equal(cards.find((card) => card.key === 'population').value, '24 / 30');
+    assert.equal(cards.find((card) => card.key === 'tradesToday').value, '4');
+    assert.match(cards.find((card) => card.key === 'winRate').value, /%$/);
+    assert.equal(typeof cards.find((card) => card.key === 'treasury').value, 'string');
+    const stateOnlyCards = helpers.kpiCards(state);
+    assert.equal(stateOnlyCards.length, 8);
+    assert.equal(stateOnlyCards.find((card) => card.key === 'equity').value, '$20,000.00');
+    assert.deepEqual(helpers.kpiCards(null), []);
+
+    // ---- 70/30 strategy mix ----
+    const mix = helpers.strategyMixBreakdown(state);
+    assert.equal(mix.available, true);
+    assert.equal(mix.total, 30);
+    assert.equal(mix.targetDayPct, 0.7);
+    assert.equal(mix.day.count, 10);
+    assert.equal(mix.swing.count, 20);
+    assert.equal(mix.bars.length, 2);
+    assert.equal(mix.day.pctText, '+33.3%');
+    assert.equal(mix.day.targetText, '+70.0%');
+
+    // ---- agent table rows merged with live data ----
+    const rows = helpers.agentTableRows(state, view);
+    assert.equal(rows.length, 30);
+    const liveRow = rows.find((row) => row.id === 'atm-10000000');
+    assert.equal(liveRow.live, true);
+    assert.equal(liveRow.liveEquityUsd, 21.5);
+    assert.equal(liveRow.stance, 'trade');
+    assert.equal(liveRow.stanceBadge.labelKey, 'stanceTrade');
+    assert.deepEqual(liveRow.basket, ['AAPL', 'MSFT']);
+    assert.equal(liveRow.basketText, 'AAPL, MSFT');
+    assert.ok(liveRow.sparklinePath.length > 0);
+    const downRow = rows.find((row) => row.id === 'atm-10000005');
+    assert.equal(downRow.liveDayPnlPct, -2.5);
+    assert.equal(downRow.liveDirection, 'down');
+    assert.equal(downRow.stance, 'cautious');
+    const stateOnlyRows = helpers.agentTableRows(state);
+    assert.equal(stateOnlyRows.every((row) => row.live === false), true);
+    assert.deepEqual(helpers.agentTableRows(null), []);
+
+    // ---- live view mapping: live / closed / unavailable / empty ----
+    const live = helpers.liveViewMapping(state, view);
+    assert.equal(live.available, true);
+    assert.equal(live.feedStatus, 'live');
+    assert.equal(live.marketOpen, true);
+    assert.equal(live.tape.length, 4);
+    assert.equal(live.kpis.length, 8);
+    assert.equal(live.equity.hasData, true);
+    assert.equal(live.mix.total, 30);
+    assert.equal(live.agents.length, 30);
+    assert.equal(live.summary.running, true);
+    const closedView = helpers.liveViewMapping(state, buildMarketViewPayload({ marketOpen: false }));
+    assert.equal(closedView.feedStatus, 'closed');
+    assert.equal(closedView.marketOpen, false);
+    const fallbackView = helpers.liveViewMapping(state, null);
+    assert.equal(fallbackView.available, false);
+    assert.equal(fallbackView.feedStatus, 'unavailable');
+    assert.equal(fallbackView.tape.length, 0);
+    assert.equal(fallbackView.kpis.length, 8);
+    assert.equal(fallbackView.equity.hasData, false);
+    assert.equal(fallbackView.agents.length, 30);
+    const emptyView = helpers.liveViewMapping(null, null);
+    assert.equal(emptyView.hasState, false);
+    assert.deepEqual(emptyView.agents, []);
+    assert.deepEqual(emptyView.kpis, []);
+
+    // ---- market session labels ----
+    assert.equal(helpers.marketSession(view).labelKey, 'marketOpen');
+    assert.equal(helpers.marketSession(buildMarketViewPayload({ marketOpen: false })).labelKey, 'marketClosed');
+    const unknownSession = helpers.marketSession({});
+    assert.equal(unknownSession.labelKey, 'marketUnknown');
+    assert.equal(unknownSession.available, false);
   } finally {
     loaded.restore();
   }

@@ -763,3 +763,181 @@ three would have been invisible to the builders' fake-brake harnesses. The remai
 environmental: no live paper option fills, no assignment/early-exercise modelling, and no browser-verified
 panel. **Verified as a paper/sim capability expansion with a hard brake wall; live/realmoney option
 behavior remains unverified.**
+
+---
+
+## 10. v3.2 multi-symbol portfolio bots, 70/30 mix and live analytics — independent verification (2026-11-09)
+
+Task-22. Scope: `test/integration.test.js`, `test/security.test.js`, this document (no `src/**` or other
+test-suite edits). Read `docs/PORTFOLIO-ANALYTICS.md`, the README v3.2 section and `docs/RUNBOOK.md` §8f,
+then the landed code (`orchestrator` genesis/migrations/ensureSpecs/executor wiring/status, `registry`
+basket fields, `executor` portfolio mode, `broker-*` `getSnapshots`, `engine.marketView`, `index.js`
+`/automaton/market`, registry/strategy-types helpers) and probed the real composition with deterministic
+sim worlds before writing tests.
+
+The Lead's v3.2 integration edits were reviewed and are **kept (not weakened)**: mleg orders carry their
+side on the legs rather than a top-level side, OCC option symbols are matched with a 21+ char shape and
+D4 whitelisting uses the OCC UNDERLYING, and the one-mutation audit was extended so that a changed
+`symbol` plus the derived `symbols` reorder counts as ONE logical mutation with a child-basket-size
+assertion. The verifier additionally added an engine-level basket-trade test and a marker-present
+50/50→70/30 mix-change test.
+
+### 10.1 Reproduce
+
+```powershell
+cd D:\CounterStikers\packages\automaton-trading
+node test/mortality.test.js    # 76
+node test/market.test.js       # 50
+node test/research.test.js     # 13
+node test/rankings.test.js     # 16
+node test/control.test.js      # 18
+node test/instruments.test.js  # 7
+node test/plugin.test.js       # 46
+node test/bot-agent.test.js    # 9
+node test/integration.test.js  # 53  (verifier-owned; 34 v3.0/v3.1 + 19 v3.2)
+node test/security.test.js     # 58  (verifier-owned; 53 + 5 v3.2)
+
+cd D:\CounterStikers
+node scripts/verify-fixes.mjs  # 17/17 PASS
+node scripts/research-smoke.mjs # 10/10 PASS
+```
+
+`node --test` still hits the sandbox spawn EPERM; run each file directly. The installed Harness plugin
+process caches the old ESM modules until the app is restarted, so these fresh-process results are the
+authoritative test of the workspace code.
+
+Extra check — migration dry-run on a **copy of the real live paper state** (the live `automaton-data`
+directory was read-only; only `config.json`, `registry.json`, `ledger.json`, `day-stats.json`,
+`deaths.json`, `treasury.json` were copied to an OS temp dir and booted with the v3.2 code in `mode:"sim"`
+against the sim broker, so no Alpaca request and no write to live state): 30 alive agents in a legacy
+50/50 mix (families 8/7/8/7) migrated to **21 day / 9 swing**, basket sizes **{day:{4:21}, swing:{3:9}}**,
+all 30 ids preserved, all legacy `specId`/`specIds` cleared, `portfolio-v32.json`
+`{version:1, changed:30}` written, target `dayPct 0.7`. This is the exact state the operator will get
+after restarting the Host.
+
+### 10.2 Results (fresh runs, every process exit code 0)
+
+| Suite | Tests | Pass | Fail | TODO |
+|---|---:|---:|---:|---:|
+| mortality.test.js | 76 | 76 | 0 | 0 |
+| market.test.js | 50 | 50 | 0 | 0 |
+| research.test.js | 13 | 13 | 0 | 0 |
+| rankings.test.js | 16 | 16 | 0 | 0 |
+| control.test.js | 18 | 18 | 0 | 0 |
+| instruments.test.js | 7 | 7 | 0 | 0 |
+| plugin.test.js | 46 | 46 | 0 | 0 |
+| bot-agent.test.js | 9 | 9 | 0 | 0 |
+| **integration.test.js (verifier)** | **53** | **53** | 0 | 0 |
+| **security.test.js (verifier)** | **58** | **58** | 0 | 0 |
+| **Total** | **346** | **346** | **0** | **0** |
+
+v3.2 verifier integration tests: fresh 70/30 genesis (21 day / 9 swing, families 5/4/11/10, 4/3-symbol
+baskets, unique primary strategy pairs, unique baskets, `portfolio-v32.json` marker, status
+`engine.portfolio` and `strategyMix.target {dayPct:.7,dayCount:21,swingCount:9}`, $50 ledger grants);
+pre-v3.2 50/50 population migration (ids/endowment/cash/equity preserved per agent, families/tiers
+rebalanced to 70/30, baskets re-derived to 4/3, legacy `specId`/`specIds` cleared, marker written,
+second boot idempotent); 50/50→70/30 mix change on an already-migrated v3.2 state (marker present)
+re-derives baskets without rewriting the marker; replication basket inheritance across 13 RNG seeds
+(child keeps parent basket size, `symbol` mutation replaces the primary slot / moves an inherited symbol
+to the front, only one MUTABLE field changes and only `symbols` may co-vary, tier follows the mutated
+family, child endowment from parent cash); multi-symbol executor entries across basket symbols with
+one order per symbol, shared per-cycle cap, per-symbol stop exits with no cross-symbol corruption, tier
+`maxOpenPositions` cap, exit/entry shared order budget, kill-switch brakes-first denial of every basket
+order and recovery after removal, legacy single-`spec` mode unchanged (one entry symbol, one exit per
+run, all held positions managed over runs), options still opening through the real brake wall in
+basket mode; end-to-end engine trading only basket symbols (7 fills across 3 basket symbols in 15 sim
+cycles, zero out-of-basket fill/action symbols, every held position's underlying inside its bot basket);
+status coherence (`engine.portfolio`, `strategyMix.target`, per-agent `symbols`/`tier`/`specs`/`specIds`/
+primary `spec`, build traces carrying basket+spec lists); restricted paper account effective-capability
+gating (permissions remain, `effective.shortStock/margin/creditOptions` false, credit structures
+removed) while long calls remain; `engine.marketView` full shape (14 quotes, 14 sparklines, portfolio,
+agents with baskets, equity history, engine block), 2 s cache, no credential-shaped text, no trading,
+last-good-view+error fallback on broker clock/snapshot/bars failures, `{ok:false,error}` instead of a
+throw when the broker cannot be constructed, and stopped/never-started engines still serving status and
+market views; halted recovery (broker_unavailable halt visible in trace/status and cleared by the next
+successful tick, no auto-reward) and CRITICAL treasury not permanently halting trading (budget 0.01 ->
+funding -> STABLE 0.08, no deaths).
+
+v3.2 verifier security tests: `/automaton/market` route registration beside `/automaton/state` and
+`/automaton/control`; loopback 200 with `route`/`loopbackOnly`/`mode` fields and analytics payload;
+secret-named fields injected into the view are redacted to `***` and never appear raw in the body;
+remote and address-less requests get 403 (`FORBIDDEN`, fail-closed); POST gets 405
+(`METHOD_NOT_ALLOWED`); HEAD 200 bodyless; structured 503 for an engine without `marketView`,
+`marketView()` returning undefined, returning `ok:false`, or throwing (the 503 body scrubs
+credential-shaped text); registry basket/specIds sanitization (uppercase, dedupe, ticker pattern,
+8-symbol cap, legacy `genome.symbols` fallback, sanitized values persisted through reload); no new
+agent tools (still exactly 10, no market/portfolio/basket/snapshot tool) and no new broker surface
+(`getSnapshots` is a read; no transfer/withdraw/ACH/account-config methods on either broker).
+
+### 10.3 Defects found by this verification (all fixed and regression-tested)
+
+| # | Sev | Defect (pre-fix) | Fix location | Regression evidence |
+|---|-----|------------------|--------------|---------------------|
+| D-V32-1 | MEDIUM | The replicator's `symbol` mutation APPENDED the new symbol to the inherited basket, growing a 4-symbol day basket to 5 (and a 3-symbol swing basket to 4); the child no longer matched `portfolio.basketSize*`, and the genome diff showed `symbol`+`symbols` for one logical mutation. | `src/replicator.js` basket assembly (primary slot replaced / inherited symbol moved to the front; size preserved) | integration *replicator: child inherits the parent basket…*; seeds 0-12 including the `symbol` mutation keep size and one logical mutation |
+| D-V32-2 | MEDIUM | `rebalanceStrategyMix()` reassigned families/tiers but left `genome.symbols`/`agent.symbols` alone, and `assignBasketsV32()` is one-time (`portfolio-v32.json`); a later 50/50→70/30 mix change left 6 of 21 day bots with 3-symbol swing baskets. | `src/orchestrator.js:592-629` (re-derives `basketForAgent(config,index,newTier,primary)` and updates `symbols`/`genome.symbols` together) | integration *pre-v3.2 50/50 migration…* and *a 50/50 -> 70/30 mix change on an EXISTING v3.2 state…* (day sizes {4:21}, swing {3:9}, marker unchanged) |
+| D-V32-3 | LOW | Genesis baskets were not unique: `start = index*3 % symbols.length` plus `primary = index % symbols.length` gave two same-tier bots whose index differed by the universe size the identical basket (26 unique/30 in a 30-bot 70/30 genesis), contrary to "every bot gets its own combination". | `src/orchestrator.js` basket rotation (stride 5 + per-lap offset) | integration *genesis gives every bot its own basket combination* (30 unique) |
+| D-V32-4 | LOW/MEDIUM | `engine.marketView()` threw (`CONFIG_INVALID: missing Alpaca credentials`) when `makeBroker()` failed in paper/live without credentials — its construction sat outside the defensive try/catch, violating the "on broker failure return last good view + error (never throw 500)" contract (the Host route caught it, but direct callers did not). | `src/engine.js` marketView (broker construction + load/status wrapped; returns last good view + error or `{ok:false,error}`) | integration *marketView returns an error object instead of throwing when the broker cannot be constructed*; broker-error fallback test |
+| D-V32-5 | MEDIUM (pre-existing v3.0) | With `instruments.enabled=false`, `resolveInstrumentPermissions` returned `longStock:false`, so the executor's permission intersection denied EVERY stock entry (`instrument_not_permitted`) — the documented RUNBOOK §8d "v2 long-stock-only behaviour" was actually "no trading at all". | `src/instruments.js` resolveInstrumentPermissions (`longStock: true`; `enabled` gates only short/options/margin) | the v3.0/v3.1 integration option/gating tests plus this run's full suite; direct repro from the interim report now returns ALLOW |
+| D-V32-6 | LOW (docs) | README.md pointed operators to `docs/RUNBOOK.md` §8f for v3.2, but RUNBOOK had no §8f and no v3.2 content (headings stopped at §8e/§10). | `docs/RUNBOOK.md` §8f added (multi-symbol/70-30/live feed/halt recovery) | route/ops docs reviewed; README reference resolves |
+
+Repro used before the fixes: fresh 30-bot genesis (4 duplicate baskets); boot 50/50 then 70/30 on the
+same state dir (basket sizes `{day:{3:6,4:15}}`); `createReplicator` with `mulberry32(7)` from a
+4-symbol parent (child had 5 symbols); `createEngine({mode:'paper', no keys}).marketView()` rejected;
+`instruments.enabled=false` + bullish bars executor run (`instrument_not_permitted`, 0 orders).
+
+### 10.4 Remaining gaps (explicit — NOT verified)
+
+1. **No live paper network activity.** Nothing in this round hit Alpaca: the market analytics endpoint
+   is tested through the deterministic sim broker plus the documented `brokerFactory` test seam, and the
+   Host route through a fake Cordis context. Real `GET /v2/stocks/snapshots` mapping is covered only by
+   the stubbed-fetch market suite, not by a live paper request; the 2 s/15 s caches and the row shape are
+   verified, the vendor payload is not.
+2. **Browser/visual verification of the analytics dashboard was not performed.** The verifier verified
+   the `/automaton/market` JSON, redaction and status semantics; the Google-Analytics-style panel
+   (KPI cards, equity area chart, market tape flashes/sparklines, tabs, polling fallback) is covered by
+   the plugin suite's pure-helper tests, not by a browser/screenshot. The installed Host also needs a
+   restart before the new client bundle is served.
+3. **No long-run population behaviour.** The engine-level basket trade test runs 15 sim cycles; no
+   multi-day 70/30 survival/selection study, no long-horizon mix drift or basket-overlap effect on
+   replication was measured.
+4. **Assignment / early exercise / expiry settlement remain unmodelled** (carried over from v3.0): the
+   covered-call/spread/DTE paths are close-order based, with no assignment simulation, pin risk,
+   dividends, borrow fees or option commissions.
+5. **Margin call / maintenance-margin waterfall and short-locate/HTB behaviour are not simulated**; the
+   effective-capability gating test only proves the UI/status intersection with the account fields.
+6. **Halted/degraded observability:** a `broker_unavailable` halt is visible as
+   `halted`/`haltReasons` and clears on the next successful tick, but `state.engine.lastError` stays
+   `null` during the outage (treasury degraded-tick errors are not copied into the engine error field).
+   The Lead accepted this as a minor observability gap for a later pass.
+7. **Docs/code detail mismatches (no behavioural effect):** `PORTFOLIO-ANALYTICS.md` §2 says
+   `assignBasketsV32()` adds a registry note `basket-v32`; the code updates the basket/genome/spec
+   fields but adds no such note. `README.md`'s "Status (this build)" count (322) predates the +19/+5
+   verifier tests (now 346). Replication family mutations keep the inherited basket size by design, so a
+   swing→day family mutation can leave a day bot with a 3-symbol basket until the next mix/basket
+   migration — accepted inheritance semantics, not covered by a behavioural guard.
+8. **Real external Reaper + live Host route:** the Reaper multi-instrument tests carry over from §9 and
+   use the sim broker/fresh state instances; the live Host route was verified only as a handler with a
+   fake Cordis ctx, not against the running `dsh web` server.
+9. **The running Host process is still pre-v3.2:** the live `automaton-data` at verification time held 30
+   alive agents in the old 50/50 mix (families 8/7/8/7), no `symbols`/baskets on any agent and no
+   `portfolio-v32.json` marker; only a restart loads the new modules and runs the migration. The
+   dry-run above proves a copy of that state migrates correctly, but the live process itself (and its
+   analytics panel/market feed) has not yet executed the v3.2 code.
+
+### 10.5 Verdict (v3.2)
+
+The multi-symbol/70-30 release is real, not a presentation layer over the old single-symbol engine:
+bots are seeded and migrated into 4/3-symbol baskets with unique primary strategies, the 70/30 day/swing
+mix is generated and repaired on existing state (including a later mix change), the per-symbol specs are
+compiled/persisted/plumbed through the executor, one bot demonstrably trades several basket symbols with
+per-symbol exits and tier/order caps behind the real 18-brake wall, replication preserves the basket with
+exactly one logical mutation, the status payload exposes baskets/specs/portfolio/mix targets, and
+`engine.marketView` + the loopback `/automaton/market` route deliver a cached, secret-free analytics view
+that degrades to last-known data on broker errors instead of throwing. Five behavioural defects found in
+this round (basket-growing symbol mutation, stale basket sizes after a mix change, duplicate genesis
+baskets, marketView throwing on broker-construction failure, and the pre-existing "instruments disabled
+= no long stock" bug) were fixed and re-verified; a sixth (missing RUNBOOK §8f) is a docs fix. The
+remaining risk is environmental/visual: no live paper market-data or option fills, no browser-rendered
+dashboard verification, no long-run population study, and no assignment/margin-call modelling.
+**Verified as a paper/sim multi-symbol capability with a real 70/30 mix and a read-only analytics feed;
+live vendor behavior and the visual dashboard remain unverified.**

@@ -111,10 +111,13 @@ export function estimatedTradingIntervalSec({ category, reviewSec, timeframe } =
  * Blocks are sized so every (symbol, family) pair stays unique for populations up to
  * symbols × 4 families (e.g. 30 bots over 10 symbols → 8/7/8/7).
  */
-export function targetFamilyForIndex(index, count = 30) {
+export function targetFamilyForIndex(index, count = 30, dayPct = 0.5) {
   const i = Math.max(0, Math.trunc(Number(index) || 0));
   const total = Math.max(1, Math.trunc(Number(count) || 30));
-  const swingCount = Math.ceil(total / 2);
+  const targetDayPct = Math.min(0.9, Math.max(0.1, Number(dayPct) || 0.5));
+  // Swing gets the ceil share so the historical 50/50 behaviour for odd populations is unchanged;
+  // at 70% day this yields 9 swing / 21 day for a 30-bot population.
+  const swingCount = Math.ceil(Number((total * (1 - targetDayPct)).toFixed(6)));
   const dayCount = total - swingCount;
   const momentumCount = Math.ceil(swingCount / 2);
   const breakoutCount = Math.ceil(dayCount / 2);
