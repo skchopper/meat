@@ -124,5 +124,24 @@
     "maxOpenPositionsDay": 5,
     "maxOpenPositionsSwing": 3,
     "maxOrdersPerCycle": 2
+  },
+  "rewards": {
+    "enabled": true,
+    "period": "weekly",
+    "basis": "trading-performance",
+    "rankShares": [
+      0.5,
+      0.3,
+      0.2
+    ],
+    "rewardBudgetPctOfPool": 0.1,
+    "maxPerPeriodUsd": null,
+    "maxRewardPerAgentPctOfCapital": 0.5,
+    "minTradingProfitUsd": 0.05,
+    "minTrades": 3,
+    "maxDrawdownPct": 0.2
+  },
+  "account": {
+    "allocationCapPct": 0.9
   }
 }

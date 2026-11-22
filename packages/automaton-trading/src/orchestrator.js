@@ -314,6 +314,21 @@ export async function createAutomaton(options = {}) {
     } else {
       state.dayStats = { dayKey: today, agents: {} };
     }
+    // v3.3: daily risk P&L is TRADING P&L (reward top-ups are capital, not daily profit). Legacy
+    // day-stat entries have no trading baseline yet, so anchor them at the current trading P&L;
+    // this intentionally never counts contributed/reward capital as a gain.
+    for (const agent of registry.all?.() ?? []) {
+      const entry = state.dayStats.agents[agent.id];
+      if (!entry || Number.isFinite(Number(entry.startTradingPlUsd))) continue;
+      let tradingPlUsd = 0;
+      try {
+        const book = ledger.snapshot(agent.id);
+        tradingPlUsd = Number(book?.tradingPlUsd) || 0;
+      } catch {
+        tradingPlUsd = 0;
+      }
+      entry.startTradingPlUsd = round2(tradingPlUsd);
+    }
     return state.dayStats;
   }
 
@@ -322,17 +337,30 @@ export async function createAutomaton(options = {}) {
   }
 
   function dayStatsFor(agentId) {
-    const entry = state.dayStats.agents[agentId] ?? { ordersCount: 0, startEquityUsd: null };
+    const entry = state.dayStats.agents[agentId] ?? { ordersCount: 0, startEquityUsd: null, startTradingPlUsd: null };
     const view = (state.lastTreasury?.agentViews ?? []).find((item) => item.agentId === agentId);
-    const startEquityUsd = entry.startEquityUsd ?? view?.equityUsd ?? null;
-    const pnlUsd =
-      Number.isFinite(Number(view?.equityUsd)) && Number.isFinite(Number(startEquityUsd))
-        ? Number(view.equityUsd) - Number(startEquityUsd)
+    let currentTradingPlUsd = null;
+    try {
+      const book = ledger.snapshot(agentId);
+      currentTradingPlUsd = Number(book?.tradingPlUsd);
+    } catch {
+      currentTradingPlUsd = null;
+    }
+    if (!Number.isFinite(currentTradingPlUsd) && view) {
+      currentTradingPlUsd = Number(view.equityUsd) - Number(view.capitalContributionsUsd ?? 0);
+    }
+    const startTradingPlUsd = Number.isFinite(Number(entry.startTradingPlUsd))
+      ? Number(entry.startTradingPlUsd)
+      : Number.isFinite(currentTradingPlUsd)
+        ? currentTradingPlUsd
         : 0;
+    const pnlUsd = Number.isFinite(currentTradingPlUsd) ? currentTradingPlUsd - startTradingPlUsd : 0;
+    const startEquityUsd = entry.startEquityUsd ?? view?.equityUsd ?? null;
     return {
       dayKey: state.dayStats.dayKey,
       ordersCount: entry.ordersCount ?? 0,
       startEquityUsd,
+      startTradingPlUsd,
       pnlUsd: round2(pnlUsd),
     };
   }
@@ -524,7 +552,7 @@ export async function createAutomaton(options = {}) {
       });
       await ledger.ensureAgent(agent.id, { endowmentUsd: config.endowmentUsd, at: clock.now() });
       await treasurer.grantInitial(agent.id, config.endowmentUsd);
-      state.dayStats.agents[agent.id] = { ordersCount: 0, startEquityUsd: config.endowmentUsd };
+      state.dayStats.agents[agent.id] = { ordersCount: 0, startEquityUsd: config.endowmentUsd, startTradingPlUsd: 0 };
     }
     await registry.save();
     await ledger.save();
@@ -814,11 +842,15 @@ export async function createAutomaton(options = {}) {
     await ensureDir(paths.specsDir);
     await registry.load();
     await ledger.load();
+    // v3.3: rewards history must be loaded before the fair-capital migration, and the migration must
+    // run before day-stats are anchored so daily-loss baselines use trading P&L (not the legacy
+    // endowment-based fallback). New genesis records are created with capitalVersion=2 later.
+    await rewards.load();
+    await migrateCapitalBasisV33();
     await loadDayStats(clock.now());
     await researcher.init();
     await botAgents.init();
     await rankings.load();
-    await rewards.load();
     // Reload compiled specs from disk so a restart does not silently drop strategies.
     try {
       const specFiles = (await fsp.readdir(paths.specsDir)).filter((file) => file.endsWith('.json'));
@@ -1025,17 +1057,24 @@ export async function createAutomaton(options = {}) {
         const eq = ledger.equity(agent.id, prices);
         const stored = state.dayStats.agents[agent.id] ?? { ordersCount: 0, startEquityUsd: null };
         if (stored.startEquityUsd == null) stored.startEquityUsd = round2(eq.equityUsd);
+        const tradingPlUsd = Number.isFinite(Number(eq.tradingPnlUsd))
+          ? round2(eq.tradingPnlUsd)
+          : round2(eq.equityUsd - Number(eq.capitalContributionsUsd ?? 0));
+        if (!Number.isFinite(Number(stored.startTradingPlUsd))) stored.startTradingPlUsd = tradingPlUsd;
         state.dayStats.agents[agent.id] = stored;
         dayStats[agent.id] = {
           dayKey: state.dayStats.dayKey,
           ordersCount: stored.ordersCount ?? 0,
           startEquityUsd: round2(stored.startEquityUsd),
-          // The daily-loss death rule needs real P&L, not a hardcoded zero.
-          pnlUsd: round2(eq.equityUsd - stored.startEquityUsd),
+          startTradingPlUsd: round2(stored.startTradingPlUsd),
+          // v3.3: daily-loss is measured on TRADING P&L only. Reward capital/top-ups raise equity and
+          // contributed capital equally and must never look like a daily gain or a daily loss.
+          pnlUsd: round2(tradingPlUsd - round2(stored.startTradingPlUsd)),
         };
         // Persist the P&L too: the external Reaper re-derives daily_loss_limit from this
         // file, so a fatal verdict must be executable outside the engine.
         stored.pnlUsd = dayStats[agent.id].pnlUsd;
+        stored.startTradingPlUsd = dayStats[agent.id].startTradingPlUsd;
         stored.dayKey = state.dayStats.dayKey;
       }
       const treasuryView = await treasurer.tick({ prices, dayStats });
@@ -1239,9 +1278,26 @@ export async function createAutomaton(options = {}) {
               reason: action.reason,
             })),
           });
-          const statsEntry = state.dayStats.agents[agent.id] ?? { ordersCount: 0, startEquityUsd: view.equityUsd };
+          const statsEntry = state.dayStats.agents[agent.id] ?? {
+            ordersCount: 0,
+            startEquityUsd: view.equityUsd,
+            startTradingPlUsd: (() => {
+              try {
+                return round2(Number(ledger.snapshot(agent.id)?.tradingPlUsd) || 0);
+              } catch {
+                return 0;
+              }
+            })(),
+          };
           statsEntry.ordersCount = (statsEntry.ordersCount ?? 0) + (result?.orders?.length ?? 0);
           statsEntry.startEquityUsd = statsEntry.startEquityUsd ?? round2(view.equityUsd);
+          if (!Number.isFinite(Number(statsEntry.startTradingPlUsd))) {
+            try {
+              statsEntry.startTradingPlUsd = round2(Number(ledger.snapshot(agent.id)?.tradingPlUsd) || 0);
+            } catch {
+              statsEntry.startTradingPlUsd = 0;
+            }
+          }
           state.dayStats.agents[agent.id] = statsEntry;
           if (result?.denied?.length) {
             for (const denial of result.denied.slice(0, 5)) {
@@ -1270,13 +1326,30 @@ export async function createAutomaton(options = {}) {
       try {
         const nowMs = clock.now();
         const equityByAgent = {};
+        const riskByAgent = {};
         for (const agent of registry.all()) {
           const view = agentViews.get(agent.id);
           const snapshot = ledger.snapshot ? ledger.snapshot(agent.id) : null;
+          const capitalUsd = Math.max(0, Number(snapshot?.capitalContributionsUsd) || 0);
+          const equityUsd = Number(view?.equityUsd) || 0;
           equityByAgent[agent.id] = {
             name: agent.name ?? agent.id,
-            equityUsd: Number(view?.equityUsd) || 0,
+            equityUsd,
             trades: Number(snapshot?.trades) || 0,
+            // v3.3 fair period P&L: reward capital is a contribution, not profit.
+            tradingPlUsd: Number.isFinite(Number(snapshot?.tradingPlUsd))
+              ? round2(snapshot.tradingPlUsd)
+              : round2(equityUsd - capitalUsd),
+            capitalUsd: round2(capitalUsd),
+          };
+          riskByAgent[agent.id] = {
+            // Fair risk gate: also include the trading loss relative to CONTRIBUTED capital, so a
+            // rewarded bot cannot hide a trading drawdown behind reward-inflated equity.
+            drawdownPct: Math.max(
+              Number.isFinite(Number(view?.drawdownPct)) ? Number(view.drawdownPct) : 0,
+              capitalUsd > 0 ? Math.max(0, (capitalUsd - equityUsd) / capitalUsd) : 0,
+            ),
+            tradingPnlUsd: equityByAgent[agent.id].tradingPlUsd,
           };
         }
         // Payout for a completed period must be ranked BEFORE this tick records the new
@@ -1304,6 +1377,8 @@ export async function createAutomaton(options = {}) {
             accountCashUsd: Number(account.cashUsd ?? pool.poolUsd ?? 0),
             poolUsd: Number(pool.poolUsd || 0),
             allocationCapRemainingUsd,
+            // v3.3: only period TRADING performance can win; drawdown gate from the risk views.
+            riskByAgent,
             ledger,
             nowMs,
           });
@@ -1312,6 +1387,8 @@ export async function createAutomaton(options = {}) {
           trace.rewards = {
             period: due.period,
             periodKey: due.periodKey,
+            basis: payout?.basis ?? operatorRewardsConfig.basis ?? 'trading-performance',
+            budgetUsd: payout?.budgetUsd ?? 0,
             winners: payout?.winners ?? [],
             skipped: payout?.skipped ?? false,
           };
@@ -1426,6 +1503,135 @@ export async function createAutomaton(options = {}) {
   }
 
   // -------------------------------------------------------------------------
+  // v3.3 fair capital accounting + performance rewards
+  // -------------------------------------------------------------------------
+
+  /** Lifetime reward capital by agent, from the rewards state (lifetime map, else history sum). */
+  function lifetimeRewardsMap() {
+    const out = {};
+    try {
+      const state = rewards.getState?.() ?? {};
+      if (state.lifetime && typeof state.lifetime === 'object') {
+        for (const [agentId, amount] of Object.entries(state.lifetime)) {
+          const value = Number(amount);
+          if (agentId && Number.isFinite(value) && value > 0) out[agentId] = round2(value);
+        }
+        if (Object.keys(out).length > 0) return out;
+      }
+      for (const entry of Array.isArray(state.history) ? state.history : []) {
+        for (const winner of Array.isArray(entry?.winners) ? entry.winners : []) {
+          const value = Number(winner?.amountUsd);
+          if (!winner?.agentId || !Number.isFinite(value) || value <= 0) continue;
+          out[winner.agentId] = round2((out[winner.agentId] ?? 0) + value);
+        }
+      }
+    } catch {
+      /* rewards state unavailable: no lifetime map */
+    }
+    return out;
+  }
+
+  /** Per-agent lifetime reward capital (ledger is authoritative after migration). */
+  function lifetimeRewardsFor(agentId, book = null) {
+    try {
+      if (typeof rewards.lifetimeForAgent === 'function') {
+        const value = Number(rewards.lifetimeForAgent(agentId));
+        if (Number.isFinite(value) && value >= 0) return round2(value);
+      }
+    } catch {
+      /* fall back to ledger/state */
+    }
+    const ledgerValue = Number(book?.rewardCapitalUsd);
+    if (Number.isFinite(ledgerValue) && ledgerValue >= 0) return round2(ledgerValue);
+    return round2(lifetimeRewardsMap()[agentId] ?? 0);
+  }
+
+  /** Reward history rows for one agent from the persisted rewards state. */
+  function rewardHistoryFor(agentId) {
+    try {
+      if (typeof rewards.historyForAgent === 'function') {
+        const rows = rewards.historyForAgent(agentId);
+        if (Array.isArray(rows)) return rows;
+      }
+    } catch {
+      /* fall back to raw state */
+    }
+    const rows = [];
+    try {
+      const state = rewards.getState?.() ?? {};
+      for (const entry of Array.isArray(state.history) ? state.history : []) {
+        for (const winner of Array.isArray(entry?.winners) ? entry.winners : []) {
+          if (winner?.agentId !== agentId) continue;
+          rows.push({
+            period: entry.period ?? null,
+            periodKey: entry.periodKey ?? null,
+            at: entry.at ?? null,
+            rank: winner.rank ?? null,
+            amountUsd: round2(winner.amountUsd ?? 0),
+            share: winner.share ?? winner.percent ?? null,
+            periodTradingPnlUsd: winner.periodTradingPnlUsd ?? null,
+            periodTradingPnlPct: winner.periodTradingPnlPct ?? null,
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return rows;
+  }
+
+  /**
+   * One-time v3.3 migration (docs/FAIR-PNL-REWARDS.md §7): give every legacy ledger record a fair
+   * capital basis = registry endowment + lifetime reward payouts. Reward capital is classified as
+   * capital, never profit. Idempotent via `capitalVersion` and the capital-v33 marker.
+   */
+  async function migrateCapitalBasisV33() {
+    const marker = path.join(paths.stateDir, 'capital-v33.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 2) return;
+    if (typeof ledger.setCapitalBasis !== 'function' || typeof ledger.hasCapitalAccounting !== 'function') {
+      log.warn('capital basis migration skipped: ledger capital APIs unavailable');
+      return;
+    }
+    const lifetime = lifetimeRewardsMap();
+    let migrated = 0;
+    let lifetimeTotal = 0;
+    for (const agent of registry.all()) {
+      if (ledger.hasCapitalAccounting(agent.id)) continue;
+      let baseCapitalUsd = Math.max(0, Number(agent.endowmentUsd) || 0);
+      if (!(baseCapitalUsd > 0)) {
+        try {
+          baseCapitalUsd = Math.max(0, Number(ledger.snapshot(agent.id)?.endowmentUsd) || 0);
+        } catch {
+          baseCapitalUsd = 0;
+        }
+      }
+      const rewardCapitalUsd = Math.max(0, Number(lifetime[agent.id]) || 0);
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await ledger.setCapitalBasis(agent.id, {
+          baseCapitalUsd,
+          rewardCapitalUsd,
+          reason: 'v3.3 fair capital basis migration',
+          at: clock.now(),
+        });
+        migrated += 1;
+        lifetimeTotal += rewardCapitalUsd;
+      } catch (error) {
+        log.warn('capital basis migration failed', { agentId: agent.id, error: String(error?.message ?? error) });
+      }
+    }
+    if (migrated > 0) await ledger.save();
+    await writeJsonAtomic(marker, {
+      version: 2,
+      at: new Date(clock.now()).toISOString(),
+      migrated,
+      lifetimeRewardsUsd: round2(lifetimeTotal),
+    });
+    log.info('fair capital basis migrated', { agents: migrated, lifetimeRewardsUsd: round2(lifetimeTotal) });
+  }
+
+  // -------------------------------------------------------------------------
   // snapshot for UI / tools
   // -------------------------------------------------------------------------
 
@@ -1448,10 +1654,18 @@ export async function createAutomaton(options = {}) {
       } catch {
         bookSnapshot = null;
       }
+      const capitalUsd = Math.max(0, Number(bookSnapshot?.capitalContributionsUsd) || 0);
+      const equityUsd = Number(view?.equityUsd) || 0;
+      const tradingPlUsd = Number.isFinite(Number(bookSnapshot?.tradingPlUsd))
+        ? Number(bookSnapshot.tradingPlUsd)
+        : round2(equityUsd - capitalUsd);
       equityByAgent[agent.id] = {
         name: agent.name ?? agent.id,
-        equityUsd: Number(view?.equityUsd) || 0,
+        equityUsd,
         trades: Number(bookSnapshot?.trades) || 0,
+        // v3.3 fair rankings: trading P&L excludes contributed/reward capital.
+        tradingPlUsd: round2(tradingPlUsd),
+        capitalUsd: round2(capitalUsd),
       };
     }
     const asOfMs = clock.now();
@@ -1476,15 +1690,45 @@ export async function createAutomaton(options = {}) {
       rewardsStatus = null;
     }
     const rewardsView = rewardsStatus
-      ? {
-          ...rewardsStatus,
-          basis: operatorRewardsConfig.basis ?? 'account-cash',
-          accountCashUsd: account?.cashUsd ?? null,
-          poolUsd: round2(ledgerPool.poolUsd ?? 0),
-          allocatedUsd: round2(ledgerPool.allocatedUsd ?? 0),
-          allocationCapRemainingUsd: round2(Math.max(0, allocationCapUsd - Number(ledgerPool.allocatedUsd || 0))),
-          history: rewardsHistory,
-        }
+      ? (() => {
+          const poolUsd = round2(ledgerPool.poolUsd ?? 0);
+          const allocationRemainingUsd = round2(Math.max(0, allocationCapUsd - Number(ledgerPool.allocatedUsd || 0)));
+          const rules = {
+            ...operatorRewardsConfig,
+            explain: rewardsStatus?.rules?.explain ?? [
+              'Rewards are paid as TRADING CAPITAL from the treasury pool, never counted as profit.',
+              'Eligible only with positive period trading P&L, at least the minimum number of trades and acceptable drawdown.',
+              'Ranked by period trading return on contributed capital (not raw equity).',
+              'Top 3 shares of the period reward budget: 50% / 30% / 20%.',
+            ],
+          };
+          const uncappedBudgetUsd = round2(poolUsd * Number(rules.rewardBudgetPctOfPool ?? 0.1));
+          const capByPeriod = rules.maxPerPeriodUsd === null || rules.maxPerPeriodUsd === undefined
+            ? uncappedBudgetUsd
+            : Math.min(uncappedBudgetUsd, Number(rules.maxPerPeriodUsd));
+          return {
+            ...rewardsStatus,
+            rules,
+            basis: rules.basis ?? 'trading-performance',
+            accountCashUsd: account?.cashUsd ?? null,
+            poolUsd,
+            allocatedUsd: round2(ledgerPool.allocatedUsd ?? 0),
+            allocationCapRemainingUsd: allocationRemainingUsd,
+            budgetUsd: round2(Math.min(capByPeriod, allocationRemainingUsd, poolUsd)),
+            history: rewardsHistory,
+            lifetimeTotalUsd: round2(Object.values(lifetimeRewardsMap()).reduce((sum, value) => sum + value, 0)),
+            tradingPnlTotalUsd: round2(
+              registry.alive().reduce((sum, agent) => {
+                try {
+                  const book = ledger.snapshot(agent.id);
+                  return sum + (Number(book?.tradingPlUsd) || 0);
+                } catch {
+                  return sum;
+                }
+              }, 0),
+            ),
+          };
+        })()
       : null;
     const agents = registry.all().map((agent) => {
       const view = views.get(agent.id) ?? null;
@@ -1545,6 +1789,32 @@ export async function createAutomaton(options = {}) {
       } catch {
         freshEquity = null;
       }
+      // v3.3 fair P&L: reward payouts are capital contributions, never trading profit.
+      const capitalContributionsUsd = round2(Math.max(0,
+        Number(freshEquity?.capitalContributionsUsd ?? book?.capitalContributionsUsd) || 0));
+      const rewardCapitalUsd = round2(Math.max(0,
+        Number(freshEquity?.rewardCapitalUsd ?? book?.rewardCapitalUsd) || 0));
+      const baseCapitalUsd = round2(Math.max(0,
+        Number(freshEquity?.baseCapitalUsd ?? book?.baseCapitalUsd) || (capitalContributionsUsd - rewardCapitalUsd)));
+      const equityUsd = freshEquity?.equityUsd ?? view?.equityUsd ?? null;
+      const tradingPnlUsd = Number.isFinite(Number(freshEquity?.tradingPnlUsd))
+        ? round2(freshEquity.tradingPnlUsd)
+        : Number.isFinite(Number(book?.tradingPlUsd))
+          ? round2(book.tradingPlUsd)
+          : equityUsd !== null && Number.isFinite(Number(equityUsd))
+            ? round2(Number(equityUsd) - capitalContributionsUsd)
+            : null;
+      const tradingPnlPct = capitalContributionsUsd > 0 && tradingPnlUsd !== null
+        // Fraction (e.g. 0.0157 = +1.57%), matching rankings/ledger and the UI contract.
+        ? Math.round((tradingPnlUsd / capitalContributionsUsd) * 1000000) / 1000000
+        : null;
+      const rewardHistory = rewardHistoryFor(agent.id);
+      const lifetimeRewardsUsd = lifetimeRewardsFor(agent.id, book ?? freshEquity);
+      const lastReward = rewardHistory.length > 0 ? rewardHistory[rewardHistory.length - 1] : null;
+      const capitalVersion = Number(freshEquity?.capitalVersion ?? book?.capitalVersion) || 1;
+      const rankingDay = rankingMaps.daily.get(agent.id) ?? null;
+      const rankingWeek = rankingMaps.weekly.get(agent.id) ?? null;
+      const rankingMonth = rankingMaps.monthly.get(agent.id) ?? null;
       return {
         id: agent.id,
         name: agent.name ?? agent.id,
@@ -1588,7 +1858,25 @@ export async function createAutomaton(options = {}) {
               createdAt: spec.createdAt ?? null,
             }
           : null,
-        equityUsd: freshEquity?.equityUsd ?? view?.equityUsd ?? null,
+        equityUsd,
+        // v3.3 fair capital decomposition + trading-only P&L (reward capital is NOT profit).
+        tradingPnlUsd,
+        tradingPnlPct,
+        capital: {
+          contributedUsd: capitalContributionsUsd,
+          baseUsd: baseCapitalUsd,
+          rewardCapitalUsd,
+          rewardSharePct: capitalContributionsUsd > 0
+            ? Math.round((rewardCapitalUsd / capitalContributionsUsd) * 10000) / 100
+            : 0,
+          capitalVersion,
+        },
+        rewards: {
+          lifetimeUsd: lifetimeRewardsUsd,
+          count: rewardHistory.length,
+          lastAt: lastReward?.at ?? null,
+          history: rewardHistory,
+        },
         cashUsd: freshEquity?.cashUsd ?? book?.cashUsd ?? view?.cashUsd ?? null,
         marginDebtUsd: freshEquity?.marginDebtUsd ?? view?.marginDebtUsd ?? null,
         grossExposureUsd: view?.grossExposureUsd ?? freshEquity?.grossExposureUsd ?? null,
@@ -1597,7 +1885,7 @@ export async function createAutomaton(options = {}) {
         runwayHours: view?.runwayHours ?? null,
         treasuryState: view?.state ?? null,
         drawdownPct: view?.drawdownPct ?? null,
-        dayPnlPct: view?.dayPnlPct ?? null,
+        dayPnlPct: rankingDay?.tradingPnlPct ?? view?.dayPnlPct ?? null,
         net7dUsd: view?.net7dUsd ?? null,
         positions,
         recentTrades,
@@ -1619,20 +1907,34 @@ export async function createAutomaton(options = {}) {
         pnl: {
           realizedUsd: book?.realizedPlUsd ?? null,
           unrealizedUsd: book?.unrealizedPlUsd ?? null,
-          netUsd: view?.equityUsd !== undefined && view?.equityUsd !== null
-            ? round2(Number(view.equityUsd) - Number(agent.endowmentUsd ?? 0))
+          // Trading P&L only: equity minus ALL contributed capital (base + rewards + top-ups).
+          tradingUsd: tradingPnlUsd,
+          tradingPct: tradingPnlPct,
+          tradingRealizedUsd: book?.realizedPlUsd ?? null,
+          tradingUnrealizedUsd: book?.unrealizedPlUsd ?? null,
+          rewardsUsd: lifetimeRewardsUsd,
+          // Legacy alias now points at the fair trading number (never equity change).
+          netUsd: tradingPnlUsd,
+          equityChangeUsd: equityUsd !== null && Number.isFinite(Number(equityUsd))
+            ? round2(Number(equityUsd) - Number(agent.endowmentUsd ?? 0))
             : null,
-          dayPct: view?.dayPnlPct ?? null,
-          weekPct: rankingMaps.weekly.get(agent.id)?.pnlPct ?? null,
-          monthPct: rankingMaps.monthly.get(agent.id)?.pnlPct ?? null,
+          dayPct: rankingDay?.tradingPnlPct ?? null,
+          weekPct: rankingWeek?.tradingPnlPct ?? null,
+          monthPct: rankingMonth?.tradingPnlPct ?? null,
         },
         rankings: {
-          dayRank: rankingMaps.daily.get(agent.id)?.rank ?? null,
-          weekRank: rankingMaps.weekly.get(agent.id)?.rank ?? null,
-          monthRank: rankingMaps.monthly.get(agent.id)?.rank ?? null,
-          dayPct: rankingMaps.daily.get(agent.id)?.pnlPct ?? null,
-          weekPct: rankingMaps.weekly.get(agent.id)?.pnlPct ?? null,
-          monthPct: rankingMaps.monthly.get(agent.id)?.pnlPct ?? null,
+          dayRank: rankingDay?.rank ?? null,
+          weekRank: rankingWeek?.rank ?? null,
+          monthRank: rankingMonth?.rank ?? null,
+          dayPct: rankingDay?.tradingPnlPct ?? null,
+          weekPct: rankingWeek?.tradingPnlPct ?? null,
+          monthPct: rankingMonth?.tradingPnlPct ?? null,
+          tradingDayPct: rankingDay?.tradingPnlPct ?? null,
+          tradingWeekPct: rankingWeek?.tradingPnlPct ?? null,
+          tradingMonthPct: rankingMonth?.tradingPnlPct ?? null,
+          tradingDayUsd: rankingDay?.tradingPnlUsd ?? null,
+          tradingWeekUsd: rankingWeek?.tradingPnlUsd ?? null,
+          tradingMonthUsd: rankingMonth?.tradingPnlUsd ?? null,
         },
         // Execution tier + cadence (day = intraday lane, swing = mid/long-term lane).
         tier: (agent.tier === 'swing' ? 'swing' : 'day'),
@@ -1690,6 +1992,13 @@ export async function createAutomaton(options = {}) {
       };
     })();
     const obituaryStats = journal.stats ? await journal.stats() : null;
+    const capitalAccounting = {
+      version: 2,
+      migrationMarker: path.join(paths.stateDir, 'capital-v33.json'),
+      rewardedAgents: agents.filter((agent) => Number(agent.capital?.rewardCapitalUsd) > 0).length,
+      tradingPnlTotalUsd: round2(agents.reduce((sum, agent) => sum + (Number(agent.tradingPnlUsd) || 0), 0)),
+      rewardsLifetimeTotalUsd: round2(agents.reduce((sum, agent) => sum + (Number(agent.rewards?.lifetimeUsd) || 0), 0)),
+    };
     return {
       at: new Date(clock.now()).toISOString(),
       mode: config.mode,
@@ -1701,6 +2010,8 @@ export async function createAutomaton(options = {}) {
         lastError: state.lastError,
         killSwitch: brakes.isKillSwitchActive?.(),
         liveArmed: liveArmed(config),
+        rewards: rewardsView,
+        capitalAccounting,
         research: {
           ...researcher.schedule(),
           configurable: {

@@ -115,10 +115,19 @@ export function defaultConfig() {
     },
     rewards: {
       enabled: true,
-      period: 'daily',
-      rankPercents: [0.05, 0.03, 0.02],
-      basis: 'account-cash',
+      period: 'weekly',
+      // v3.3 performance rewards (docs/FAIR-PNL-REWARDS.md): pay CAPITAL from the treasury pool to
+      // eligible agents ranked by period TRADING RETURN; reward capital is never counted as P&L.
+      basis: 'trading-performance',
+      rankShares: [0.5, 0.3, 0.2],
+      rewardBudgetPctOfPool: 0.1,
       maxPerPeriodUsd: null,
+      maxRewardPerAgentPctOfCapital: 0.5,
+      minTradingProfitUsd: 0.05,
+      minTrades: 3,
+      maxDrawdownPct: 0.2,
+      // Deprecated v3.2 fields; accepted on load only and ignored by the v3.3 scheduler.
+      rankPercents: [0.05, 0.03, 0.02],
     },
     // Per-tier execution cadence (docs/CONTROL-PANEL.md / RUNBOOK §8b). A 'day' bot is analysed
     // on the intraday timeframe every `intervalSec`; a 'swing' bot on its slower timeframe.
@@ -477,12 +486,31 @@ export function validateConfig(config) {
   if (!['daily', 'weekly', 'monthly'].includes(rewards.period)) {
     fail('CONFIG_INVALID', 'rewards.period must be daily|weekly|monthly');
   }
-  if (rewards.basis !== 'account-cash') fail('CONFIG_INVALID', 'rewards.basis must be "account-cash"');
-  if (!Array.isArray(rewards.rankPercents) || rewards.rankPercents.length !== 3) {
-    fail('CONFIG_INVALID', 'rewards.rankPercents must be exactly 3 numbers');
+  // v3.3: new settings win; the old account-cash/rankPercents fields are accepted only as legacy.
+  if (!['trading-performance', 'account-cash'].includes(rewards.basis)) {
+    fail('CONFIG_INVALID', 'rewards.basis must be "trading-performance" (or deprecated "account-cash")');
   }
-  for (const percent of rewards.rankPercents) {
-    assertNumber(percent, 'rewards.rankPercents[i]', { min: 0, max: 0.5 });
+  if (!Array.isArray(rewards.rankShares) || rewards.rankShares.length !== 3) {
+    fail('CONFIG_INVALID', 'rewards.rankShares must be exactly 3 numbers');
+  }
+  const rankSharesSum = rewards.rankShares.reduce((sum, share) => sum + Number(share), 0);
+  for (const share of rewards.rankShares) {
+    assertNumber(share, 'rewards.rankShares[i]', { min: 0, max: 1 });
+  }
+  if (rankSharesSum > 1.000001) fail('CONFIG_INVALID', 'rewards.rankShares must sum to at most 1');
+  assertNumber(rewards.rewardBudgetPctOfPool, 'rewards.rewardBudgetPctOfPool', { min: 0, max: 1 });
+  assertNumber(rewards.maxRewardPerAgentPctOfCapital, 'rewards.maxRewardPerAgentPctOfCapital', { min: 0, max: 1 });
+  assertNumber(rewards.minTradingProfitUsd, 'rewards.minTradingProfitUsd', { min: 0, max: 1_000_000 });
+  assertNumber(rewards.minTrades, 'rewards.minTrades', { min: 0, max: 100_000 });
+  if (!Number.isInteger(Number(rewards.minTrades))) fail('CONFIG_INVALID', 'rewards.minTrades must be an integer');
+  assertNumber(rewards.maxDrawdownPct, 'rewards.maxDrawdownPct', { min: 0, max: 1 });
+  if (rewards.rankPercents !== undefined && rewards.rankPercents !== null) {
+    if (!Array.isArray(rewards.rankPercents) || rewards.rankPercents.length !== 3) {
+      fail('CONFIG_INVALID', 'rewards.rankPercents (deprecated) must be exactly 3 numbers when present');
+    }
+    for (const percent of rewards.rankPercents) {
+      assertNumber(percent, 'rewards.rankPercents[i]', { min: 0, max: 0.5 });
+    }
   }
   if (rewards.maxPerPeriodUsd !== null) {
     assertNumber(rewards.maxPerPeriodUsd, 'rewards.maxPerPeriodUsd', { min: 0, max: 1_000_000 });
@@ -732,8 +760,14 @@ export function configSummary(config) {
     rewards: {
       enabled: config.rewards.enabled,
       period: config.rewards.period,
-      rankPercents: config.rewards.rankPercents,
+      basis: config.rewards.basis,
+      rankShares: config.rewards.rankShares,
+      rewardBudgetPctOfPool: config.rewards.rewardBudgetPctOfPool,
       maxPerPeriodUsd: config.rewards.maxPerPeriodUsd,
+      maxRewardPerAgentPctOfCapital: config.rewards.maxRewardPerAgentPctOfCapital,
+      minTradingProfitUsd: config.rewards.minTradingProfitUsd,
+      minTrades: config.rewards.minTrades,
+      maxDrawdownPct: config.rewards.maxDrawdownPct,
     },
     agents: {
       enabled: config.agents.enabled,

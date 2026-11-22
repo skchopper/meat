@@ -12,6 +12,55 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v3.3.0 — 2026-11-22 — fair P&L and performance-based capital rewards
+
+Reward payouts are now **trading capital, never profit**, and the population's rewards follow measured
+trading performance instead of equity inflation.
+
+- **Fair capital accounting.** The ledger tracks `capitalContributionsUsd` (base endowment + top-ups +
+  credits + reward capital), `rewardCapitalUsd` (lifetime reward payouts, a subset), `capitalVersion`
+  and the derived **Trading P&L = total equity − capital contributed**. A reward transfer raises
+  equity/capital/reward capital equally and leaves trading P&L/returns/rank unchanged. One-time
+  idempotent migration (`capital-v33.json`) reclassifies historical rewards from the rewards history;
+  current live state: $129.18 lifetime across 6 bots, e.g. GapFade META equity $106.86 − ($50 base +
+  $58.56 reward) = **−$1.70 trading P&L** instead of an apparent +$56.86.
+- **Performance-only reward rules.** Config: `basis:'trading-performance'`, weekly, eligible only with
+  a measured period trading baseline, positive trading P&L above **$0.05**, at least **3 period trades**
+  and drawdown **≤20%**. Ranked by **period trading return on contributed capital** (tie: trading P&L
+  dollars), not raw equity. Budget = **10% of the treasury pool** (optionally capped); top 3 get
+  **50% / 30% / 20%** of it, each capped at **50% of that bot's capital**, and by pool/allocation
+  headroom. No baseline/negative/no-activity/excess-drawdown bots are skipped; no eligible winners or
+  budget records a `skipped` payout without transfers. Legacy `rankPercents`/`account-cash` settings
+  are accepted only for compatibility and ignored.
+- **More capital where it earns.** Rewards are paid as **reward capital** from the treasury, which
+  increases a winning bot's buying power and order sizing (mandates scale with equity) while staying
+  behind the 18 brakes and caps. The live profile raises `account.allocationCapPct` from 0.8 to **0.9**
+  (keeping a 10% account reserve) so the pool budget can actually reach winners; the setting remains
+  operator-configurable. Per-agent/program caps, min-profit/min-trade/drawdown gates and the weekly
+  period prevent concentration and rewarding noise. Rewards remain virtual-only (no broker
+  transfer/withdraw surface). Formula and rationale: `docs/FAIR-PNL-REWARDS.md`.
+- **Fair P&L everywhere.** Agent status exposes `capital` breakdown, `tradingPnlUsd`/`tradingPnlPct`
+  (fraction), `pnl.tradingUsd` and `rewards.lifetimeUsd` with per-agent **reward history**;
+  `engine.rewards.rules/budgetUsd/lifetimeTotalUsd` and `engine.capitalAccounting` are exposed.
+  Rankings store/archived **trading P&L baselines** and `periodTrades`, so leaderboards and payouts use
+  trading return. Daily-loss/dayStats bookkeeping now uses trading P&L deltas (reward top-ups never look
+  like a daily gain/loss). `/automaton/market` portfolio daily P&L is trading-based and no longer 100×
+  understated by a fraction/percent mixup.
+- **UI.** Agent table shows Trading P&L (excluding reward capital) and a new lifetime **Rewards** column;
+  the detail drawer shows total equity, capital contributed, of which reward capital, Trading P&L,
+  return on capital, lifetime rewards and a **Reward history** table with period/rank/amount/share and
+  period trading P&L/return; the Rewards tab documents the rules, current pool/budget, eligible
+  candidates and payout history; leaderboards are labelled Trading P&L; KPI cards separate total equity
+  from trading P&L and rewards. Old snapshots degrade gracefully.
+- **Tests/docs:** **404/404** across 10 suites (mortality 88, market 50, plugin 49, integration 78,
+  security 63, research 13, rankings 29, control 18, bot-agent 9, instruments 7), including the
+  independent verifier's v3.3 additions (ledger fairness, real-state migration, e2e reward payouts,
+  status/percent scale, marketView day-P&L and security regressions); contract `docs/FAIR-PNL-REWARDS.md`, RUNBOOK §8g, CONTROL-PANEL rankings/rewards,
+  ARCHITECTURE, README and this changelog updated.
+- **Compatibility:** paper remains default and live is still triple-gated; historical payouts are
+  reclassified but never clawed back; no assignment/margin-call modelling changes. Rewarding winners
+  with more capital increases both upside and drawdown risk — tune the budget/allocation caps.
+
 ## v3.2.0 — 2026-11-09 — multi-symbol portfolio bots, 70% day mix and live analytics dashboard
 
 The population now trades **baskets of companies** instead of one ticker, the live profile is

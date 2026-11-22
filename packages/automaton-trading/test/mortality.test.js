@@ -874,6 +874,378 @@ describe('ledger.js — v3 multi-instrument book', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// ledger.js v3.3 — fair capital accounting (docs/FAIR-PNL-REWARDS.md §2-§3)
+// ---------------------------------------------------------------------------
+
+function makeCapitalLedger() {
+  const env = makeEnv();
+  const clock = makeClock();
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  return { env, clock, ledger };
+}
+
+/** Seed one agent the way the orchestrator does: ensureAgent(endowment) then grant(endowment). */
+function seedCapitalAgent(ledger, clock, agentId, endowmentUsd) {
+  ledger.ensureAgent(agentId, { endowmentUsd, at: clock.iso() });
+  ledger.grant(agentId, endowmentUsd, { reason: 'genesis-endowment', at: clock.iso() });
+}
+
+describe('ledger.js — v3.3 fair capital accounting', () => {
+  it('counts the declared endowment once across ensureAgent + genesis grant; later grants add capital', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    const newRecord = ledger.ensureAgent('atm-cap', { endowmentUsd: 50, at: clock.iso() });
+    assert.equal(newRecord.capitalContributionsUsd, 50);
+    assert.equal(newRecord.rewardCapitalUsd, 0);
+    assert.equal(newRecord.capitalVersion, 2);
+    assert.equal(ledger.hasCapitalAccounting('atm-cap'), true);
+    assert.equal(ledger.hasCapitalAccounting('atm-unknown'), false);
+
+    ledger.grant('atm-cap', 50, { reason: 'genesis-endowment', at: clock.iso() });
+    const funded = ledger.equity('atm-cap', {});
+    assert.equal(funded.equityUsd, 50);
+    assert.equal(funded.capitalContributionsUsd, 50, 'ensureAgent basis + funding grant must count once');
+    assert.equal(funded.rewardCapitalUsd, 0);
+    assert.equal(funded.baseCapitalUsd, 50);
+    assert.equal(funded.tradingPnlUsd, 0);
+    assert.equal(funded.tradingPnlPct, 0);
+    assert.equal(funded.tradingPlUsd, 0, 'tradingPlUsd alias mirrors tradingPnlUsd');
+    assert.equal(funded.capitalVersion, 2);
+
+    ledger.grant('atm-cap', 10, { reason: 'extra-capital', at: clock.iso() });
+    const after = ledger.capitalOf('atm-cap');
+    assert.equal(after.capitalContributionsUsd, 60);
+    assert.equal(after.tradingPnlUsd, 0);
+    assert.equal(ledger.equity('atm-cap', {}).equityUsd, 60);
+    assert.equal(ledger.hasCapitalAccounting('atm-cap'), true);
+  });
+
+  it('classifies credit and treasury transfers as capital, but never fills or costs', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-cap', 100);
+    ledger.credit('atm-cap', 25, { category: 'capital', reason: 'capital-topup', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-cap').capitalContributionsUsd, 125);
+    assert.equal(ledger.snapshot('atm-cap').creditsUsd, 25);
+
+    ledger.charge('atm-cap', 5, { category: 'inference', role: 'executor', at: clock.iso() });
+    ledger.applyFill('atm-cap', { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 10, at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-cap').capitalContributionsUsd, 125, 'fills/costs are not capital');
+    assert.equal(ledger.capitalOf('atm-cap').tradingPnlUsd, -5); // cash 110 + mark 10 − capital 125
+    // A treasury grant is a capital contribution, not trading P&L.
+    ledger.grant(TREASURY_ID, 100, { reason: 'pool-anchor', at: clock.iso() });
+    ledger.transfer(TREASURY_ID, 'atm-cap', 15, { reason: 'capital reallocation', at: clock.iso() });
+    const after = ledger.capitalOf('atm-cap');
+    assert.equal(after.capitalContributionsUsd, 140);
+    assert.equal(after.rewardCapitalUsd, 0);
+    assert.equal(ledger.equity('atm-cap', {}).equityUsd, 135);
+  });
+
+  it('reward transfer raises equity and reward capital but leaves trading P&L unchanged (pool conserved)', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-win', 50);
+    ledger.grant(TREASURY_ID, 100, { reason: 'pool-anchor', at: clock.iso() });
+    const poolBefore = ledger.pool();
+    const before = ledger.equity('atm-win', {});
+    assert.equal(before.tradingPnlUsd, 0);
+
+    ledger.transfer(TREASURY_ID, 'atm-win', 10, {
+      category: 'reward',
+      reason: 'reward:2026-W44',
+      at: clock.iso(),
+    });
+    const after = ledger.equity('atm-win', {});
+    assert.equal(after.equityUsd, 60);
+    assert.equal(after.capitalContributionsUsd, 60);
+    assert.equal(after.rewardCapitalUsd, 10);
+    assert.equal(after.baseCapitalUsd, 50);
+    assert.equal(after.tradingPnlUsd, before.tradingPnlUsd, 'a reward is capital, never trading profit');
+    assert.equal(after.tradingPnlPct, 0);
+    assert.equal(after.capitalVersion, 2, 'a reward transfer keeps the v3.3 capital accounting');
+    const snapshot = ledger.snapshot('atm-win');
+    assert.equal(snapshot.capitalContributionsUsd, 60);
+    assert.equal(snapshot.rewardCapitalUsd, 10);
+    assert.equal(snapshot.tradingPnlUsd, 0);
+    assert.equal(snapshot.tradingPlUsd, 0);
+    // Conservation: the transfer moves pool → allocated, the ledger total is unchanged.
+    const poolAfter = ledger.pool();
+    assert.equal(poolAfter.poolUsd, round2(poolBefore.poolUsd - 10));
+    assert.equal(poolAfter.allocatedUsd, round2(poolBefore.allocatedUsd + 10));
+    assert.equal(poolAfter.totalUsd, poolBefore.totalUsd);
+  });
+
+  it('marks reward capital from a reward category or a /reward/i reason on grant and credit', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    ledger.grant('atm-r1', 10, { reason: 'reward:2026-W45', category: 'reward', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-r1').capitalContributionsUsd, 10);
+    assert.equal(ledger.capitalOf('atm-r1').rewardCapitalUsd, 10);
+    ledger.credit('atm-r1', 5, { reason: 'reward performance bonus', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-r1').capitalContributionsUsd, 15);
+    assert.equal(ledger.capitalOf('atm-r1').rewardCapitalUsd, 15);
+    // A non-reward grant after migration is plain capital.
+    ledger.grant('atm-r1', 4, { reason: 'genesis-endowment', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-r1').capitalContributionsUsd, 19);
+    assert.equal(ledger.capitalOf('atm-r1').rewardCapitalUsd, 15);
+  });
+
+  it('treats agent → treasury transfers as capital withdrawals (reward capital last)', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-cap', 50);
+    ledger.grant(TREASURY_ID, 100, { reason: 'pool-anchor', at: clock.iso() });
+    ledger.transfer(TREASURY_ID, 'atm-cap', 10, { category: 'reward', reason: 'reward:2026-W44', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-cap').capitalContributionsUsd, 60);
+    assert.equal(ledger.capitalOf('atm-cap').rewardCapitalUsd, 10);
+
+    // 20 ≤ non-reward capital (50): only capital contributions fall, reward capital is untouched.
+    ledger.transfer('atm-cap', TREASURY_ID, 20, { reason: 'capital-return', at: clock.iso() });
+    let capital = ledger.capitalOf('atm-cap');
+    assert.equal(capital.capitalContributionsUsd, 40);
+    assert.equal(capital.rewardCapitalUsd, 10);
+    assert.equal(capital.tradingPnlUsd, 0);
+
+    // 25 ≤ remaining non-reward capital (30): still no reward reduction.
+    ledger.transfer('atm-cap', TREASURY_ID, 25, { reason: 'capital-return', at: clock.iso() });
+    capital = ledger.capitalOf('atm-cap');
+    assert.equal(capital.capitalContributionsUsd, 15);
+    assert.equal(capital.rewardCapitalUsd, 10);
+
+    // Withdrawal beyond non-reward capital (5) reduces reward capital by the excess (5).
+    ledger.transfer('atm-cap', TREASURY_ID, 10, { reason: 'capital-return', at: clock.iso() });
+    capital = ledger.capitalOf('atm-cap');
+    assert.equal(capital.capitalContributionsUsd, 5);
+    assert.equal(capital.rewardCapitalUsd, 5);
+    assert.equal(capital.baseCapitalUsd, 0);
+    assert.equal(capital.tradingPnlUsd, 0, 'withdrawals never create P&L');
+  });
+
+  it('leaves capital untouched for agent → agent transfers (cash only) and clears the pending basis', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-parent', 100);
+    ledger.ensureAgent('atm-child', { endowmentUsd: 30, at: clock.iso() });
+    ledger.transfer('atm-parent', 'atm-child', 30, { reason: 'child-endowment', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-parent').capitalContributionsUsd, 100);
+    assert.equal(ledger.capitalOf('atm-child').capitalContributionsUsd, 30);
+    assert.equal(ledger.snapshot('atm-parent').cashUsd, 70);
+    assert.equal(ledger.snapshot('atm-child').cashUsd, 30);
+    assert.equal(ledger.get('atm-child').capitalPendingUsd, 0, 'parent funding clears the declared basis');
+    // A later capital grant therefore adds in full instead of funding the declared basis again.
+    ledger.grant('atm-child', 5, { reason: 'later-capital', at: clock.iso() });
+    assert.equal(ledger.capitalOf('atm-child').capitalContributionsUsd, 35);
+    assert.equal(ledger.snapshot('atm-child').cashUsd, 35);
+  });
+
+  it('setCapitalBasis reclassifies without a cash/P&L movement and is idempotent', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-mig', 20);
+    ledger.grant(TREASURY_ID, 100, { reason: 'pool-anchor', at: clock.iso() });
+    ledger.transfer(TREASURY_ID, 'atm-mig', 58.56, {
+      category: 'reward',
+      reason: 'reward:2026-W44',
+      at: clock.iso(),
+    });
+    const cashBefore = ledger.snapshot('atm-mig').cashUsd;
+    assert.equal(cashBefore, 78.56);
+
+    const basis = {
+      baseCapitalUsd: 50,
+      rewardCapitalUsd: 58.56,
+      reason: 'v3.3 fair capital basis migration',
+      at: clock.iso(),
+    };
+    const first = ledger.setCapitalBasis('atm-mig', basis);
+    assert.equal(first.capitalContributionsUsd, 108.56);
+    assert.equal(first.rewardCapitalUsd, 58.56);
+    assert.equal(first.baseCapitalUsd, 50);
+    assert.equal(first.capitalVersion, 2);
+    assert.equal(first.tradingPnlUsd, round2(78.56 - 108.56));
+    assert.equal(ledger.hasCapitalAccounting('atm-mig'), true);
+
+    const snapshot = ledger.snapshot('atm-mig');
+    assert.equal(snapshot.cashUsd, cashBefore, 'capital-basis is not a cash movement');
+    assert.equal(snapshot.realizedPlUsd, 0, 'capital-basis is not P&L');
+    assert.deepEqual(snapshot.positionsList, []);
+    const record = ledger.get('atm-mig');
+    const basisEvent = record.events.find((event) => event.kind === 'capital-basis');
+    assert.ok(basisEvent, 'a capital-basis audit event is appended');
+    assert.equal(basisEvent.amountUsd, 108.56);
+    assert.equal(basisEvent.rewardUsd, 58.56);
+    assert.equal(basisEvent.reason, 'v3.3 fair capital basis migration');
+    assert.ok(Number.isFinite(basisEvent.atMs));
+
+    // Idempotent retry: same state, no extra cash, no P&L.
+    const second = ledger.setCapitalBasis('atm-mig', basis);
+    assert.deepEqual(second, first);
+    assert.equal(ledger.snapshot('atm-mig').cashUsd, cashBefore);
+    assert.equal(ledger.snapshot('atm-mig').realizedPlUsd, 0);
+  });
+
+  it('a migrated basis record is not re-based by a later grant (pending basis is zero)', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-mig', 20);
+    ledger.setCapitalBasis('atm-mig', {
+      baseCapitalUsd: 50,
+      rewardCapitalUsd: 58.56,
+      reason: 'v3.3 fair capital basis migration',
+      at: clock.iso(),
+    });
+    assert.equal(ledger.capitalOf('atm-mig').capitalContributionsUsd, 108.56);
+    ledger.grant('atm-mig', 10, { reason: 'treasury-grant', at: clock.iso() });
+    const capital = ledger.capitalOf('atm-mig');
+    assert.equal(capital.capitalContributionsUsd, 118.56, 'a migrated record has no pending basis to consume');
+    assert.equal(capital.rewardCapitalUsd, 58.56);
+    assert.equal(capital.baseCapitalUsd, 60);
+    assert.equal(capital.tradingPnlUsd, round2(30 - 118.56));
+    assert.equal(capital.capitalVersion, 2, 'a grant after migration keeps capitalVersion 2');
+  });
+
+  it('reproduces the live GapFade META example: $106.86 equity − ($50 + $58.56 rewards) = −$1.70', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    ledger.grant(TREASURY_ID, 200, { reason: 'pool-anchor', at: clock.iso() });
+    seedCapitalAgent(ledger, clock, 'atm-gap', 20);
+    ledger.transfer(TREASURY_ID, 'atm-gap', 58.56, {
+      category: 'reward',
+      reason: 'reward:2026-W44',
+      at: clock.iso(),
+    });
+    // +$28.30 trading profit turns the funded record into the live $106.86 account.
+    ledger.applyFill('atm-gap', { symbol: 'AAPL', side: 'buy', qty: 10, priceUsd: 2, at: clock.iso() });
+    ledger.applyFill('atm-gap', { symbol: 'AAPL', side: 'sell', qty: 10, priceUsd: 4.83, at: clock.iso() });
+    assert.equal(ledger.snapshot('atm-gap').cashUsd, 106.86);
+
+    ledger.setCapitalBasis('atm-gap', {
+      baseCapitalUsd: 50,
+      rewardCapitalUsd: 58.56,
+      reason: 'v3.3 fair capital basis migration',
+      at: clock.iso(),
+    });
+    const marked = ledger.equity('atm-gap', {});
+    assert.equal(marked.equityUsd, 106.86);
+    assert.equal(marked.capitalContributionsUsd, 108.56);
+    assert.equal(marked.rewardCapitalUsd, 58.56);
+    assert.equal(marked.baseCapitalUsd, 50);
+    assert.equal(marked.tradingPnlUsd, -1.7, 'only trading results count');
+    assert.equal(marked.tradingPnlPct, -0.0157);
+    assert.equal(marked.tradingPlUsd, -1.7);
+    assert.equal(marked.capitalVersion, 2);
+  });
+
+  it('normalises a legacy record, round-trips it, and migrates it via setCapitalBasis', () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    fs.mkdirSync(path.dirname(env.paths.ledger), { recursive: true });
+    const legacyRecord = {
+      agentId: 'atm-legacy',
+      cashUsd: 106.86,
+      positions: {},
+      realizedPlUsd: 30,
+      costsUsd: 2,
+      costsByRole: {},
+      grossSpendUsd: 0,
+      grossRevenueUsd: 0,
+      creditsUsd: 5,
+      trades: 3,
+      firstProfitAt: null,
+      declaredEndowmentUsd: 20,
+      startedAt: new Date(T0).toISOString(),
+      fills: [],
+      events: [],
+      markPrices: {},
+      lastUnrealizedUsd: 0,
+      lastMarginDebtUsd: 0,
+      lastGrossExposureUsd: 0,
+      lastNetExposureUsd: 0,
+      updatedAt: new Date(T0).toISOString(),
+    };
+    fs.writeFileSync(
+      env.paths.ledger,
+      JSON.stringify({ version: 3, anchored: false, anchoredAt: null, agents: { 'atm-legacy': legacyRecord } }),
+    );
+    ledger.load();
+    let snapshot = ledger.snapshot('atm-legacy');
+    assert.equal(snapshot.capitalContributionsUsd, 25, 'legacy fallback: declaredEndowmentUsd + creditsUsd');
+    assert.equal(snapshot.rewardCapitalUsd, 0);
+    assert.equal(snapshot.capitalVersion, 1);
+    assert.equal(ledger.hasCapitalAccounting('atm-legacy'), false);
+    assert.equal(ledger.capitalOf('atm-legacy').tradingPnlUsd, round2(106.86 - 25));
+
+    // Save/load keeps the legacy fallback stable (it is not silently re-migrated).
+    ledger.save();
+    const reloaded = createLedger({ paths: env.paths, config: env.config, clock });
+    reloaded.load();
+    assert.equal(reloaded.snapshot('atm-legacy').capitalVersion, 1);
+    assert.equal(reloaded.capitalOf('atm-legacy').capitalContributionsUsd, 25);
+
+    // The orchestrator migration then applies the exact fair basis.
+    reloaded.setCapitalBasis('atm-legacy', {
+      baseCapitalUsd: 50,
+      rewardCapitalUsd: 58.56,
+      reason: 'v3.3 fair capital basis migration',
+      at: clock.iso(),
+    });
+    reloaded.save();
+    const migrated = createLedger({ paths: env.paths, config: env.config, clock });
+    migrated.load();
+    assert.equal(migrated.hasCapitalAccounting('atm-legacy'), true);
+    const capital = migrated.capitalOf('atm-legacy');
+    assert.equal(capital.capitalContributionsUsd, 108.56);
+    assert.equal(capital.rewardCapitalUsd, 58.56);
+    assert.equal(capital.baseCapitalUsd, 50);
+    assert.equal(capital.tradingPnlUsd, -1.7);
+    assert.equal(capital.capitalVersion, 2);
+    assert.equal(migrated.snapshot('atm-legacy').capitalVersion, 2);
+  });
+
+  it('decomposes records with no positions safely (equity = cash; null pct at zero capital)', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    ledger.ensureAgent('atm-empty', { endowmentUsd: 0, at: clock.iso() });
+    assert.deepEqual(ledger.capitalOf('atm-empty'), {
+      capitalContributionsUsd: 0,
+      rewardCapitalUsd: 0,
+      baseCapitalUsd: 0,
+      tradingPnlUsd: 0,
+      tradingPlUsd: 0,
+      capitalVersion: 2,
+    });
+    const snapshot = ledger.snapshot('atm-empty');
+    assert.equal(snapshot.positionsValueUsd, 0);
+    assert.deepEqual(snapshot.positionsList, []);
+    assert.equal(snapshot.capitalContributionsUsd, 0);
+    assert.equal(snapshot.baseCapitalUsd, 0);
+    assert.equal(snapshot.rewardCapitalUsd, 0);
+    assert.equal(snapshot.tradingPnlUsd, 0);
+    assert.equal(snapshot.tradingPlUsd, 0);
+    assert.equal(snapshot.tradingPnlPct, null);
+    assert.equal(snapshot.capitalVersion, 2);
+    const marked = ledger.equity('atm-empty', {});
+    assert.equal(marked.equityUsd, 0);
+    assert.equal(marked.tradingPnlUsd, 0);
+    assert.equal(marked.tradingPnlPct, null);
+    assert.equal(marked.capitalVersion, 2);
+    assert.throws(
+      () => ledger.setCapitalBasis('atm-unknown', { baseCapitalUsd: 1 }),
+      (error) => error.code === 'UNKNOWN_AGENT',
+    );
+  });
+
+  it('dead-agent records still decompose; a death sweep is a withdrawal that preserves trading P&L', () => {
+    const { clock, ledger } = makeCapitalLedger();
+    seedCapitalAgent(ledger, clock, 'atm-dead', 50);
+    ledger.charge('atm-dead', 10, { category: 'inference', role: 'executor', at: clock.iso() });
+    // Reaper death sweep: move the residual cash to the treasury (capital withdrawal, not P&L).
+    ledger.transfer('atm-dead', TREASURY_ID, 40, { reason: 'death_sweep', at: clock.iso() });
+    assert.equal(ledger.snapshot('atm-dead').cashUsd, 0);
+    const capital = ledger.capitalOf('atm-dead');
+    assert.equal(capital.capitalContributionsUsd, 10);
+    assert.equal(capital.rewardCapitalUsd, 0);
+    assert.equal(capital.tradingPnlUsd, -10, 'the $10 cost is still the fair trading P&L');
+    assert.equal(capital.capitalVersion, 2);
+    const pool = ledger.pool();
+    assert.equal(pool.poolUsd, 40);
+    assert.equal(pool.totalUsd, 40);
+    assert.equal(ledger.snapshot('atm-dead').tradingPnlUsd, -10);
+  });
+});
+
 describe('registry.js — population and the one-way door', () => {
   it('registers agents, reports population, and serves defensive copies', () => {
     const env = makeEnv();

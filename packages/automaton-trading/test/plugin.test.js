@@ -978,6 +978,144 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
   };
 }
 
+/**
+ * v3.3 fair-P&L / capital-only-rewards fixture (docs/FAIR-PNL-REWARDS.md §5/§6).
+ * Decorates the 30-agent v3.2 payload with `capital`, `pnl` (trading fields),
+ * `rewards` (lifetime + per-agent history), `rankings.trading*`, engine reward
+ * rules, `engine.capitalAccounting` and a weekly trading-based ranking board.
+ */
+function buildV33StatusPayload() {
+  const status = buildStatusPayload({ running: true });
+  const agents = status.agents;
+
+  // Agent 0 is the live-example shape: $20 base + $58.56 reward capital = $78.56
+  // contributed, $106.86 total equity, −$1.70 honest trading P&L.
+  const winner = agents[0];
+  winner.equityUsd = 106.86;
+  winner.cashUsd = 106.86;
+  winner.capital = { contributedUsd: 78.56, baseUsd: 20, rewardCapitalUsd: 58.56, rewardSharePct: 74.54, capitalVersion: 2 };
+  winner.pnl = {
+    tradingUsd: -1.7,
+    tradingPct: -0.0216,
+    tradingRealizedUsd: -1,
+    tradingUnrealizedUsd: -0.7,
+    rewardsUsd: 58.56,
+    netUsd: -1.7,
+    dayPct: 0.012,
+    weekPct: 0.031,
+    monthPct: 0.047,
+  };
+  winner.tradingPnlUsd = -1.7;
+  winner.rewards = {
+    lifetimeUsd: 58.56,
+    count: 2,
+    lastAt: '2025-11-08T00:00:00.000Z',
+    history: [
+      { period: 'weekly', periodKey: '2026-W44', at: '2025-11-01T00:00:00.000Z', rank: 1, amountUsd: 40.56, share: 0.5, periodTradingPnlUsd: 3.2, periodTradingPnlPct: 0.16 },
+      { period: 'weekly', periodKey: '2026-W45', at: '2025-11-08T00:00:00.000Z', rank: 1, amountUsd: 18, share: 0.5, periodTradingPnlUsd: 1.4, periodTradingPnlPct: 0.07 },
+    ],
+  };
+  winner.rankings = {
+    ...winner.rankings,
+    tradingDayPct: 0.012,
+    tradingWeekPct: 0.031,
+    tradingMonthPct: 0.047,
+    tradingDayUsd: 0.9,
+    tradingWeekUsd: 2.4,
+    tradingMonthUsd: 3.3,
+  };
+
+  // Every other agent reports capital accounting too (no rewards yet).
+  for (let index = 1; index < agents.length; index += 1) {
+    const agent = agents[index];
+    const tradingUsd = index % 2 === 0 ? 0.5 : -0.4;
+    const contributedUsd = ENDOWMENT_USD;
+    agent.capital = { contributedUsd, baseUsd: contributedUsd, rewardCapitalUsd: 0, rewardSharePct: 0, capitalVersion: 2 };
+    agent.pnl = {
+      tradingUsd,
+      tradingPct: Math.round((tradingUsd / contributedUsd) * 10000) / 10000,
+      tradingRealizedUsd: tradingUsd,
+      tradingUnrealizedUsd: 0,
+      rewardsUsd: 0,
+      netUsd: tradingUsd,
+      dayPct: 0.004 * (index % 5),
+      weekPct: 0.01,
+      monthPct: 0.02,
+    };
+    agent.tradingPnlUsd = tradingUsd;
+    agent.rewards = { lifetimeUsd: 0, count: 0, lastAt: null, history: [] };
+  }
+
+  // Weekly trading-based ranking board for the reward candidates:
+  // 2 eligible (agent 5 higher return, agent 0 second) + 4 explicit failures.
+  const weeklyRows = [
+    { agentId: agents[5].id, name: agents[5].name, rank: 1, tradingPnlUsd: 2.4, tradingPnlPct: 0.12, periodTrades: 8, drawdownPct: 0.05, baselineCapitalUsd: 100, baselineTradingPlUsd: 0, trades: 8, equityUsd: agents[5].equityUsd },
+    { agentId: winner.id, name: winner.name, rank: 2, tradingPnlUsd: 1.2, tradingPnlPct: 0.061, periodTrades: 5, drawdownPct: 0.1, baselineCapitalUsd: 78.56, baselineTradingPlUsd: 0, trades: 5, equityUsd: winner.equityUsd },
+    { agentId: agents[1].id, name: agents[1].name, rank: 3, tradingPnlUsd: 0.02, tradingPnlPct: 0.001, periodTrades: 4, drawdownPct: 0.1, baselineCapitalUsd: 20, baselineTradingPlUsd: 0, trades: 4 },
+    { agentId: agents[2].id, name: agents[2].name, rank: 4, tradingPnlUsd: 0.1, tradingPnlPct: -0.005, periodTrades: 6, drawdownPct: 0.1, baselineCapitalUsd: 20, baselineTradingPlUsd: 0, trades: 6 },
+    { agentId: agents[3].id, name: agents[3].name, rank: 5, tradingPnlUsd: 0.5, tradingPnlPct: 0.025, periodTrades: 2, drawdownPct: 0.1, baselineCapitalUsd: 20, baselineTradingPlUsd: 0, trades: 2 },
+    { agentId: agents[4].id, name: agents[4].name, rank: 6, tradingPnlUsd: 1, tradingPnlPct: 0.05, periodTrades: 5, drawdownPct: 0.35, baselineCapitalUsd: 20, baselineTradingPlUsd: 0, trades: 5 },
+  ];
+  const v33History = [{
+    period: 'weekly',
+    periodKey: '2026-W45',
+    at: '2025-11-08T00:00:00.000Z',
+    basis: 'trading-performance',
+    budgetUsd: 40,
+    winners: [{
+      rank: 1,
+      agentId: winner.id,
+      name: winner.name,
+      amountUsd: 18,
+      share: 0.5,
+      periodTradingPnlUsd: 1.4,
+      periodTradingPnlPct: 0.07,
+      capitalUsd: 78.56,
+      periodTrades: 5,
+    }],
+  }];
+  status.rankings = {
+    asOf: '2026-01-02T00:00:00.000Z',
+    periods: {
+      daily: [],
+      weekly: weeklyRows,
+      monthly: [],
+    },
+  };
+  status.engine.rewards = {
+    enabled: true,
+    period: 'weekly',
+    basis: 'trading-performance',
+    poolUsd: 400,
+    budgetUsd: 40,
+    lifetimeTotalUsd: 58.56,
+    rules: {
+      enabled: true,
+      period: 'weekly',
+      basis: 'trading-performance',
+      rankShares: [0.5, 0.3, 0.2],
+      rewardBudgetPctOfPool: 0.1,
+      maxPerPeriodUsd: null,
+      maxRewardPerAgentPctOfCapital: 0.5,
+      minTradingProfitUsd: 0.05,
+      minTrades: 3,
+      maxDrawdownPct: 0.2,
+      explain: ['Trading performance only — reward capital never counts as profit.'],
+    },
+    history: v33History,
+    lastWinners: [],
+  };
+  status.rewards = { history: v33History, lifetimeTotalUsd: 58.56 };
+  status.engine.capitalAccounting = {
+    version: 2,
+    migrationMarker: 'capital-v33.json',
+    rewardedAgents: 1,
+    tradingPnlTotalUsd: -1.05,
+    rewardsLifetimeTotalUsd: 58.56,
+  };
+  return status;
+}
+
 function createFakeEngine(options = {}) {
   const calls = {
     start: 0,
@@ -2027,8 +2165,42 @@ test('POST /automaton/control validates and applies reward settings', async () =
   assert.equal(calls.updateRewardSettings, 2);
   assert.equal(calls.lastRewardSettings.maxPerPeriodUsd, null);
 
+  // v3.3 UI payload: new rule names are accepted and passed through unchanged.
+  const v33Settings = {
+    enabled: true,
+    period: 'weekly',
+    basis: 'trading-performance',
+    rankShares: [0.5, 0.3, 0.2],
+    rewardBudgetPctOfPool: 0.1,
+    maxPerPeriodUsd: 250,
+    maxRewardPerAgentPctOfCapital: 0.5,
+    minTradingProfitUsd: 0.05,
+    minTrades: 3,
+    maxDrawdownPct: 0.2,
+  };
+  const v33 = await invokeHandler(control.handler, {
+    method: 'POST',
+    body: { action: 'set-reward-settings', settings: v33Settings },
+  });
+  assert.equal(v33.res.statusCode, 200);
+  assert.equal(calls.updateRewardSettings, 3);
+  assert.deepEqual(calls.lastRewardSettings, v33Settings);
+  assert.deepEqual(v33.json.result.settings, v33Settings);
+  assert.equal(v33.json.result.effective.period, 'weekly');
+  assert.equal(v33.json.result.effective.basis, 'trading-performance');
+  assert.deepEqual(v33.json.result.effective.rankShares, [0.5, 0.3, 0.2]);
+
   const invalidBodies = [
     { action: 'set-reward-settings', settings: { period: 'hourly' } },
+    { action: 'set-reward-settings', settings: { basis: 'account-size' } },
+    { action: 'set-reward-settings', settings: { rankShares: [0.5, 0.3] } },
+    { action: 'set-reward-settings', settings: { rankShares: [0.5, 0.3, 0.6] } },
+    { action: 'set-reward-settings', settings: { rankShares: [0.5, 0.3, -0.01] } },
+    { action: 'set-reward-settings', settings: { rewardBudgetPctOfPool: 1.5 } },
+    { action: 'set-reward-settings', settings: { maxRewardPerAgentPctOfCapital: -0.1 } },
+    { action: 'set-reward-settings', settings: { minTradingProfitUsd: -1 } },
+    { action: 'set-reward-settings', settings: { minTrades: 2.5 } },
+    { action: 'set-reward-settings', settings: { maxDrawdownPct: 2 } },
     { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03] } },
     { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03, 0.6] } },
     { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03, -0.01] } },
@@ -2042,7 +2214,7 @@ test('POST /automaton/control validates and applies reward settings', async () =
     assert.equal(bad.res.statusCode, 400, `expected 400 for ${JSON.stringify(body)}`);
     assert.equal(bad.json.error.code, 'INVALID_SETTINGS');
   }
-  assert.equal(calls.updateRewardSettings, 2, 'invalid settings never reach the engine');
+  assert.equal(calls.updateRewardSettings, 3, 'invalid settings never reach the engine');
   fake.disposeAll();
 });
 
@@ -3520,13 +3692,32 @@ test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', as
     assert.equal(emptyChart.deltaUsd, null);
 
     // ---- KPI cards (live + state-only fallback) ----
+    // v3.3: total equity is its own card (never labelled P&L); trading P&L and
+    // rewards distributed are separate cards.
     const cards = helpers.kpiCards(state, view);
-    assert.equal(cards.length, 8);
-    assert.deepEqual(cards.map((card) => card.key), ['equity', 'dayPnl', 'cashBp', 'exposure', 'population', 'tradesToday', 'winRate', 'treasury']);
+    assert.equal(cards.length, 10);
+    assert.deepEqual(cards.map((card) => card.key), [
+      'equity',
+      'tradingPnl',
+      'dayPnl',
+      'rewards',
+      'cashBp',
+      'exposure',
+      'population',
+      'tradesToday',
+      'winRate',
+      'treasury',
+    ]);
     const equityCard = cards.find((card) => card.key === 'equity');
     assert.equal(equityCard.value, '$20,500.00');
-    assert.equal(equityCard.direction, 'up');
-    assert.equal(equityCard.deltaPct, 0.025);
+    assert.equal(equityCard.direction, 'flat', 'an equity delta must never be presented as P&L');
+    assert.equal(equityCard.deltaUsd, undefined);
+    assert.equal(equityCard.deltaPct, undefined);
+    const tradingCard = cards.find((card) => card.key === 'tradingPnl');
+    const expectedTradingTotal = Math.round(state.agents.reduce((total, agent) => total + (agent.equityUsd - agent.endowmentUsd), 0) * 100) / 100;
+    assert.equal(tradingCard.value, helpers.fmtSignedUsd(expectedTradingTotal));
+    const rewardsCard = cards.find((card) => card.key === 'rewards');
+    assert.equal(rewardsCard.value, '$2,100.00', 'lifetime rewards from the payout history ledger');
     assert.equal(cards.find((card) => card.key === 'dayPnl').direction, 'up');
     const cashCard = cards.find((card) => card.key === 'cashBp');
     assert.match(cashCard.value, /15,200/);
@@ -3536,7 +3727,7 @@ test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', as
     assert.match(cards.find((card) => card.key === 'winRate').value, /%$/);
     assert.equal(typeof cards.find((card) => card.key === 'treasury').value, 'string');
     const stateOnlyCards = helpers.kpiCards(state);
-    assert.equal(stateOnlyCards.length, 8);
+    assert.equal(stateOnlyCards.length, 10);
     assert.equal(stateOnlyCards.find((card) => card.key === 'equity').value, '$20,000.00');
     assert.deepEqual(helpers.kpiCards(null), []);
 
@@ -3576,7 +3767,7 @@ test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', as
     assert.equal(live.feedStatus, 'live');
     assert.equal(live.marketOpen, true);
     assert.equal(live.tape.length, 4);
-    assert.equal(live.kpis.length, 8);
+    assert.equal(live.kpis.length, 10);
     assert.equal(live.equity.hasData, true);
     assert.equal(live.mix.total, 30);
     assert.equal(live.agents.length, 30);
@@ -3588,7 +3779,7 @@ test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', as
     assert.equal(fallbackView.available, false);
     assert.equal(fallbackView.feedStatus, 'unavailable');
     assert.equal(fallbackView.tape.length, 0);
-    assert.equal(fallbackView.kpis.length, 8);
+    assert.equal(fallbackView.kpis.length, 10);
     assert.equal(fallbackView.equity.hasData, false);
     assert.equal(fallbackView.agents.length, 30);
     const emptyView = helpers.liveViewMapping(null, null);
@@ -3602,6 +3793,381 @@ test('pure data mapping: live market tape, KPIs, equity chart and 70/30 mix', as
     const unknownSession = helpers.marketSession({});
     assert.equal(unknownSession.labelKey, 'marketUnknown');
     assert.equal(unknownSession.available, false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v3.3 fair P&L + capital-only rewards (docs/FAIR-PNL-REWARDS.md §2/§5/§6/§8)
+// ---------------------------------------------------------------------------
+
+test('pure data mapping v3.3: trading P&L excludes reward capital (table + detail)', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV33StatusPayload();
+    const agents = status.agents;
+    const rows = helpers.buildAgentRows(status);
+    const winner = rows.find((row) => row.id === agents[0].id);
+    assert.ok(winner);
+
+    // The live-example agent: $106.86 equity, $78.56 contributed ($58.56 rewards).
+    assert.equal(winner.equityUsd, 106.86);
+    assert.equal(winner.tradingPnlUsd, -1.7);
+    assert.equal(winner.pnlUsd, -1.7, 'the table P&L column is trading P&L, not equity minus endowment');
+    assert.equal(winner.pnl.source, 'trading');
+    assert.equal(winner.pnl.legacy, false);
+    assert.equal(winner.pnl.tradingPct, -0.0216, 'the engine trading return is carried through');
+    assert.ok(Math.abs(winner.tradingPnlPct - -0.0216) < 1e-12);
+    assert.ok(Math.abs(winner.pnlPct - winner.tradingPnlPct * 100) < 1e-12);
+    assert.equal(winner.pnl.netUsd, -1.7, 'netUsd stays the legacy alias of tradingUsd');
+    assert.equal(winner.pnl.dayPct, 0.012);
+    assert.equal(winner.pnl.tradingRealizedUsd, -1);
+    assert.equal(winner.pnl.tradingUnrealizedUsd, -0.7);
+
+    // Rewards column: lifetime USD, never folded into P&L.
+    assert.equal(winner.rewardsUsd, 58.56);
+    assert.equal(winner.rewardCount, 2);
+    assert.equal(winner.lastRewardAt, '2025-11-08T00:00:00.000Z');
+
+    // Detail P&L breakdown fields.
+    const breakdown = winner.capitalBreakdown;
+    assert.equal(breakdown.available, true);
+    assert.equal(breakdown.fair, true);
+    assert.equal(breakdown.legacy, false);
+    assert.equal(breakdown.equityUsd, 106.86);
+    assert.equal(breakdown.contributedUsd, 78.56);
+    assert.equal(breakdown.baseUsd, 20);
+    assert.equal(breakdown.rewardCapitalUsd, 58.56);
+    assert.equal(breakdown.rewardSharePct, 74.54, 'engine percent points are kept as a percentage');
+    assert.equal(breakdown.capitalVersion, 2);
+    assert.equal(breakdown.tradingPnlUsd, -1.7);
+    assert.ok(Math.abs(breakdown.returnOnCapitalPct - (-1.7 / 78.56)) < 1e-12, 'return on capital = trading P&L / contributed capital');
+    assert.equal(breakdown.rewardsLifetimeUsd, 58.56);
+    assert.equal(breakdown.rewardCount, 2);
+    assert.equal(breakdown.lastRewardAt, '2025-11-08T00:00:00.000Z');
+    assert.equal(helpers.capitalBreakdown({}).available, false);
+
+    // Detail reward-history rows: newest first, with rank/share/period trading data.
+    const history = winner.rewardHistory;
+    assert.equal(history.available, true);
+    assert.equal(history.empty, false);
+    assert.equal(history.rows.length, 2);
+    assert.equal(history.totalUsd, 58.56);
+    assert.equal(history.count, 2);
+    assert.equal(history.rows[0].periodKey, '2026-W45');
+    assert.equal(history.rows[0].rank, 1);
+    assert.equal(history.rows[0].amountUsd, 18);
+    assert.equal(history.rows[0].share, 0.5);
+    assert.equal(history.rows[0].periodTradingPnlUsd, 1.4);
+    assert.equal(history.rows[0].periodTradingPnlPct, 0.07);
+    assert.equal(history.rows[1].periodKey, '2026-W44');
+    const emptyHistory = helpers.agentRewardHistoryRows(null);
+    assert.equal(emptyHistory.empty, true);
+    assert.deepEqual(emptyHistory.rows, []);
+    assert.equal(emptyHistory.totalUsd, 0);
+
+    // Invariance: a bigger reward payout raises equity, capital and lifetime rewards
+    // together — trading P&L must not move.
+    const moreRewarded = JSON.parse(JSON.stringify(agents[0]));
+    moreRewarded.equityUsd = 136.86;
+    moreRewarded.cashUsd = 136.86;
+    moreRewarded.capital.contributedUsd = 108.56;
+    moreRewarded.capital.rewardCapitalUsd = 88.56;
+    moreRewarded.capital.rewardSharePct = 81.58;
+    moreRewarded.pnl.rewardsUsd = 88.56;
+    moreRewarded.rewards.lifetimeUsd = 88.56;
+    const moreRow = helpers.buildAgentRows({ ...status, agents: [moreRewarded] })[0];
+    assert.equal(moreRow.equityUsd, 136.86);
+    assert.equal(moreRow.tradingPnlUsd, -1.7, 'reward capital never counts as profit');
+    assert.equal(moreRow.rewardsUsd, 88.56);
+
+    // agentPnlView is total: defensive on empty input, explicit trading pct kept.
+    const view = helpers.agentPnlView(agents[0]);
+    assert.equal(view.tradingUsd, -1.7);
+    assert.equal(view.tradingPct, -0.0216);
+    assert.equal(view.tradingPctPoints, -2.16);
+    assert.equal(view.netUsd, -1.7);
+    assert.equal(helpers.agentPnlView({}).tradingUsd, null);
+
+    // ---- legacy snapshot fallback (no capital accounting yet) ----
+    const legacyStatus = buildStatusPayload({ running: true });
+    const legacyRows = helpers.buildAgentRows(legacyStatus);
+    const legacyAlive = legacyRows.find((row) => row.status === 'alive' && row.rewardsUsd === null);
+    assert.ok(legacyAlive, 'an unrewarded legacy agent has a null rewards column');
+    assert.equal(legacyAlive.pnlSource, 'legacy');
+    assert.equal(legacyAlive.pnl.legacy, true);
+    assert.equal(
+      legacyAlive.tradingPnlUsd,
+      Math.round((legacyAlive.equityUsd - legacyAlive.endowmentUsd) * 100) / 100,
+      'legacy fallback keeps the v3.2 equity − endowment basis until the engine migrates',
+    );
+    assert.equal(legacyAlive.capitalBreakdown.available, false);
+    assert.equal(legacyAlive.capitalBreakdown.fair, false);
+    assert.equal(legacyAlive.capitalBreakdown.contributedUsd, ENDOWMENT_USD);
+    assert.equal(legacyAlive.capitalBreakdown.rewardCapitalUsd, null);
+    // The lifetime-rewards column still works on old snapshots: derive it from the
+    // top-level payout history.
+    const legacyRewarded = legacyRows.find((row) => row.id === legacyStatus.agents[0].id);
+    assert.equal(legacyRewarded.rewardsUsd, 750);
+    assert.equal(legacyRewarded.rewardCount, 1);
+    assert.equal(legacyRewarded.rewardHistory.rows.length, 1);
+    assert.equal(legacyRewarded.rewardHistory.totalUsd, 750);
+
+    // ---- table mapping: Trading P&L column + Rewards column (tooltips), sortable ----
+    const pnlColumn = helpers.TABLE_COLUMNS.find((column) => column.key === 'pnlUsd');
+    assert.equal(pnlColumn.labelKey, 'tradingPnl');
+    assert.equal(pnlColumn.hintKey, 'pnlTradingHint');
+    const rewardsColumn = helpers.TABLE_COLUMNS.find((column) => column.key === 'rewardsUsd');
+    assert.equal(rewardsColumn.labelKey, 'rewardsLifetime');
+    assert.equal(helpers.SORTABLE_KEYS.has('rewardsUsd'), true);
+    assert.equal(helpers.TABLE_COLUMNS.some((column) => column.key === 'equityUsd' && column.labelKey === 'totalEquity'), true);
+
+    // No secret material can leak through the built rows (state never carries keys).
+    const serialized = JSON.stringify(rows);
+    assert.equal(serialized.includes(SECRET), false);
+    assert.equal(serialized.includes(SECRET_TWO), false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping v3.3: reward rules, budget, eligibility and settings patch', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV33StatusPayload();
+    const agents = status.agents;
+
+    // ---- resolved rules ----
+    const rules = helpers.rewardRuleSummary(status);
+    assert.equal(rules.reported, true);
+    assert.equal(rules.legacy, false);
+    assert.equal(rules.enabled, true);
+    assert.equal(rules.period, 'weekly');
+    assert.equal(rules.basis, 'trading-performance');
+    assert.deepEqual(rules.rankShares, [0.5, 0.3, 0.2]);
+    assert.equal(rules.rewardBudgetPctOfPool, 0.1);
+    assert.equal(rules.maxRewardPerAgentPctOfCapital, 0.5);
+    assert.equal(rules.minTradingProfitUsd, 0.05);
+    assert.equal(rules.minTrades, 3);
+    assert.equal(rules.maxDrawdownPct, 0.2);
+    assert.equal(rules.poolUsd, 400);
+    assert.equal(rules.budgetUsd, 40, 'budget = 10% of the available pool');
+    assert.equal(rules.lifetimeTotalUsd, 58.56);
+    assert.equal(rules.explain.length, 1);
+
+    // Recommended defaults when the engine reports no rules at all, and the
+    // deprecated legacy settings are flagged rather than silently trusted.
+    const bareRules = helpers.rewardRuleSummary({});
+    assert.equal(bareRules.reported, false);
+    assert.equal(bareRules.basis, 'trading-performance');
+    assert.deepEqual(bareRules.rankShares, [0.5, 0.3, 0.2]);
+    assert.equal(bareRules.minTradingProfitUsd, 0.05);
+    assert.equal(bareRules.minTrades, 3);
+    assert.equal(bareRules.maxDrawdownPct, 0.2);
+    assert.equal(bareRules.budgetUsd, null);
+    const legacyRules = helpers.rewardRuleSummary(buildStatusPayload({ running: true }));
+    assert.equal(legacyRules.reported, false);
+    assert.equal(legacyRules.basis, 'account-cash');
+    assert.equal(legacyRules.legacyBasis, true);
+    assert.equal(legacyRules.period, 'daily');
+    assert.equal(legacyRules.budgetUsd, 400, 'pool × default 10% is used for the legacy preview');
+
+    // ---- period payout history: budget + budget share + period trading data ----
+    const payoutRows = helpers.rewardHistoryRows(status);
+    assert.equal(payoutRows.length, 1);
+    assert.equal(payoutRows[0].periodKey, '2026-W45');
+    assert.equal(payoutRows[0].basis, 'trading-performance');
+    assert.equal(payoutRows[0].budgetUsd, 40);
+    assert.equal(payoutRows[0].totalUsd, 18);
+    assert.equal(payoutRows[0].winners[0].share, 0.5);
+    assert.equal(payoutRows[0].winners[0].periodTradingPnlUsd, 1.4);
+    assert.equal(payoutRows[0].winners[0].periodTradingPnlPct, 0.07);
+
+    // ---- eligibility: ranked trading-performance candidates with reasons ----
+    const eligibility = helpers.rewardsEligibility(status);
+    assert.equal(eligibility.period, 'weekly');
+    assert.equal(eligibility.basis, 'trading-performance');
+    assert.equal(eligibility.disabled, false);
+    assert.equal(eligibility.poolUsd, 400);
+    assert.equal(eligibility.budgetUsd, 40);
+    assert.equal(eligibility.candidateCount, 6);
+    assert.equal(eligibility.eligibleCount, 2);
+    const ranked = eligibility.eligible;
+    assert.deepEqual(ranked.map((candidate) => candidate.agentId), [agents[5].id, agents[0].id], 'ranked by period trading return');
+    assert.equal(ranked[0].eligibleRank, 1);
+    assert.equal(ranked[0].tradingPnlPct, 0.12);
+    assert.equal(ranked[0].tradingPnlUsd, 2.4);
+    assert.equal(ranked[0].trades, 8);
+    assert.equal(ranked[0].projectedUsd, 20, 'top rank receives 50% of the $40 budget');
+    assert.equal(ranked[1].projectedUsd, 12, 'second rank receives 30% of the $40 budget');
+    const reasons = Object.fromEntries(eligibility.ineligible.map((candidate) => [candidate.agentId, candidate.reasonKey]));
+    assert.equal(reasons[agents[1].id], 'rewardBelowProfit');
+    assert.equal(reasons[agents[2].id], 'rewardNotPositive');
+    assert.equal(reasons[agents[3].id], 'rewardTooFewTrades');
+    assert.equal(reasons[agents[4].id], 'rewardDrawdown');
+    assert.equal(eligibility.candidates[0].reasonKey, 'rewardEligible');
+
+    // Disabled rules and zero budget block every candidate with an explicit reason.
+    const disabledStatus = buildV33StatusPayload();
+    disabledStatus.engine.rewards.rules.enabled = false;
+    const disabledEligibility = helpers.rewardsEligibility(disabledStatus);
+    assert.equal(disabledEligibility.disabled, true);
+    assert.equal(disabledEligibility.eligibleCount, 0);
+    assert.equal(disabledEligibility.candidates.every((candidate) => candidate.reasonKey === 'rewardDisabled'), true);
+    const noBudgetStatus = buildV33StatusPayload();
+    noBudgetStatus.engine.rewards.budgetUsd = 0;
+    delete noBudgetStatus.engine.rewards.poolUsd;
+    noBudgetStatus.engine.rewards.rules.rewardBudgetPctOfPool = 0;
+    const noBudgetEligibility = helpers.rewardsEligibility(noBudgetStatus);
+    assert.equal(noBudgetEligibility.eligibleCount, 0);
+    assert.equal(noBudgetEligibility.candidates.every((candidate) => candidate.reasonKey === 'rewardNoBudget'), true);
+
+    // Legacy rankings have no measured trading baseline → no fabricated winners.
+    const legacyEligibility = helpers.rewardsEligibility(buildStatusPayload({ running: true }));
+    assert.equal(legacyEligibility.eligibleCount, 0);
+    assert.ok(legacyEligibility.candidateCount > 0);
+    assert.equal(legacyEligibility.candidates.every((candidate) => candidate.reasonKey === 'rewardNoBaseline'), true);
+    const emptyEligibility = helpers.rewardsEligibility({});
+    assert.deepEqual(emptyEligibility.candidates, []);
+    assert.equal(emptyEligibility.eligibleCount, 0);
+
+    // ---- settings patch: new v3.3 field names only ----
+    const patch = helpers.rewardSettingsPatch({
+      enabled: true,
+      period: 'weekly',
+      rankShares: [0.5, 0.3, 0.2],
+      rewardBudgetPctOfPool: 0.1,
+      maxPerPeriodUsd: null,
+      maxRewardPerAgentPctOfCapital: 0.5,
+      minTradingProfitUsd: 0.05,
+      minTrades: 3,
+      maxDrawdownPct: 0.2,
+    });
+    assert.deepEqual(patch, {
+      enabled: true,
+      period: 'weekly',
+      rankShares: [0.5, 0.3, 0.2],
+      rewardBudgetPctOfPool: 0.1,
+      maxRewardPerAgentPctOfCapital: 0.5,
+      maxDrawdownPct: 0.2,
+      minTradingProfitUsd: 0.05,
+      minTrades: 3,
+      maxPerPeriodUsd: null,
+    });
+    assert.equal('rankPercents' in patch, false, 'deprecated rankPercents are never sent');
+    assert.equal(helpers.rewardSettingsPatch({}), null);
+    assert.equal(helpers.rewardSettingsPatch({ period: 'hourly' }), null);
+    assert.equal(helpers.rewardSettingsPatch({ rankShares: [0.5, 0.6, 0.2] }), null, 'shares must sum to at most 100%');
+    assert.deepEqual(helpers.rewardSettingsPatch({ maxPerPeriodUsd: 250 }), { maxPerPeriodUsd: 250 });
+    assert.deepEqual(helpers.rewardSettingsPatch({ maxPerPeriodUsd: null }), { maxPerPeriodUsd: null });
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping v3.3: KPI equity/P&L separation, trading day rows and leaderboards', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV33StatusPayload();
+    const baseView = buildMarketViewPayload();
+    const view = buildMarketViewPayload({
+      portfolio: {
+        ...baseView.portfolio,
+        dayPnlUsd: 500,
+        dayPnlPct: 0.025,
+        tradingDayPnlUsd: 123.45,
+        tradingDayPnlPct: 0.006,
+      },
+      agents: [
+        {
+          id: status.agents[0].id,
+          name: status.agents[0].name,
+          equityUsd: 106.86,
+          dayPnlPct: 2,
+          tradingDayPct: 1.2,
+          tradingDayPnlUsd: 0.9,
+          tradingPnlUsd: -1.7,
+          positions: [],
+          stance: 'trade',
+        },
+      ],
+    });
+
+    // ---- KPI cards: total equity, trading P&L, day trading P&L, lifetime rewards ----
+    const cards = helpers.kpiCards(status, view);
+    const byKey = Object.fromEntries(cards.map((card) => [card.key, card]));
+    assert.equal(byKey.equity.value, '$20,500.00', 'live total equity');
+    assert.equal(byKey.equity.labelKey, 'totalEquity');
+    assert.equal(byKey.equity.direction, 'flat');
+    assert.equal(byKey.tradingPnl.labelKey, 'kpiTradingPnl');
+    assert.equal(byKey.tradingPnl.value, helpers.fmtSignedUsd(-1.05), 'engine capitalAccounting trading P&L total');
+    assert.equal(byKey.dayPnl.value, '+$123.45 (+0.6%)', 'day card uses trading P&L, not portfolio.dayPnlUsd');
+    assert.equal(byKey.dayPnl.direction, 'up');
+    assert.equal(byKey.rewards.labelKey, 'kpiRewards');
+    assert.equal(byKey.rewards.value, '$58.56');
+    assert.equal(byKey.rewards.detail, '1');
+    assert.equal(byKey.equity.deltaUsd, undefined);
+    assert.equal(byKey.equity.deltaPct, undefined);
+
+    // ---- live agent rows: live equity total + trading day pct ----
+    const rows = helpers.agentTableRows(status, view);
+    const liveWinner = rows.find((row) => row.id === status.agents[0].id);
+    assert.equal(liveWinner.live, true);
+    assert.equal(liveWinner.liveEquityUsd, 106.86);
+    assert.equal(liveWinner.liveDayPnlPct, 1.2, 'live day P&L uses the trading day pct');
+    assert.equal(liveWinner.liveDayPnlUsd, 0.9);
+    assert.equal(liveWinner.liveTradingPnlUsd, -1.7);
+    assert.equal(liveWinner.liveDirection, 'up');
+
+    // ---- leaderboards carry the trading fields ----
+    const periods = helpers.leaderboardPeriods(status);
+    const top = periods.weekly[0];
+    assert.equal(top.agentId, status.agents[5].id);
+    assert.equal(top.pnlPct, 0.12, 'leaderboards rank on trading returns');
+    assert.equal(top.pnlUsd, 2.4);
+    assert.equal(top.tradingPnlPct, 0.12);
+    assert.equal(top.tradingPnlUsd, 2.4);
+    assert.equal(top.trades, 8, 'periodTrades preferred over the lifetime trade count');
+    assert.equal(top.baselineCapitalUsd, 100);
+
+    // ---- portfolio totals: engine capital accounting first ----
+    const totals = helpers.portfolioPnlTotals(status);
+    assert.equal(totals.available, true);
+    assert.equal(totals.capitalVersion, 2);
+    assert.equal(totals.migrationMarker, 'capital-v33.json');
+    assert.equal(totals.tradingPnlTotalUsd, -1.05);
+    assert.equal(totals.rewardsLifetimeTotalUsd, 58.56);
+    assert.equal(totals.rewardedAgents, 1);
+    const legacyTotals = helpers.portfolioPnlTotals(buildStatusPayload({ running: true }));
+    assert.equal(legacyTotals.capitalVersion, null);
+    assert.equal(legacyTotals.rewardsLifetimeTotalUsd, 2100, 'legacy totals fall back to the payout-history ledger');
+    assert.equal(typeof legacyTotals.tradingPnlTotalUsd, 'number');
+    assert.equal(helpers.summarize(status).pnlTotals.tradingPnlTotalUsd, -1.05);
+    assert.equal(helpers.summarize(status).capitalAccounting.version, 2);
+
+    // ---- KPI fallback on an old state snapshot (no live market view) ----
+    const legacyCards = helpers.kpiCards(buildStatusPayload({ running: true }));
+    assert.equal(legacyCards.length, 10);
+    assert.equal(legacyCards.find((card) => card.key === 'rewards').value, '$2,100.00');
+    assert.equal(legacyCards.find((card) => card.key === 'dayPnl').value, '—', 'no live market view → no day P&L');
+
+    // State-only day P&L falls back to the day leaderboard's trading P&L (never equity).
+    const stateOnlyStatus = buildV33StatusPayload();
+    stateOnlyStatus.rankings.periods.daily = [
+      { agentId: status.agents[0].id, name: status.agents[0].name, rank: 1, tradingPnlUsd: 0.6, tradingPnlPct: 0.03, baselineCapitalUsd: 20 },
+      { agentId: status.agents[1].id, name: status.agents[1].name, rank: 2, tradingPnlUsd: -0.1, tradingPnlPct: -0.005, baselineCapitalUsd: 20 },
+    ];
+    const stateOnlyDay = helpers.kpiCards(stateOnlyStatus).find((card) => card.key === 'dayPnl');
+    assert.equal(stateOnlyDay.value, '+$0.50 (+1.3%)');
+
+    // No secret material below the KPI/rows mapping.
+    const serialized = JSON.stringify([cards, rows, periods, totals]);
+    assert.equal(serialized.includes(SECRET), false);
+    assert.equal(serialized.includes(SECRET_TWO), false);
   } finally {
     loaded.restore();
   }

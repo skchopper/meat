@@ -51,8 +51,10 @@ import { createBroker as createSimBroker } from '../src/broker-sim.js';
 import { createBrakes } from '../src/brakes.js';
 import { createExecutor } from '../src/executor.js';
 import { createRegistry } from '../src/registry.js';
-import { createLedger } from '../src/ledger.js';
+import { createLedger, TREASURY_ID } from '../src/ledger.js';
 import { createJournal } from '../src/journal.js';
+import { createRankings } from '../src/rankings.js';
+import { createRewards } from '../src/rewards.js';
 import * as registryModule from '../src/registry.js';
 import { createReplicator, MUTABLE_FIELDS } from '../src/replicator.js';
 import { createReaper } from '../src/reaper.js';
@@ -2284,5 +2286,225 @@ describe('v3.2 analytics route: GET /automaton/market is loopback-only, read-onl
     assert.equal(MARKET_PATH, '/automaton/market');
     assert.equal(TOOL_NAMES.length, 10);
     assert.equal(TOOL_NAMES.includes('automaton_market'), false);
+  });
+});
+
+// ===========================================================================
+// M. v3.3 performance rewards: virtual capital only, no new transfer surface
+// ===========================================================================
+
+describe('v3.3 performance rewards stay virtual: no broker transfer/order surface, no new tools', () => {
+  const REWARD_WINNER = Object.freeze({
+    rank: 1,
+    agentId: 'atm-reward',
+    name: 'Breakout AAPL',
+    tradingPnlUsd: 10.5,
+    baselineTradingPlUsd: 0,
+    tradingPnlPct: 0.035,
+    capitalUsd: 300,
+    baselineCapitalUsd: 300,
+    periodTrades: 5,
+  });
+
+  function makeRewardEnv() {
+    const env = makeEnv({ mode: 'sim', population: { initial: 0, cap: 2 } });
+    const clock = makeClock(Date.UTC(2026, 10, 18, 15, 0, 0)); // Wed 2026-W47
+    return { env, clock };
+  }
+
+  it('rewards.js has no broker/network path: the only payout is a virtual ledger transfer', () => {
+    const source = fs.readFileSync(path.join(PKG_ROOT, 'src', 'rewards.js'), 'utf8');
+    for (const banned of [
+      'broker-alpaca.js', 'broker-sim.js', 'executor.js', 'engine.js', 'reaper.js',
+      'node:http', 'node:https', 'node:net', 'node:child_process', 'node:dgram',
+    ]) {
+      assert.equal(source.includes(banned), false, `rewards.js must not depend on ${banned}`);
+    }
+    assert.equal(/\bfetch\s*\(/.test(source), false, 'rewards.js must never perform network I/O');
+    assert.match(source, /ledger\.transfer\(TREASURY_ID/, 'the payout path is ledger.transfer from the treasury');
+    assert.equal(TOOL_NAMES.some((name) => /reward|payout|transfer|capital/i.test(name)), false, 'no tool can pay a reward');
+    assert.equal(TOOL_NAMES.length, 10);
+  });
+
+  it('a reward payout only calls the virtual ledger: no order, transfer or broker write happens', async () => {
+    const { env, clock } = makeRewardEnv();
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent(TREASURY_ID, { endowmentUsd: 0 });
+    ledger.grant(TREASURY_ID, 1000, { reason: 'pool-anchor' });
+    ledger.ensureAgent('atm-reward', { endowmentUsd: 300, at: clock.now() });
+    ledger.grant('atm-reward', 300, { reason: 'genesis-endowment', at: clock.now() });
+    const poolBefore = ledger.pool();
+    const rewards = createRewards({ paths: env.paths, config: { ...env.config, rewards: { maxPerPeriodUsd: 100 } }, clock });
+    await rewards.load();
+    const calls = [];
+    const spyLedger = new Proxy(ledger, {
+      get(target, property) {
+        const value = target[property];
+        if (typeof value !== 'function') return value;
+        return (...args) => {
+          calls.push(String(property));
+          return value.apply(target, args);
+        };
+      },
+    });
+    const result = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [REWARD_WINNER] } },
+      poolUsd: 1000,
+      ledger: spyLedger,
+    });
+    assert.equal(result.applied, true);
+    assert.equal(result.winners.length, 1);
+    assert.equal(result.winners[0].amountUsd, 50, '50% share of the $100 budget');
+    assert.equal(calls.filter((name) => name === 'transfer').length, 1, 'exactly one economy write');
+    assert.equal(calls.every((name) => name === 'transfer'), true, `only ledger.transfer may be called, got ${calls.join(',')}`);
+    const poolAfter = ledger.pool();
+    assert.equal(poolAfter.totalUsd, poolBefore.totalUsd, 'reward transfers move virtual cash, they never create it');
+    assert.equal(ledger.equity('atm-reward', {}).rewardCapitalUsd, 50, 'the payout is reward capital');
+    assert.equal(ledger.equity('atm-reward', {}).tradingPnlUsd, 0, 'the payout is not trading profit');
+  });
+
+  it('a payout leaves the broker account and its positions untouched (no broker write surface)', async () => {
+    const { env, clock } = makeRewardEnv();
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const accountBefore = JSON.stringify(broker.getAccount());
+    assertNoForbiddenBrokerMethods(broker, 'broker-sim');
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent(TREASURY_ID, { endowmentUsd: 0 });
+    ledger.grant(TREASURY_ID, 1000, { reason: 'pool-anchor' });
+    ledger.ensureAgent('atm-reward', { endowmentUsd: 300, at: clock.now() });
+    ledger.grant('atm-reward', 300, { reason: 'genesis-endowment', at: clock.now() });
+    const rewards = createRewards({ paths: env.paths, config: { ...env.config, rewards: { maxPerPeriodUsd: 100 } }, clock });
+    await rewards.load();
+    const result = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [REWARD_WINNER] } },
+      poolUsd: 1000,
+      ledger,
+    });
+    assert.equal(result.winners.length, 1);
+    assert.equal(JSON.stringify(broker.getAccount()), accountBefore, 'a virtual reward must never touch the broker account');
+    const persisted = JSON.parse(fs.readFileSync(env.paths.rewardsFile, 'utf8'));
+    assert.equal(persisted.history.length, 1);
+    assert.equal(persisted.history[0].winners.length, 1);
+  });
+
+  it('reward history is whitelisted: persisted extra/credential-shaped fields never reach status or the tools', async () => {
+    const env = makeEnv({ mode: 'sim' });
+    const clock = makeClock(T0);
+    const secretMarker = 'AKIA-V33-REWARD-LEAK-71f2';
+    fs.mkdirSync(env.paths.stateDir, { recursive: true });
+    fs.writeFileSync(env.paths.rewardsFile, JSON.stringify({
+      version: 2,
+      lastPeriodKey: '2026-W47',
+      lastWinners: [{
+        rank: 1, agentId: 'atm-reward', name: 'Breakout AAPL', amountUsd: 50, share: 0.5,
+        periodTradingPnlUsd: 10.5, periodTradingPnlPct: 0.035, capitalUsd: 300, periodTrades: 5,
+        apiSecret: secretMarker, token: secretMarker,
+      }],
+      history: [{
+        period: 'weekly', periodKey: '2026-W47', at: '2026-11-20T20:00:00.000Z',
+        basis: 'trading-performance', budgetUsd: 100,
+        winners: [{
+          rank: 1, agentId: 'atm-reward', name: 'Breakout AAPL', amountUsd: 50, share: 0.5,
+          periodTradingPnlUsd: 10.5, periodTradingPnlPct: 0.035, capitalUsd: 300, periodTrades: 5,
+          apiSecret: secretMarker, credentials: { token: secretMarker },
+        }],
+      }],
+      lifetime: { 'atm-reward': 50 },
+      updatedAt: '2026-11-20T20:00:00.000Z',
+    }));
+    const rewards = createRewards({ paths: env.paths, config: env.config, clock });
+    await rewards.load();
+    const status = rewards.status();
+    assert.equal(JSON.stringify(status).includes(secretMarker), false, 'rewards.status() must not leak an unknown field');
+    assert.equal(JSON.stringify(rewards.getState()).includes(secretMarker), false, 'the normalized rewards state must drop unknown fields');
+    const historyState = rewards.getState().history;
+    assert.equal(historyState.length, 1);
+    const historyKeys = Object.keys(historyState[0].winners[0]).sort();
+    assert.deepEqual(historyKeys, [
+      'agentId', 'amountUsd', 'capitalUsd', 'name', 'periodTrades',
+      'periodTradingPnlPct', 'periodTradingPnlUsd', 'rank', 'share',
+    ], 'reward history winners are a documented whitelist');
+    const lastWinnerKeys = Object.keys(rewards.getState().lastWinners[0]).sort();
+    assert.deepEqual(lastWinnerKeys, [
+      'agentId', 'amountUsd', 'at', 'capitalUsd', 'name', 'periodKey', 'periodTrades',
+      'periodTradingPnlPct', 'periodTradingPnlUsd', 'rank', 'share',
+    ], 'lastWinners carry only the documented fields');
+    const agentRows = rewards.historyForAgent('atm-reward');
+    assert.equal(agentRows.length, 1);
+    assert.deepEqual(Object.keys(agentRows[0]).sort(), [
+      'amountUsd', 'at', 'capitalUsd', 'period', 'periodKey', 'periodTrades',
+      'periodTradingPnlPct', 'periodTradingPnlUsd', 'rank', 'share',
+    ]);
+
+    // The real orchestrator status built from that state dir must be secret-free too.
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const engineStatus = await automaton.status();
+    const text = JSON.stringify(engineStatus);
+    assert.equal(text.includes(secretMarker), false, 'automaton status leaked a reward-state field');
+    const rewardRows = engineStatus.agents?.[0]?.rewards?.history ?? [];
+    for (const row of rewardRows) {
+      assert.equal('apiSecret' in row, false);
+      assert.equal('credentials' in row, false);
+    }
+  });
+});
+
+// ===========================================================================
+// N. v3.3 market view: trading P&L fields are fair, fraction-scaled and secret-free
+// ===========================================================================
+
+describe('v3.3 market view exposes fair trading day P&L without credential leakage', () => {
+  it('portfolio day P&L is the per-agent trading sum, fraction-scaled, and never carries secrets', async () => {
+    const env = makeEnv({ mode: 'sim', population: { initial: 3, cap: 6 } });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const agents = automaton._internals.registry.alive();
+    clock.advance(5 * 60 * 1000);
+    await automaton.tick();
+    // Seed a real trading loss after the day baseline so the live day P&L is non-zero.
+    automaton._internals.ledger.applyFill(agents[0].id, { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100, at: clock.now() });
+    automaton._internals.ledger.applyFill(agents[0].id, { symbol: 'AAPL', side: 'sell', qty: 1, priceUsd: 90, at: clock.now() });
+    await automaton._internals.ledger.save();
+    clock.advance(5 * 60 * 1000);
+    await automaton.tick();
+
+    const envFile = path.join(env.dir, '.env');
+    fs.writeFileSync(envFile, `ALPACA_API_KEY_ID=${SECRET_KEY_ID}\nALPACA_API_SECRET_KEY=${SECRET_VALUE}\n`, 'utf8');
+    const engine = createEngine({
+      cwd: env.dir,
+      configFile: path.join(env.dir, 'no-such-config.json'),
+      envFile,
+      clock,
+      overrides: { stateDir: env.paths.stateDir, mode: 'sim', accountEquityUsd: 100000 },
+      brokerFactory: () => createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock }),
+    });
+    const view = await engine.marketView();
+    assert.equal(view.ok, true);
+    const payload = JSON.stringify(view);
+    for (const secret of [SECRET_KEY_ID, SECRET_VALUE]) {
+      assert.equal(payload.includes(secret), false, 'market view leaked credential material');
+    }
+    const portfolio = view.portfolio;
+    assert.equal(typeof portfolio.tradingDayPnlUsd, 'number');
+    assert.equal(typeof portfolio.tradingDayPnlPct, 'number');
+    assert.ok(Math.abs(portfolio.tradingDayPnlPct) < 1, `pct must be a fraction, got ${portfolio.tradingDayPnlPct}`);
+    assert.equal(portfolio.dayPnlUsd, portfolio.tradingDayPnlUsd, 'legacy alias is the fair trading P&L');
+    assert.equal(portfolio.dayPnlPct, portfolio.tradingDayPnlPct, 'legacy alias is the fair trading pct');
+    const dayUsd = view.agents.reduce((sum, agent) => sum + (Number(agent.tradingDayPnlUsd) || 0), 0);
+    assert.equal(portfolio.tradingDayPnlUsd, round2(dayUsd), 'portfolio day P&L is the per-agent trading sum');
+    const capital = view.agents.reduce((sum, agent) => sum + (Number(agent.capitalUsd) || 0), 0);
+    if (capital > 0) {
+      assert.equal(
+        portfolio.tradingDayPnlPct,
+        Math.round((portfolio.tradingDayPnlUsd / capital) * 1000000) / 1000000,
+        'portfolio pct = trading P&L / contributed capital (fraction)',
+      );
+    }
   });
 });

@@ -224,7 +224,18 @@ describe('control-panel status + leaderboards + rewards payouts', () => {
     config = tempConfig(dir, {
       population: { initial: 3, cap: 10 },
       research: { enabled: true, influence: false, intervalSec: 3600, staggerSec: 0 },
-      rewards: { enabled: true, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: 300 },
+      rewards: {
+        enabled: true,
+        period: 'daily',
+        basis: 'trading-performance',
+        rankShares: [0.5, 0.3, 0.2],
+        rewardBudgetPctOfPool: 0.1,
+        maxPerPeriodUsd: 300,
+        maxRewardPerAgentPctOfCapital: 0.5,
+        minTradingProfitUsd: 0.05,
+        minTrades: 3,
+        maxDrawdownPct: 0.2,
+      },
     });
     paths = statePaths(config);
     broker = createSimBroker(config, { seed: 11, accountEquityUsd: 100000 });
@@ -265,44 +276,82 @@ describe('control-panel status + leaderboards + rewards payouts', () => {
       assert.ok(status.rankings.periodKeys[period]);
     }
     assert.equal(status.engine.rewards.enabled, true);
-    assert.deepEqual(status.engine.rewards.rankPercents, [0.05, 0.03, 0.02]);
+    // v3.3: rewards are ranked on trading performance and paid as capital; the settings contract
+    // moved from rankPercents (percent of account cash) to rankShares (shares of the reward budget).
+    assert.equal(status.engine.rewards.basis, 'trading-performance');
+    assert.deepEqual(status.engine.rewards.rules.rankShares, [0.5, 0.3, 0.2]);
+    assert.equal(status.engine.rewards.rules.rewardBudgetPctOfPool, 0.1);
+    assert.ok(status.engine.rewards.budgetUsd >= 0);
+    assert.equal(status.engine.capitalAccounting.version, 2);
     assert.equal(status.engine.research.scheduleMode, 'interval');
     assert.ok(Array.isArray(status.engine.research.configurable.intervalOptionsSec));
     assert.deepEqual(status.engine.research.configurable.intervalOptionsSec, [3600, 10800, 21600, 86400]);
   });
 
-  it('pays the top-3 once when a period completes, capped and reconciling', async () => {
+  it('pays the top-3 once when a profitable period completes, as capital not P&L', async () => {
+    const { ledger } = automaton._internals;
+    const agents = automaton._internals.registry.alive();
+    const now = clock.now();
+    // Seed REAL trading P&L + round trips on every bot (ledger-only: two +$10 round trips each).
+    for (const agent of agents) {
+      for (let round = 0; round < 2; round += 1) {
+        ledger.applyFill(agent.id, { symbol: 'SPY', side: 'buy', qty: 1, priceUsd: 100, at: now + round * 2 });
+        ledger.applyFill(agent.id, { symbol: 'SPY', side: 'sell', qty: 1, priceUsd: 110, at: now + round * 2 + 1 });
+      }
+    }
+    await ledger.save();
+    // Record the end-of-period observation with the profitable trading marks (still inside day 1).
+    await automaton.tick();
     const before = await automaton.status();
     const poolBefore = before.engine.rewards.poolUsd;
-    const ledgerBefore = automaton._internals.ledger;
     const cashBefore = Object.fromEntries(before.agents.map((agent) => [agent.id, agent.cashUsd]));
+    const rewardsBefore = Object.fromEntries(before.agents.map((agent) => [agent.id, Number(agent.rewards?.lifetimeUsd) || 0]));
+    const rewardCapitalBefore = Object.fromEntries(before.agents.map((agent) => [agent.id, Number(agent.capital?.rewardCapitalUsd) || 0]));
     clock.advance(24 * HOUR); // cross the daily boundary
     const trace = await automaton.tick();
     assert.ok(trace.rewards && trace.rewards.winners.length === 3, JSON.stringify(trace.rewards));
+    assert.equal(trace.rewards.basis, 'trading-performance');
+    assert.ok(trace.rewards.budgetUsd > 0);
     const totalPaid = trace.rewards.winners.reduce((sum, winner) => sum + winner.amountUsd, 0);
-    assert.ok(Math.abs(totalPaid - 300) < 0.5, `maxPerPeriodUsd cap should bound the payout, got ${totalPaid}`);
+    assert.ok(totalPaid > 0 && totalPaid <= 300.01, `budget/per-agent caps should bound the payout, got ${totalPaid}`);
     const status = await automaton.status();
     assert.equal(status.engine.rewards.lastWinners.length, 3);
     assert.ok(status.engine.rewards.poolUsd < poolBefore + 1e-9);
     for (const winner of trace.rewards.winners) {
       assert.ok(status.agents.find((agent) => agent.id === winner.agentId));
       assert.ok(winner.amountUsd > 0);
+      // v3.3 fairness: the reward is REWARD CAPITAL, added to capital and lifetime rewards, and
+      // never booked as trading P&L.
+      const afterAgent = status.agents.find((agent) => agent.id === winner.agentId);
+      assert.ok(afterAgent.capital.rewardCapitalUsd >= rewardCapitalBefore[winner.agentId] + winner.amountUsd - 0.02);
+      assert.ok(afterAgent.rewards.lifetimeUsd >= rewardsBefore[winner.agentId] + winner.amountUsd - 0.02);
+      assert.ok((afterAgent.rewards.history ?? []).length >= 1);
     }
     const newCash = Object.fromEntries(status.agents.map((agent) => [agent.id, agent.cashUsd]));
     const increased = Object.keys(cashBefore).filter((id) => newCash[id] > cashBefore[id] + 1e-9);
     assert.ok(increased.length >= 1, 'at least one agent must have received a reward');
-    assert.ok(ledgerBefore.pool().poolUsd < poolBefore + 1e-9);
     // The next tick must not pay the same period again.
     const again = await automaton.tick();
     assert.equal((again.rewards?.winners ?? []).length, 0);
   });
 
   it('live reward settings apply immediately and are reflected in status', async () => {
-    const result = await automaton.updateRewardSettings({ period: 'weekly', rankPercents: [0.02, 0.01, 0.005], maxPerPeriodUsd: 50 });
+    const result = await automaton.updateRewardSettings({
+      period: 'weekly',
+      rankShares: [0.6, 0.25, 0.15],
+      rewardBudgetPctOfPool: 0.15,
+      minTradingProfitUsd: 0.1,
+      minTrades: 2,
+      maxDrawdownPct: 0.25,
+      maxPerPeriodUsd: 50,
+    });
     assert.equal(result.settings.period, 'weekly');
+    assert.deepEqual(result.settings.rankShares, [0.6, 0.25, 0.15]);
     const status = await automaton.status();
     assert.equal(status.engine.rewards.period, 'weekly');
-    assert.deepEqual(status.engine.rewards.rankPercents, [0.02, 0.01, 0.005]);
+    assert.deepEqual(status.engine.rewards.rules.rankShares, [0.6, 0.25, 0.15]);
+    assert.equal(status.engine.rewards.rules.rewardBudgetPctOfPool, 0.15);
+    assert.equal(status.engine.rewards.rules.minTrades, 2);
   });
 });
 

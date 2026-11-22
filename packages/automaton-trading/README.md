@@ -21,12 +21,13 @@ obituary the living read.
 | Control panel | `main` keyed panel `automaton-trading`: the full dashboard opened from the sidebar in the central column — header stats, operator controls, the 30-agent table, per-agent drill-down, generation rollup and obituary feed |
 | Settings page | Settings → Built-in plugins → **MEAT — Mortality Engineered Auto-Trading** (`settings.plugins.tab`): the same dashboard as a full page |
 | State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 5 s (auto-refresh with pause) |
-| Market route | `GET /automaton/market` — loopback-only, GET-only redacted live view from `engine.marketView()` (quotes, sparklines, portfolio, live agent P&L, equity history); soft 503 when the engine has no market view |
-| Live analytics dashboard | Google-Analytics-style UI: top bar (brand/mode/running/market clock/refresh/pause), KPI cards, inline-SVG equity chart + sparklines + 70/30 strategy mix, live market tape with up/down flash, filterable agent table with live P&L, and tabs Overview / Agents / Markets / Research / Rewards / Settings |
+| Market route | `GET /automaton/market` — loopback-only, GET-only redacted live view from `engine.marketView()` (quotes, sparklines, portfolio, live agent total equity + **trading day P&L**, equity history); soft 503 when the engine has no market view |
+| Live analytics dashboard | Google-Analytics-style UI: top bar (brand/mode/running/market clock/refresh/pause), KPI cards separating **total equity / trading P&L / rewards distributed**, inline-SVG equity chart + sparklines + 70/30 strategy mix, live market tape with up/down flash, filterable agent table with live trading P&L, and tabs Overview / Agents / Markets / Research / Rewards / Settings |
 | Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop and the research/reward settings actions) |
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
-| Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), winner rewards (period + 1st/2nd/3rd % of account cash + caps) and daily/weekly/monthly leaderboards, all applied through loopback-only control actions |
-| Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, day/week/month P&L |
+| Fair P&L + rewards (v3.3) | **Trading P&L = equity − capital contributed**: reward payouts are capital, never profit. Trading P&L + lifetime Rewards columns, P&L breakdown (capital contributed / reward capital / return on capital) and per-agent reward history, a Rewards tab with the trading-performance rules, ranked eligible candidates with reasons, payout history, and trading-P&L leaderboards. Authoritative contract: `docs/FAIR-PNL-REWARDS.md` |
+| Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), v3.3 winner rewards (period + trading-performance rules: min profit/trades/drawdown, 10% of pool budget, 50/30/20 rank shares, 50% per-agent capital cap + max per period) and daily/weekly/monthly trading-P&L leaderboards, all applied through loopback-only control actions |
+| Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, trading day/week/month P&L, P&L breakdown and reward history |
 | Strategy taxonomy | Per-bot **strategy type** + **estimated trading interval** columns, category tabs (All / Swing · mid-long / Day · intraday with counts) and category-coloured chips |
 | Per-bot agent brains | Each bot has its own agent brain (isolated per-bot reviews): a **Bot agent** section (stance, size/risk multipliers, confidence, thesis, plan, watch list, review count, last/next review, stale warning) plus a small engine-level bridge line |
 | Multi-instrument v3.0 | Margin, short selling, long options, defined-risk spreads and covered calls: LONG/SHORT/CALL/PUT position rendering (strike, expiry, DTE, contracts, spread group), per-bot Instruments badges, Instrument playbook, policy instrument plan, and an engine header instruments/exposure line |
@@ -51,9 +52,12 @@ Builder actually trades — it can differ from the genome, shown with a `≠` ma
 **Strategy type** chip (`Momentum swing` / `Mean-reversion swing` / `Intraday breakout` /
 `Day-trade gap fade`, colour-coded by category), the **Est. interval** (`~30s` / `~5m` /
 `~1h` …), a compact **Instruments** badge (`Stk` / `Short` / `Opt` / `Spreads` /
-`Margin`, tooltip lists the allowed structures), research badge, equity, USD/percent P&L,
-day P&L, net-7d, a runway bar, treasury state, alive/dead/condemned status plus cause, and
-a positions/trades count.
+`Margin`, tooltip lists the allowed structures), research badge, **Total equity**, and —
+separately — **Trading P&L** (lifetime $ and %, tooltip *"Trading P&L only — excludes
+reward capital"*) plus the **Rewards** column (lifetime rewards USD, never added into
+P&L), day trading %, a runway bar, treasury state, alive/dead/condemned status plus cause,
+and a positions/trades count. Equity and P&L are always separate columns: equity can rise
+when reward capital is paid in while trading P&L does not.
 
 Above the table, **category tabs** filter the population by strategy class:
 `All (n) / Swing · mid-long (n) / Day · intraday (n)` — counts come from
@@ -64,8 +68,15 @@ alive/dead filter, search and sorting.
 stacked below on narrow ones; `Esc` or the × closes it):
 
 - header: name, status, generation, born/died, cause, note, parent/mutation, equity,
-  cash, positions value, endowment, day/net-7d P&L, realized/unrealized P&L, runway,
-  drawdown, first-profit time, compiled-spec timestamp;
+  cash, positions value, endowment, trading P&L, lifetime rewards, day/net-7d P&L,
+  realized/unrealized P&L, runway, drawdown, first-profit time, compiled-spec timestamp;
+- **P&L breakdown** (v3.3): total equity, capital contributed, *of which reward capital*,
+  base capital, trading P&L ($ and capital return), return on capital, lifetime rewards,
+  reward count and last-reward date, with the explicit note *"Rewards are trading capital,
+  not profit — P&L counts trading only."*;
+- **Reward history** (v3.3): the agent's reward payouts newest-first — period key, date,
+  rank, reward USD, share of the period budget, the period trading P&L/return that earned
+  it — plus a lifetime totals row ("no rewards yet" empty state);
 - **Current holdings** table: LONG/SHORT stock and CALL/PUT option rows — side chip, qty
   (contracts for options), avg/premium, market value, unrealized P&L, option strike,
   expiry + DTE, spread-group tag, and a totals line with gross/net exposure and margin
@@ -84,7 +95,8 @@ stacked below on narrow ones; `Esc` or the × closes it):
 
 Plus:
 
-- **Sort** by clicking the Agent, Gen, Equity, P&L, Day %, Runway or Status headers.
+- **Sort** by clicking the Agent, Gen, Total equity, Trading P&L, Rewards, Day %, Runway
+  or Status headers.
 - **Filter** by category tabs (All / Swing · mid-long / Day · intraday with counts),
   status All / Alive / Dead (plus Condemned when any exist) and free-text search across
   name, id, symbol, family and parent name.
@@ -220,9 +232,12 @@ dependencies) while every existing control and detail view stays available:
 - **Top bar** — MEAT brand, paper/live badge, running/stopped + kill switch, live-feed
   pill, market session + local clock (1 s tick), **manual refresh**, auto-refresh
   pause/resume, and the unchanged Start / Stop / Emergency Stop controls underneath.
-- **KPI cards** — account equity with a live ▲/▼ delta, day P&L $/%, cash / buying
-  power, gross exposure (net in the sub-line), population alive/total, trades today,
-  win rate and treasury runway/state.
+- **KPI cards** — **total equity** (a size label only — never presented as P&L),
+  **Trading P&L** (lifetime, reward capital excluded), **Day P&L** (trading P&L $/%),
+  **Rewards distributed** (lifetime), cash / buying power, gross exposure (net in the
+  sub-line), population alive/total, trades today, win rate and treasury runway/state.
+  The equity card deliberately carries no delta: reward capital moves equity, so an
+  equity change is not a profit or a loss.
 - **Charts (inline SVG, hover tooltips)** — portfolio equity area chart from
   `equityHistory`, sparkline paths for the watchlist and per-agent trends, and a
   **Day vs Swing** mix with actual bars against the **70/30 target** (`targetDayPct`).
@@ -230,12 +245,15 @@ dependencies) while every existing control and detail view stays available:
   flash green/red on a price change, stale quotes are marked, and a closed market shows
   “market closed · last close”.
 - **Agents** — search, sort, status/category filters; basket, strategy type, stance
-  badges, live day P&L and sparkline; clicking a row opens the existing detail drawer
-  (holdings/transactions/plan/bot-agent/research/playbook/rankings) and the selection
-  persists across polling.
+  badges, **live total equity**, **live day trading P&L** (`tradingDayPct` when the engine
+  reports it), Trading P&L, Rewards and sparkline; clicking a row opens the existing
+  detail drawer (holdings/transactions/plan/bot-agent/research/playbook/rankings/P&L
+  breakdown/reward history) and the selection persists across polling.
 - **Tabs** — Overview (KPIs, charts, watchlist, agents), Agents, Markets (full tape +
   instruments/last-cycle diagnostics), Research (coverage + cadence control), Rewards
-  (rewards card + leaderboards) and Settings (operator controls, Reaper row, diagnostics).
+  (reward-rule summary, current pool/budget, ranked trading-performance candidates with
+  eligibility reasons, settings card, payout history, trading-P&L leaderboards) and
+  Settings (operator controls, Reaper row, diagnostics).
 - **Polling** — `GET /automaton/state` every **5 s** and `GET /automaton/market` every
   **2 s** while the tab is visible; the pause toggle stops both, a hidden tab pauses
   polling, manual refresh pulls both immediately, and timers/subscriptions are cleaned up.
@@ -244,13 +262,93 @@ dependencies) while every existing control and detail view stays available:
   and the tape show empty states instead of breaking.
 - **Pure helpers** (exported for tests): `marketTapeRows`, `kpiCards`,
   `equityChartPoints` / `sparklinePath`, `agentTableRows`, `strategyMixBreakdown`,
-  `marketSession`, `liveViewMapping`, `changeDirection` / `marketChangePctText`.
+  `marketSession`, `liveViewMapping`, `changeDirection` / `marketChangePctText`; v3.3 adds
+  `agentPnlView`, `capitalBreakdown`, `agentRewardHistoryRows`, `rewardsLedgerByAgent`,
+  `rewardRuleSummary`, `rewardsEligibility`, `rewardSettingsPatch`, `portfolioPnlTotals`,
+  `rewardHistoryRows` and `TABLE_COLUMNS` / `SORTABLE_KEYS`.
 
 `GET /automaton/market` is loopback-only, GET/HEAD only, redacted (never secrets), and
 delegates to `engine.marketView()`. A missing/failing engine view returns
 `503 {"ok":false,"error":{"code":"MARKET_UNAVAILABLE",…}}`; a non-loopback request gets
 `403 FORBIDDEN` and a non-GET method `405 METHOD_NOT_ALLOWED`. No new agent tools and no
 new control actions were added.
+
+### Fair trading P&L and capital-only rewards (v3.3)
+
+> Authoritative contract: [`docs/FAIR-PNL-REWARDS.md`](../../docs/FAIR-PNL-REWARDS.md).
+> In one sentence: **reward payouts are trading capital, not profit — every P&L number in
+> the UI counts trading results only, and total equity is always labelled separately.**
+
+v3.2 derived P&L as `equity − endowment` and ranked on equity, so a treasury→agent reward
+transfer instantly inflated "P&L", rank and the next reward. v3.3 tracks capital
+contributed separately from equity:
+
+| Term | Meaning in the UI |
+|---|---|
+| Total equity | cash + marked positions (already includes reward capital). Shown as `Equity`/`Total equity`, never as P&L. |
+| Capital contributed | base endowment + top-ups + credits + transfers in, including reward capital. |
+| Reward capital | subset of contributed capital that came from reward payouts (`agent.capital.rewardCapitalUsd`). |
+| **Trading P&L** | `equity − capital contributed`; reward transfers leave it unchanged. The table/detail/leaderboard/KPI P&L. |
+| Return on capital | `tradingPnlUsd / capitalContributionsUsd`. |
+| Lifetime rewards | sum of all reward payouts (`agent.rewards.lifetimeUsd`); shown in its own column/card, never added to P&L. |
+
+**Status fields consumed** (`GET /automaton/state`): each agent may carry
+`capital {contributedUsd, baseUsd, rewardCapitalUsd, rewardSharePct, capitalVersion}`,
+`pnl {tradingUsd, tradingPct, tradingRealizedUsd, tradingUnrealizedUsd, rewardsUsd,
+netUsd, dayPct, weekPct, monthPct}` (the pct fields are **trading** returns),
+`tradingPnlUsd` (top-level alias) and `rewards {lifetimeUsd, count, lastAt, history[]}`;
+`rankings` adds `tradingDayPct/tradingWeekPct/tradingMonthPct` and
+`tradingDayUsd/…`; `engine.rewards` adds `rules{enabled, period, basis,
+rankShares, rewardBudgetPctOfPool, maxPerPeriodUsd, maxRewardPerAgentPctOfCapital,
+minTradingProfitUsd, minTrades, maxDrawdownPct, explain[]}`, `budgetUsd`,
+`lifetimeTotalUsd`; `engine.capitalAccounting` carries
+`{version, migrationMarker, rewardedAgents, tradingPnlTotalUsd, rewardsLifetimeTotalUsd}`.
+
+**Agent table**: `Trading P&L` column = lifetime trading $ and % (of contributed capital;
+tooltip *"Trading P&L only — excludes reward capital"*), followed by a `Rewards (lifetime)`
+column. Equity stays its own column and sorts independently; the default sort is Trading
+P&L, and both columns are sortable. Live rows keep live ***total equity*** and show the
+live day return from `tradingDayPct` (never from an equity delta).
+
+**Agent detail** adds the **P&L breakdown** card (total equity, capital contributed, of
+which reward capital + share, base capital, trading P&L, return on capital, lifetime
+rewards, reward count, last-reward date, explicit "rewards are trading capital, not
+profit" note) and the **Reward history** table (period key, date, rank, reward USD, share
+of the period budget, that period's trading P&L/return, lifetime totals row — empty state
+"no rewards yet"). All previous detail sections are unchanged.
+
+**Rewards tab**:
+- **Reward rules** summary: basis `trading performance`, period, budget = `% of pool`
+  (default 10%), rank shares `50/30/20`, per-agent cap `50% of capital`, min trading
+  profit `$0.05`, min `3` trades, max drawdown `20%`, max per period; pool available,
+  next budget preview, lifetime distributed, and the engine's `rules.explain[]` list.
+- **Eligible candidates**, derived from the current period's trading ranking plus the
+  resolved rules: ranked by period trading return (tie-break trading P&L), each row shows
+  return %, trading P&L $, trades, drawdown, an eligibility **reason**
+  (`below min profit`, `not positive`, `too few trades`, `drawdown`, `no measured trading
+  baseline`, `no budget`, `disabled`) and the projected payout (budget share capped by
+  50% of capital). Clicking a candidate opens its detail.
+- **Settings card** now edits only the v3.3 rule fields (`rankShares`,
+  `rewardBudgetPctOfPool`, `maxPerPeriodUsd`, `maxRewardPerAgentPctOfCapital`,
+  `minTradingProfitUsd`, `minTrades`, `maxDrawdownPct`) and previews the budget from the
+  pool; the deprecated `rankPercents`/account-cash controls are gone.
+- Payout history (period key, date, budget, winners, total, lifetime row) and
+  **leaderboards labelled Trading P&L** (trading day/week/month % and $, period trades,
+  total equity as a separate column).
+
+**Reward eligibility** (server-side rules are authoritative): measured trading baseline;
+period trading profit `> $0.05`; period trading return `> 0`; `≥ 3` round trips; drawdown
+`≤ 20%`; then the top-3 receive `50/30/20 %` of the period budget (10% of the available
+pool, optionally capped by `maxPerPeriodUsd`), each capped at `50%` of that agent's
+contributed capital. Payouts are ledger capital contributions, so the *next* ranking and
+P&L are unaffected by the payout itself.
+
+**Legacy fallback**: when a snapshot predates v3.3 (no `capital`/`pnl.tradingUsd`/
+`rewards` fields), the UI renders the old equity-based P&L as an explicitly marked legacy
+fallback (`pnlSource: 'legacy'`, warning in the P&L breakdown), derives the lifetime-rewards
+column from the top-level payout history, and shows the recommended v3.3 rules with a
+"rules not reported yet" note instead of breaking. Once the engine migration
+(`capital-v33.json`) has run, the same panel renders fair trading P&L automatically.
 
 ### Research sidecar — isolated hourly analyst
 
@@ -298,22 +396,30 @@ One operator section sits above the agent table (all loopback-only, applied thro
   `After close`, `Before open + after close`, plus collection/influence toggles and
   **Apply** → `set-research-settings`. Shows the current schedule, `nextDueAt`,
   provider/model and paused reason. Cadence applies live (researcher reconfigure).
-- **Rewards** — enable toggle, period selector (daily/weekly/monthly), three percentage
-  inputs for 1st/2nd/3rd (default `5/3/2` of the broker account's **cash**), optional
-  max per period, a live preview (`5% × cash ≈ $…` with pool / allocation-cap / max
-  capping shown) and **Apply** → `set-reward-settings`. Below it: last winners and the
-  payout history (last 8 entries).
+- **Rewards** — enable toggle, period selector (daily/weekly/monthly), and the v3.3
+  trading-performance rules: rank shares (default `50/30/20`), budget % of pool
+  (default 10%), optional max per period, per-agent cap (% of capital, default 50%),
+  min trading profit, min trades and max drawdown. A live preview shows the pool, the
+  next budget (`pool × %`) and the per-rank amounts (before per-agent caps); **Apply** →
+  `set-reward-settings` sends only the v3.3 field names. Below it: last winners and the
+  payout history (period key, date, budget, winners, lifetime total; last 8 periods).
 - **Leaderboards** — Daily / Weekly / Monthly tabs from `status.rankings`
-  (rank / name / P&L% / P&L$ / equity / trades, 🥇🥈🥉 highlighted, as-of timestamp);
-  clicking a row opens that agent's detail pane.
+  (**Trading P&L % / Trading P&L $** — reward capital excluded — total equity, period
+  trades, 🥇🥈🥉 highlighted, as-of timestamp); clicking a row opens that agent's detail
+  pane.
 
-**Payout semantics:** rewards are **virtual ledger transfers** from the treasury pool
-(`__treasury__`) to agents — the Alpaca client still has no transfer/withdraw surface.
+**Payout semantics (v3.3):** rewards are **virtual ledger transfers** from the treasury
+pool (`__treasury__`) to agents — the Alpaca client still has no transfer/withdraw surface.
 They are paid **only at period boundaries** (no "pay now"), at most once per period key,
-as `rankPercent × account cash`, proportionally scaled down when the available pool, the
-remaining allocation cap, or `maxPerPeriodUsd` is smaller. `sum(agent equity) + pool`
+and only to agents with a measured trading baseline that passed the eligibility rules
+above. Allocation is **trading performance only** — period trading return first, trading
+P&L as tie-break — never equity or account size, so **reward capital cannot buy a better
+rank or a bigger next reward**. The payout is a **capital contribution**
+(`category:'reward'`): it raises the agent's equity, contributed capital and reward
+capital by the same amount and leaves trading P&L untouched. `sum(agent equity) + pool`
 stays constant, so reconciliation is unaffected; the rewards history keeps the last 50
-entries.
+periods. Legacy cash-based settings (`rankPercents`, `basis:'account-cash'`) are mapped
+away by the engine and flagged as deprecated in the panel.
 
 ### Agent detail: strategy & plan, transactions, rankings
 
@@ -328,7 +434,10 @@ adds:
   symbol, qty, price, notional, realized P&L and order id — empty state "no transactions
   yet".
 - **Ranking badges** for day/week/month ranks (medals for the top three) when
-  `agent.rankings` is present, plus day/week/month P&L when `agent.pnl` is present.
+  `agent.rankings` is present, plus the v3.3 **P&L breakdown** and **Reward history**
+  sections described above (trading day/week/month returns when `agent.pnl` is present).
+  Legacy snapshots without the v3.3 fields fall back to the equity-based values with an
+  explicit warning.
 
 ### `POST /automaton/control`
 
@@ -345,7 +454,7 @@ Content-Type: application/json
 {"action": "emergency-stop", "confirm": "STOP"}
 {"action": "reaper-stop", "confirm": "STOP"}
 {"action": "set-research-settings", "settings": {"mode": "interval", "intervalSec": 10800, "enabled": true, "influence": true}}
-{"action": "set-reward-settings", "settings": {"enabled": true, "period": "daily", "rankPercents": [0.05, 0.03, 0.02], "maxPerPeriodUsd": null}}
+{"action": "set-reward-settings", "settings": {"enabled": true, "period": "weekly", "basis": "trading-performance", "rankShares": [0.5, 0.3, 0.2], "rewardBudgetPctOfPool": 0.10, "maxPerPeriodUsd": null, "maxRewardPerAgentPctOfCapital": 0.50, "minTradingProfitUsd": 0.05, "minTrades": 3, "maxDrawdownPct": 0.20}}
 ```
 
 Settings actions are validated before they reach the engine (unknown keys and empty
@@ -354,7 +463,7 @@ patches are rejected):
 | Action | `settings` fields | Validation |
 |---|---|---|
 | `set-research-settings` | `mode`, `intervalSec`, `enabled`, `influence` | `mode` ∈ `interval` / `pre-open` / `post-close` / `pre-open+post-close`; `intervalSec` ∈ `3600` / `10800` / `21600` / `86400`; booleans for `enabled`/`influence` |
-| `set-reward-settings` | `enabled`, `period`, `rankPercents`, `maxPerPeriodUsd` | `period` ∈ `daily` / `weekly` / `monthly`; `rankPercents` exactly 3 numbers in `0..0.5`; `maxPerPeriodUsd` `null` or `0..1_000_000`; boolean `enabled` |
+| `set-reward-settings` | v3.3: `enabled`, `period`, `basis`, `rankShares`, `rewardBudgetPctOfPool`, `maxPerPeriodUsd`, `maxRewardPerAgentPctOfCapital`, `minTradingProfitUsd`, `minTrades`, `maxDrawdownPct` | `period` ∈ `daily` / `weekly` / `monthly`; `basis` = `trading-performance`; `rankShares` exactly 3 numbers that sum to ≤ 1; `rewardBudgetPctOfPool`/`maxRewardPerAgentPctOfCapital`/`maxDrawdownPct` in `0..1`; `maxPerPeriodUsd` `null` or `0..1_000_000`; boolean `enabled`. The deprecated `rankPercents` / `basis:'account-cash'` remain accepted only as legacy input mapped away by the engine — the dashboard never sends them |
 
 Success for both is `200 {"ok":true,"action":"…","result":{"settings":{…},"effective":{…}}}`.
 They delegate to `engine.updateResearchSettings(settings)` /
@@ -405,15 +514,18 @@ so the new client module + routes load), verify:
    appears instead when the Host has no LLM bridge. `GET /automaton/state` carries
    `engine.research` and `agents[].research`.
 8. Operator controls: the research cadence segmented control applies a new schedule
-   (`nextDueAt`/mode change in the panel), the rewards card previews 1st/2nd/3rd amounts
-   and saves them, and the leaderboards tabs show daily/weekly/monthly ranks (rows open
-   the agent detail). `POST /automaton/control` with
+   (`nextDueAt`/mode change in the panel), the rewards card previews the pool-based budget
+   and the 50/30/20 rank amounts and saves the v3.3 rule fields, and the leaderboards tabs
+   show daily/weekly/monthly trading-P&L ranks (rows open the agent detail).
+   `POST /automaton/control` with
    `{"action":"set-research-settings","settings":{"mode":"pre-open"}}` and
    `{"action":"set-reward-settings","settings":{"period":"weekly"}}` return
    `{"ok":true,"result":{"settings":…,"effective":…}}`.
 9. Agent detail: the "Strategy & plan" and "Transactions" sections render from
-   `agents[].plan` / `agents[].orders`, and day/week/month ranking badges show when
-   `agents[].rankings` exists.
+   `agents[].plan` / `agents[].orders`, day/week/month ranking badges show when
+   `agents[].rankings` exists, and the **P&L breakdown** + **Reward history** sections show
+   trading P&L, capital contributed/reward capital and every reward payout (or the
+   documented legacy warning on an old engine snapshot).
 10. Strategy taxonomy: the table shows a colour-coded **Strategy type** chip and an
     **Est. interval** for every bot; the category tabs show
     `All (30) / Swing · mid-long (n) / Day · intraday (n)` and filter the rows; the
@@ -440,12 +552,21 @@ so the new client module + routes load), verify:
     tooltip. With an older engine (no `lastCycle`/`effective`) the panel shows "no cycle
     data yet" and no warning.
 15. Live analytics: the dashboard has the top bar (brand/mode/running/feed pill/market
-    clock/manual refresh/pause), KPI cards, equity chart + strategy mix, a live market
-    tape that flashes green/red, and the six tabs; `GET /automaton/market` returns
+    clock/manual refresh/pause), KPI cards (total equity separate from trading P&L and
+    rewards distributed), equity chart + strategy mix, a live market tape that flashes
+    green/red, and the six tabs; `GET /automaton/market` returns
     `{ok:true,quotes,sparklines,portfolio,agents,equityHistory,…}` locally and 403 for a
     non-loopback caller. State polls every 5 s and the market feed every 2 s; pausing or
     hiding the tab stops both, and with an old engine (no `engine.marketView`) the panel
     shows "live feed unavailable — state-only" without breaking.
+16. Fair P&L: select the known rewarded agent (`$106.86` equity): the table/detail show
+    **Trading P&L −$1.70** (not `+$58.56`), the **Rewards** column/detail card show
+    `$58.56`, capital contributed shows `$78.56` (of which `$58.56` reward capital), and the
+    Rewards tab lists the rule summary (trading performance, `$0.05` min profit, `3` min
+    trades, `20%` max drawdown, `10%` of pool budget, `50/30/20` rank shares, `50%`
+    per-agent cap), the pool/budget, ranked candidates with reasons, payout history and
+    trading-P&L leaderboards. With an older engine the P&L falls back to equity − endowment
+    and is explicitly marked as a legacy snapshot.
 
 ## Configuration
 
@@ -528,11 +649,15 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
   `set-reward-settings` only call the engine's validated settings updaters. No dashboard
   surface can clear the kill switch, place an order, or change the engine configuration
   directly.
-- **Rewards are virtual ledger transfers.** Winner payouts move cash from the treasury
-  pool (`__treasury__`) to agents; the broker client still has no transfer/withdraw
-  surface (brake D1). Payouts happen only at period boundaries, at most once per period
-  key, and are capped by the available pool, the remaining allocation cap and
-  `maxPerPeriodUsd`; `sum(agent equity) + pool` stays constant so reconciliation is
+- **Rewards are virtual ledger transfers, and they are capital — not profit.** Winner
+  payouts move cash from the treasury pool (`__treasury__`) to agents; the broker client
+  still has no transfer/withdraw surface (brake D1). Payouts happen only at period
+  boundaries, at most once per period key, are paid **only on demonstrated trading
+  performance** (no negative-P&L, no-baseline or over-drawdown winners), and are capped by
+  the available pool, `rewardBudgetPctOfPool`, `maxPerPeriodUsd` and the per-agent
+  `maxRewardPerAgentPctOfCapital` cap. A payout increments the agent's capital
+  contributed and reward capital by the same amount and **never touches trading P&L or
+  reward ranking**; `sum(agent equity) + pool` stays constant so reconciliation is
   unaffected. The panel has no "pay now" action.
 - **Kill switch:** `automaton_emergency_stop` (tool or control panel) writes
   `<stateDir>/KILL_SWITCH`; every order and cycle is denied while the file exists, and
@@ -572,12 +697,15 @@ file in-process with `node test/plugin.test.js` or disable test isolation as sho
 
 Layout: `index.js` (Host tools + state/market/control routes + engine lifecycle +
 validator for research/reward settings + the operator-only Reaper stop helper; passes
-`rankings`, `strategyMix`, `instruments`, `rewards` and `engine.agents` through from the
-engine status, and proxies `engine.marketView()` on the market route), `client.js`
-(shared dashboard: sidebar entry + keyed `main` panel + settings page, live analytics
-components; names/genome-vs-spec/holdings/activity/research/cadence/rewards/leaderboards/
-plan/transactions/strategy-type/bot-agent-policy/instrument-positions/playbook/last-cycle/
-capability/market-tape/KPI/equity-chart/strategy-mix/live-view mapping are pure functions
-exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata), `icon.svg`,
-`test/plugin.test.js`, `src/**` (engine implemented by the core project).
+`rankings`, `strategyMix`, `instruments`, `rewards`, `engine.capitalAccounting` and
+`engine.agents` through from the engine status, and proxies `engine.marketView()` on the
+market route), `client.js` (shared dashboard: sidebar entry + keyed `main` panel + settings
+page, live analytics components; names/genome-vs-spec/holdings/activity/research/cadence/
+rewards/leaderboards/plan/transactions/strategy-type/bot-agent-policy/instrument-positions/
+playbook/last-cycle/capability/market-tape/KPI/equity-chart/strategy-mix/live-view mapping,
+plus the v3.3 `agentPnlView`/`capitalBreakdown`/`agentRewardHistoryRows`/
+`rewardsLedgerByAgent`/`rewardRuleSummary`/`rewardsEligibility`/`rewardSettingsPatch`/
+`portfolioPnlTotals` fair-P&L helpers, are pure functions exported as `helpers` for
+tests), `locale/{en,zh}.json` (plugin metadata), `icon.svg`, `test/plugin.test.js`,
+`src/**` (engine implemented by the core project).
 

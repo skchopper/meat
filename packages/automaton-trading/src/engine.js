@@ -684,10 +684,62 @@ export function createEngine(options = {}) {
       }
       patch.period = settings.period;
     }
+    if (settings.basis !== undefined) {
+      if (!['trading-performance', 'account-cash'].includes(settings.basis)) {
+        throw operatorError('rewards.basis must be "trading-performance"');
+      }
+      patch.basis = settings.basis;
+    }
+    if (settings.rankShares !== undefined) {
+      const shares = settings.rankShares;
+      const sum = Array.isArray(shares) ? shares.reduce((total, value) => total + Number(value), 0) : NaN;
+      if (!Array.isArray(shares) || shares.length !== 3
+        || shares.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 1)
+        || sum > 1.000001) {
+        throw operatorError('rewards.rankShares must be exactly 3 numbers between 0 and 1 summing to at most 1');
+      }
+      patch.rankShares = shares.map((value) => Number(value));
+    }
+    if (settings.rewardBudgetPctOfPool !== undefined) {
+      const value = Number(settings.rewardBudgetPctOfPool);
+      if (!Number.isFinite(value) || value < 0 || value > 1) {
+        throw operatorError('rewards.rewardBudgetPctOfPool must be a number between 0 and 1');
+      }
+      patch.rewardBudgetPctOfPool = value;
+    }
+    if (settings.maxRewardPerAgentPctOfCapital !== undefined) {
+      const value = Number(settings.maxRewardPerAgentPctOfCapital);
+      if (!Number.isFinite(value) || value < 0 || value > 1) {
+        throw operatorError('rewards.maxRewardPerAgentPctOfCapital must be a number between 0 and 1');
+      }
+      patch.maxRewardPerAgentPctOfCapital = value;
+    }
+    if (settings.minTradingProfitUsd !== undefined) {
+      const value = Number(settings.minTradingProfitUsd);
+      if (!Number.isFinite(value) || value < 0 || value > 1_000_000) {
+        throw operatorError('rewards.minTradingProfitUsd must be a non-negative number');
+      }
+      patch.minTradingProfitUsd = value;
+    }
+    if (settings.minTrades !== undefined) {
+      const value = Number(settings.minTrades);
+      if (!Number.isFinite(value) || value < 0 || value > 100_000 || !Number.isInteger(value)) {
+        throw operatorError('rewards.minTrades must be a non-negative integer');
+      }
+      patch.minTrades = value;
+    }
+    if (settings.maxDrawdownPct !== undefined) {
+      const value = Number(settings.maxDrawdownPct);
+      if (!Number.isFinite(value) || value < 0 || value > 1) {
+        throw operatorError('rewards.maxDrawdownPct must be a number between 0 and 1');
+      }
+      patch.maxDrawdownPct = value;
+    }
+    // Deprecated v3.2 field: accepted for API/test compatibility, ignored by the v3.3 scheduler.
     if (settings.rankPercents !== undefined) {
       const percents = settings.rankPercents;
       if (!Array.isArray(percents) || percents.length !== 3 || percents.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 0.5)) {
-        throw operatorError('rewards.rankPercents must be exactly 3 numbers between 0 and 0.5');
+        throw operatorError('rewards.rankPercents must be exactly 3 numbers between 0 and 0.5 (deprecated)');
       }
       patch.rankPercents = percents.map((value) => Number(value));
     }
@@ -712,8 +764,15 @@ export function createEngine(options = {}) {
       settings: {
         enabled: config.rewards.enabled,
         period: config.rewards.period,
-        rankPercents: config.rewards.rankPercents,
+        basis: config.rewards.basis,
+        rankShares: config.rewards.rankShares,
+        rewardBudgetPctOfPool: config.rewards.rewardBudgetPctOfPool,
         maxPerPeriodUsd: config.rewards.maxPerPeriodUsd,
+        maxRewardPerAgentPctOfCapital: config.rewards.maxRewardPerAgentPctOfCapital,
+        minTradingProfitUsd: config.rewards.minTradingProfitUsd,
+        minTrades: config.rewards.minTrades,
+        maxDrawdownPct: config.rewards.maxDrawdownPct,
+        rankPercents: config.rewards.rankPercents ?? null,
       },
       appliedLive: Boolean(live),
       status: live?.status ?? null,
@@ -857,17 +916,29 @@ export function createEngine(options = {}) {
       strategy: agent.strategy?.typeLabel ?? null,
       basket: Array.isArray(agent.symbols) ? agent.symbols : [],
       equityUsd: agent.equityUsd ?? null,
+      tradingPnlUsd: agent.tradingPnlUsd ?? null,
+      capitalUsd: agent.capital?.contributedUsd ?? null,
+      rewardsLifetimeUsd: agent.rewards?.lifetimeUsd ?? null,
+      // Trading-based daily values (fractions, NOT percent points). `tradingDayPnlUsd` is the
+      // authoritative per-agent P&L; pct is the return on contributed capital.
+      tradingDayPnlUsd: agent.rankings?.tradingDayUsd ?? null,
+      tradingDayPct: agent.rankings?.tradingDayPct ?? agent.pnl?.dayPct ?? null,
       dayPnlPct: agent.pnl?.dayPct ?? null,
       positions: Array.isArray(agent.positions) ? agent.positions.length : 0,
       stance: agent.policy?.stance ?? null,
     }));
     let dayPnlUsd = 0;
+    let dayCapitalUsd = 0;
     let positionsCount = 0;
     for (const agent of agents) {
       positionsCount += agent.positions;
-      if (Number.isFinite(Number(agent.dayPnlPct)) && Number.isFinite(Number(agent.equityUsd))) {
-        dayPnlUsd += (Number(agent.equityUsd) * Number(agent.dayPnlPct)) / 100;
+      const pct = Number(agent.tradingDayPct);
+      if (Number.isFinite(Number(agent.tradingDayPnlUsd))) {
+        dayPnlUsd += Number(agent.tradingDayPnlUsd);
+      } else if (Number.isFinite(pct)) {
+        dayPnlUsd += (Number(agent.capitalUsd) || Number(agent.equityUsd) || 0) * pct;
       }
+      dayCapitalUsd += Number(agent.capitalUsd) || 0;
     }
     const equityUsd = Number(account.equityUsd) || 0;
     const cashUsd = Number(account.cashUsd) || 0;
@@ -875,8 +946,12 @@ export function createEngine(options = {}) {
       equityUsd,
       cashUsd,
       buyingPowerUsd: account.buyingPowerUsd ?? null,
+      // Backward-compatible aliases now carry the fair trading day P&L (reward capital excluded).
       dayPnlUsd: round2(dayPnlUsd),
-      dayPnlPct: equityUsd > 0 ? Math.round((dayPnlUsd / equityUsd) * 1000000) / 10000 : null,
+      // FRACTION (0.0025 = +0.25%), consistent with agents[].tradingDayPct and the UI contract.
+      dayPnlPct: dayCapitalUsd > 0 ? Math.round((dayPnlUsd / dayCapitalUsd) * 1000000) / 1000000 : null,
+      tradingDayPnlUsd: round2(dayPnlUsd),
+      tradingDayPnlPct: dayCapitalUsd > 0 ? Math.round((dayPnlUsd / dayCapitalUsd) * 1000000) / 1000000 : null,
       grossExposureUsd: snapshotStatus?.treasury?.grossExposureUsd ?? null,
       netExposureUsd: snapshotStatus?.treasury?.netExposureUsd ?? null,
       positions: positionsCount,

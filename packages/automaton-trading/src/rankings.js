@@ -2,22 +2,36 @@
  * RANKINGS — deterministic, persisted daily / weekly / monthly leaderboards.
  *
  * Pure bookkeeping for the operator control panel: it observes per-agent equity and
- * computes period P&L against the equity observed at the start of the period. It never
- * trades, never moves money, and never reads the broker.
+ * TRADING P&L and computes period performance against the values observed at the start
+ * of the period. It never trades, never moves money, and never reads the broker.
+ *
+ * v3.3 fair P&L (docs/FAIR-PNL-REWARDS.md §4): reward payouts are CAPITAL contributions,
+ * not profit. An observation therefore carries, besides `equityUsd`/`trades`, the
+ * agent's lifetime trading P&L (`tradingPlUsd = equity − contributed capital`) and its
+ * contributed capital (`capitalUsd`). Period ranking uses the change in trading P&L
+ * (period trading return), so a reward payout can never lift an agent's rank.
  *
  * Baseline semantics (docs/CONTROL-PANEL.md § "Rankings module"):
  *   - the FIRST observation of an agent in a period sets that period's baseline;
- *   - when a new period starts, the PREVIOUS period's last observed equity is carried
- *     forward as the new baseline, so a period's return is measured from start-of-period
- *     equity even though observations are sampled every tick;
- *   - without a baseline for the current period the entry is ranked last with
- *     `pnlPct: null` / `pnlUsd: null` (never a fabricated number).
+ *   - when a new period starts, the PREVIOUS period's last observation is carried
+ *     forward as the new baseline (equity, trades and the trading/capital marks), so a
+ *     period's performance is measured from the start of the period even though
+ *     observations are sampled every tick;
+ *   - without a baseline (or without a trading-P&L reading at the baseline) the entry
+ *     is ranked last and its trading P&L / return / period trades are `null` — never a
+ *     fabricated number, and the rewards scheduler will not pay it.
+ *
+ * Legacy compatibility: observations may omit `tradingPlUsd`/`capitalUsd` and persisted
+ * v3.2 state (no trading fields) loads cleanly; the equity-delta `pnlUsd`/`pnlPct`
+ * fields are still computed for compatibility, but only the trading fields are used for
+ * fair rewards.
  *
  * Determinism: time comes from the injected clock (or explicit `atMs`); there is no
  * `Date.now()`, no `Math.random()`, and no locale-dependent comparison. Persistence is
  * an atomic JSON write to `stateDir/rankings.json`.
  *
- * Contract: docs/CONTROL-PANEL.md § "Rankings module". Owner: market teammate.
+ * Contract: docs/FAIR-PNL-REWARDS.md §4 + docs/CONTROL-PANEL.md § "Rankings module".
+ * Owner: market teammate.
  *
  * @module rankings
  */
@@ -30,7 +44,8 @@ import { readJson, round, round2, SYSTEM_CLOCK, writeJsonAtomic } from './util.j
 /** Periods the control panel exposes. */
 export const PERIODS = Object.freeze(['daily', 'weekly', 'monthly']);
 
-export const RANKINGS_VERSION = 1;
+/** v3.3: observations/baselines carry trading P&L + contributed capital. */
+export const RANKINGS_VERSION = 2;
 
 /** Keep percent fractions exact enough for stable tie-breaking. */
 const PCT_DECIMALS = 6;
@@ -46,6 +61,25 @@ function normalizeAt(value, clock) {
     if (Number.isFinite(ms)) return ms;
   }
   return clock.now();
+}
+
+/** Finite number from a persisted/observed value ('' / null / NaN / Infinity -> null). */
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Trading P&L reading: round2, or null when it was never measured. */
+function normalizeTradingPl(value) {
+  const n = finiteNumber(value);
+  return n === null ? null : round2(n);
+}
+
+/** Contributed capital reading: round2, or null when absent/negative (never fabricated). */
+function normalizeCapital(value) {
+  const n = finiteNumber(value);
+  return n === null || n < 0 ? null : round2(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +219,52 @@ export function periodKeyEndMs(period, key) {
 }
 
 // ---------------------------------------------------------------------------
+// persisted-point normalization (v3.3 fields + v3.2 back-compat)
+// ---------------------------------------------------------------------------
+
+/**
+ * A `last` observation: key + equity required (v3.2 always stored it), trading/capital
+ * marks are null until they were measured.
+ * @returns {{key:string, equityUsd:number, trades:number, tradingPlUsd:number|null,
+ *            capitalUsd:number|null, atMs:number|null}|null}
+ */
+function normalizeLastPoint(raw) {
+  if (!isPlainObject(raw) || typeof raw.key !== 'string') return null;
+  const equityUsd = finiteNumber(raw.equityUsd);
+  if (equityUsd === null) return null;
+  const trades = finiteNumber(raw.trades);
+  const atMs = finiteNumber(raw.atMs);
+  return {
+    key: raw.key,
+    equityUsd: round2(equityUsd),
+    trades: trades === null ? 0 : Math.max(0, Math.trunc(trades)),
+    tradingPlUsd: normalizeTradingPl(raw.tradingPlUsd),
+    capitalUsd: normalizeCapital(raw.capitalUsd),
+    atMs: atMs === null ? null : Math.round(atMs),
+  };
+}
+
+/**
+ * A period baseline: key + equity required; v3.2 baselines had no trades/trading
+ * fields, so they normalize to null (an unmeasured baseline is never fabricated).
+ * @returns {{key:string, equityUsd:number, trades:number|null, tradingPlUsd:number|null,
+ *            capitalUsd:number|null}|null}
+ */
+function normalizeBaselinePoint(raw) {
+  if (!isPlainObject(raw) || typeof raw.key !== 'string') return null;
+  const equityUsd = finiteNumber(raw.equityUsd);
+  if (equityUsd === null) return null;
+  const trades = finiteNumber(raw.trades);
+  return {
+    key: raw.key,
+    equityUsd: round2(equityUsd),
+    trades: trades === null ? null : Math.max(0, Math.trunc(trades)),
+    tradingPlUsd: normalizeTradingPl(raw.tradingPlUsd),
+    capitalUsd: normalizeCapital(raw.capitalUsd),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // factory
 // ---------------------------------------------------------------------------
 
@@ -216,39 +296,14 @@ function normalizeState(raw) {
       previousLast: {},
     };
     for (const period of PERIODS) {
-      const baseline = rawAgent.baseline?.[period];
-      if (isPlainObject(baseline) && typeof baseline.key === 'string' && Number.isFinite(Number(baseline.equityUsd))) {
-        agent.baseline[period] = { key: baseline.key, equityUsd: round2(Number(baseline.equityUsd)) };
-      }
-      const last = rawAgent.last?.[period];
-      if (isPlainObject(last) && typeof last.key === 'string' && Number.isFinite(Number(last.equityUsd))) {
-        agent.last[period] = {
-          key: last.key,
-          equityUsd: round2(Number(last.equityUsd)),
-          trades: Math.max(0, Math.trunc(Number(last.trades) || 0)),
-          atMs: Number.isFinite(Number(last.atMs)) ? Math.round(Number(last.atMs)) : null,
-        };
-      }
-      const previousBaseline = rawAgent.previousBaseline?.[period];
-      if (
-        isPlainObject(previousBaseline)
-        && typeof previousBaseline.key === 'string'
-        && Number.isFinite(Number(previousBaseline.equityUsd))
-      ) {
-        agent.previousBaseline[period] = {
-          key: previousBaseline.key,
-          equityUsd: round2(Number(previousBaseline.equityUsd)),
-        };
-      }
-      const previousLast = rawAgent.previousLast?.[period];
-      if (isPlainObject(previousLast) && typeof previousLast.key === 'string' && Number.isFinite(Number(previousLast.equityUsd))) {
-        agent.previousLast[period] = {
-          key: previousLast.key,
-          equityUsd: round2(Number(previousLast.equityUsd)),
-          trades: Math.max(0, Math.trunc(Number(previousLast.trades) || 0)),
-          atMs: Number.isFinite(Number(previousLast.atMs)) ? Math.round(Number(previousLast.atMs)) : null,
-        };
-      }
+      const baseline = normalizeBaselinePoint(rawAgent.baseline?.[period]);
+      if (baseline) agent.baseline[period] = baseline;
+      const last = normalizeLastPoint(rawAgent.last?.[period]);
+      if (last) agent.last[period] = last;
+      const previousBaseline = normalizeBaselinePoint(rawAgent.previousBaseline?.[period]);
+      if (previousBaseline) agent.previousBaseline[period] = previousBaseline;
+      const previousLast = normalizeLastPoint(rawAgent.previousLast?.[period]);
+      if (previousLast) agent.previousLast[period] = previousLast;
     }
     state.agents[agentId] = agent;
   }
@@ -273,8 +328,11 @@ function compareText(a, b) {
 }
 
 /**
- * Leaderboard ordering: measured entries first by pnlPct desc, then pnlUsd desc, then
- * name asc. Entries without a baseline (pnlPct null) always sort last (name asc).
+ * Leaderboard ordering: measured entries first by equity pnlPct desc, then pnlUsd desc,
+ * then name asc. Entries without a baseline (pnlPct null) always sort last (name asc).
+ *
+ * The displayed leaderboard keeps the legacy equity-delta ordering for compatibility;
+ * the fair REWARD ordering lives in rewards.js (period trading return).
  */
 export function compareRankedEntries(a, b) {
   const aMissing = a.pnlPct === null || a.pnlPct === undefined;
@@ -287,16 +345,75 @@ export function compareRankedEntries(a, b) {
   return compareText(a.name, b.name) || compareText(a.agentId, b.agentId);
 }
 
-/** @returns {{name:string|null, equityUsd:number, trades:number}|null} */
+/**
+ * Normalize one observation `{name, equityUsd, trades, tradingPlUsd, capitalUsd}`.
+ * `tradingPlUsd`/`capitalUsd` are optional (legacy observations still work).
+ * @returns {{name:string|null, equityUsd:number, trades:number,
+ *            tradingPlUsd:number|null, capitalUsd:number|null}|null}
+ */
 function normalizeObservation(raw) {
   if (!isPlainObject(raw)) return null;
-  const equityUsd = Number(raw.equityUsd);
-  if (!Number.isFinite(equityUsd)) return null;
-  const trades = Number(raw.trades);
+  const equityUsd = finiteNumber(raw.equityUsd);
+  if (equityUsd === null) return null;
+  const trades = finiteNumber(raw.trades);
   return {
     name: typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name.trim() : null,
     equityUsd: round2(equityUsd),
-    trades: Number.isFinite(trades) ? Math.max(0, Math.trunc(trades)) : 0,
+    trades: trades === null ? 0 : Math.max(0, Math.trunc(trades)),
+    tradingPlUsd: normalizeTradingPl(raw.tradingPlUsd),
+    capitalUsd: normalizeCapital(raw.capitalUsd),
+  };
+}
+
+/**
+ * Baseline for a new period: carried forward from the completed period's last
+ * observation when one exists, else this first observation. Carried legacy points keep
+ * their null trading marks — a period is then "unmeasured" instead of being rewarded on
+ * a fabricated start value.
+ * @param {{equityUsd:number, trades:number, tradingPlUsd:number|null, capitalUsd:number|null}} observation
+ * @param {string} key
+ * @param {{equityUsd:number, trades:number, tradingPlUsd:number|null, capitalUsd:number|null}|undefined} carried
+ * @returns {{key:string, equityUsd:number, trades:number|null, tradingPlUsd:number|null,
+ *            capitalUsd:number|null}}
+ */
+function baselineFor(observation, key, carried) {
+  const trades = finiteNumber(carried?.trades);
+  const carriedTradingPl = normalizeTradingPl(carried?.tradingPlUsd);
+  const carriedCapital = normalizeCapital(carried?.capitalUsd);
+  return {
+    key,
+    equityUsd: round2(carried && Number.isFinite(Number(carried.equityUsd))
+      ? Number(carried.equityUsd)
+      : observation.equityUsd),
+    trades: carried ? (trades === null ? null : Math.max(0, Math.trunc(trades))) : observation.trades,
+    tradingPlUsd: carried ? carriedTradingPl : observation.tradingPlUsd,
+    capitalUsd: carried ? carriedCapital : observation.capitalUsd,
+  };
+}
+
+/** The computed period performance of one point against one baseline. */
+function measurePeriod({ lastTrades, lastTradingPl, lastCapital, baseline }) {
+  const baselineTrades = baseline ? finiteNumber(baseline.trades) : null;
+  const baselineTradingPl = baseline ? normalizeTradingPl(baseline.tradingPlUsd) : null;
+  const baselineCapital = baseline ? normalizeCapital(baseline.capitalUsd) : null;
+  const tradingPl = normalizeTradingPl(lastTradingPl);
+  const tradingPnlUsd = tradingPl !== null && baselineTradingPl !== null
+    ? round2(tradingPl - baselineTradingPl)
+    : null;
+  const tradingPnlPct = tradingPnlUsd !== null && baselineCapital !== null && baselineCapital > 0
+    ? round(tradingPnlUsd / baselineCapital, PCT_DECIMALS)
+    : null;
+  const periodTrades = baselineTrades !== null && Number.isFinite(Number(lastTrades))
+    ? Math.max(0, Math.trunc(Number(lastTrades)) - baselineTrades)
+    : null;
+  return {
+    tradingPlUsd: tradingPl,
+    capitalUsd: normalizeCapital(lastCapital),
+    baselineTradingPlUsd: baselineTradingPl,
+    baselineCapitalUsd: baselineCapital,
+    tradingPnlUsd,
+    tradingPnlPct,
+    periodTrades,
   };
 }
 
@@ -312,7 +429,8 @@ function normalizeObservation(raw) {
  *   load: () => Promise<object>,
  *   save: () => Promise<string>,
  *   record: (input: {atMs?: number|string|Date, equityByAgent?: Record<string, object>}) => Promise<object>,
- *   compute: (input: {atMs?: number|string|Date, equityByAgent?: Record<string, object>}) => object,
+ *   compute: (input: {atMs?: number|string|Date, equityByAgent?: Record<string, object>,
+ *             stored?: boolean}) => object,
  *   getState: () => object,
  *   describe: () => object,
  *   path: string,
@@ -348,8 +466,8 @@ export function createRankings({ paths, config, clock } = {}) {
 
   /**
    * Store this tick's observations: set the period baseline on the first observation of
-   * a period (carrying the previous period's last equity forward) and refresh the last
-   * observed equity for the current period. Persists immediately.
+   * a period (carrying the previous period's last observation forward) and refresh the
+   * last observed values for the current period. Persists immediately.
    *
    * Synchronous mutation + async persist: the in-memory state is ready for an immediate
    * `compute()` even if the caller does not await the returned promise.
@@ -390,30 +508,36 @@ export function createRankings({ paths, config, clock } = {}) {
         const baseline = agent.baseline[period];
         if (!baseline || baseline.key !== key) {
           // A new period (or the first ever observation): archive the completed period
-          // for late ranking, then carry the previous period's last observed equity
-          // forward so this period is measured from its start.
+          // for late ranking, then carry the previous period's last observation forward
+          // so this period is measured from its start.
           const priorLast = agent.last[period];
           if (baseline) {
-            agent.previousBaseline[period] = { key: baseline.key, equityUsd: round2(baseline.equityUsd) };
+            agent.previousBaseline[period] = {
+              key: baseline.key,
+              equityUsd: round2(baseline.equityUsd),
+              trades: finiteNumber(baseline.trades),
+              tradingPlUsd: normalizeTradingPl(baseline.tradingPlUsd),
+              capitalUsd: normalizeCapital(baseline.capitalUsd),
+            };
           }
           if (priorLast) {
             agent.previousLast[period] = {
               key: priorLast.key,
               equityUsd: round2(priorLast.equityUsd),
-              trades: priorLast.trades,
-              atMs: priorLast.atMs,
+              trades: Number.isFinite(Number(priorLast.trades)) ? Math.max(0, Math.trunc(Number(priorLast.trades))) : 0,
+              tradingPlUsd: normalizeTradingPl(priorLast.tradingPlUsd),
+              capitalUsd: normalizeCapital(priorLast.capitalUsd),
+              atMs: Number.isFinite(Number(priorLast.atMs)) ? Math.round(Number(priorLast.atMs)) : null,
             };
           }
-          const carried = priorLast?.equityUsd;
-          agent.baseline[period] = {
-            key,
-            equityUsd: round2(Number.isFinite(carried) ? carried : observation.equityUsd),
-          };
+          agent.baseline[period] = baselineFor(observation, key, priorLast);
         }
         agent.last[period] = {
           key,
           equityUsd: observation.equityUsd,
           trades: observation.trades,
+          tradingPlUsd: observation.tradingPlUsd,
+          capitalUsd: observation.capitalUsd,
           atMs: nowMs,
         };
       }
@@ -434,6 +558,10 @@ export function createRankings({ paths, config, clock } = {}) {
    * - `stored: true` (used by the rewards scheduler) ranks from the stored observations
    *   instead, including the archived close of the just-completed period, so a payout
    *   can rank the period that just ended even after the boundary rolled a baseline over.
+   *
+   * Rows carry BOTH the legacy equity delta (`pnlUsd`/`pnlPct`) and the v3.3 fair
+   * trading fields (`tradingPnlUsd`/`tradingPnlPct`, baselines, `periodTrades`). Rewards
+   * rank exclusively on the trading fields.
    *
    * @param {{atMs?: number|string|Date, equityByAgent?: Record<string, object>,
    *          stored?: boolean}} [input]
@@ -475,34 +603,62 @@ export function createRankings({ paths, config, clock } = {}) {
         if (!hasObservations && !archivedView && !currentView) continue; // never observed in this period
         let equityUsd;
         let trades;
+        let baselinePoint = null;
+        let lastPoint = null;
         let baselineEquityUsd = null;
         if (archivedView) {
           // The period just completed: its archived close is authoritative, so the
           // ranking cannot drift with observations made after the boundary.
+          lastPoint = archivedLast;
+          baselinePoint = archivedBaseline;
           equityUsd = archivedLast.equityUsd;
           trades = archivedLast.trades;
           baselineEquityUsd = round2(archivedBaseline.equityUsd);
         } else if (currentView) {
           equityUsd = observation?.equityUsd ?? last?.equityUsd;
           trades = observation?.trades ?? last?.trades ?? 0;
+          baselinePoint = baseline;
           baselineEquityUsd = round2(baseline.equityUsd);
+          lastPoint = {
+            trades,
+            tradingPlUsd: observation?.tradingPlUsd ?? last?.tradingPlUsd ?? null,
+            capitalUsd: observation?.capitalUsd ?? last?.capitalUsd ?? null,
+          };
         } else {
           equityUsd = observation?.equityUsd ?? last?.equityUsd;
           trades = observation?.trades ?? last?.trades ?? 0;
+          lastPoint = {
+            trades,
+            tradingPlUsd: observation?.tradingPlUsd ?? last?.tradingPlUsd ?? null,
+            capitalUsd: observation?.capitalUsd ?? last?.capitalUsd ?? null,
+          };
         }
-        if (!Number.isFinite(equityUsd)) continue;
-        const pnlUsd = baselineEquityUsd === null ? null : round2(equityUsd - baselineEquityUsd);
+        if (!Number.isFinite(Number(equityUsd))) continue;
+        const measured = measurePeriod({
+          lastTrades: trades,
+          lastTradingPl: lastPoint?.tradingPlUsd ?? null,
+          lastCapital: lastPoint?.capitalUsd ?? null,
+          baseline: baselinePoint,
+        });
+        const pnlUsd = baselineEquityUsd === null ? null : round2(Number(equityUsd) - baselineEquityUsd);
         const pnlPct = baselineEquityUsd !== null && baselineEquityUsd > 0
-          ? round((equityUsd - baselineEquityUsd) / baselineEquityUsd, PCT_DECIMALS)
+          ? round((Number(equityUsd) - baselineEquityUsd) / baselineEquityUsd, PCT_DECIMALS)
           : null;
         rows.push({
           agentId,
           name: observation?.name ?? agentState?.name ?? agentId,
-          equityUsd: round2(equityUsd),
+          equityUsd: round2(Number(equityUsd)),
           baselineEquityUsd,
           pnlUsd,
           pnlPct,
           trades,
+          tradingPlUsd: measured.tradingPlUsd,
+          capitalUsd: measured.capitalUsd,
+          baselineTradingPlUsd: measured.baselineTradingPlUsd,
+          baselineCapitalUsd: measured.baselineCapitalUsd,
+          tradingPnlUsd: measured.tradingPnlUsd,
+          tradingPnlPct: measured.tradingPnlPct,
+          periodTrades: measured.periodTrades,
         });
       }
       rows.sort(compareRankedEntries);
@@ -520,9 +676,15 @@ export function createRankings({ paths, config, clock } = {}) {
     describe() {
       return {
         role: 'rankings',
+        version: RANKINGS_VERSION,
         periods: [...PERIODS],
         asOf: state.updatedAt,
         agents: Object.keys(state.agents).length,
+        fields: [
+          'pnlUsd/pnlPct (legacy equity delta)',
+          'tradingPnlUsd/tradingPnlPct (v3.3 fair period performance)',
+          'baselineTradingPlUsd/baselineCapitalUsd/periodTrades',
+        ],
         path: rankingsPath,
       };
     },

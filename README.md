@@ -184,11 +184,27 @@ the operating config).
   loopback `GET /automaton/market` route feeds real-time quotes/sparklines/portfolio/agent equity at
   2 s (state at 5 s), with a state-only fallback for older Hosts. Contract:
   `docs/PORTFOLIO-ANALYTICS.md`; ops: `docs/RUNBOOK.md` §8f.
+- **Fair P&L + performance-based capital rewards (v3.3):** reward payouts no longer count as trading
+  profit. The ledger now separates **capital contributed** (base endowment + top-ups + reward capital)
+  from **total equity**, so **Trading P&L = equity − capital contributed**; a reward increases equity and
+  trading capital but never P&L, return or rank. A one-time migration reclassifies existing rewards
+  (current live state: $129.18 across 6 bots; e.g. GapFade META is **−$1.70 trading P&L**, not +$56.86)
+  and is idempotent. Rewards are now **performance-only**: eligible bots need positive period trading
+  P&L (≥$0.05), at least 3 period trades and drawdown ≤20%, and are ranked by **period trading return on
+  contributed capital** — not raw equity. The weekly reward budget is **10% of the treasury pool**,
+  split **50% / 30% / 20%** across the top 3, capped at 50% of each bot's capital and by the pool /
+  allocation headroom, and paid as **reward capital** from the treasury. The live allocation cap rises
+  to 0.9 so the capital can reach winners. The panel shows total equity separately from trading P&L, a
+  **Rewards** column with lifetime rewards, a detail P&L breakdown (capital contributed, of which reward
+  capital, return on capital) and a **reward history** table; the Rewards tab documents the rules,
+  budget, eligible candidates and payout history. Daily-loss bookkeeping also uses trading P&L, so a
+  reward top-up never looks like a daily gain/loss. Contract `docs/FAIR-PNL-REWARDS.md`; ops
+  `docs/RUNBOOK.md` §8g.
 
 ## Status (this build)
 
-- 10 test suites: mortality 76, market 50, plugin 46, independent integration 53, security 58,
-  research 13, rankings 16, control 18, bot-agent 9 and instruments 7 — **346 tests, 346 pass,
+- 10 test suites: mortality 88, market 50, plugin 49, independent integration 78, security 63,
+  research 13, rankings 29, control 18, bot-agent 9 and instruments 7 — **404 tests, 404 pass,
   0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
   `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live

@@ -941,3 +941,254 @@ remaining risk is environmental/visual: no live paper market-data or option fill
 dashboard verification, no long-run population study, and no assignment/margin-call modelling.
 **Verified as a paper/sim multi-symbol capability with a real 70/30 mix and a read-only analytics feed;
 live vendor behavior and the visual dashboard remain unverified.**
+
+---
+
+## 11. v3.3 fair P&L + capital-only performance rewards — independent verification (2026-11-22)
+
+Verifier: independent verifier teammate (`verifier-v33`), not an author of any module under test.
+Contract: `docs/FAIR-PNL-REWARDS.md` (read first). Host: Windows, Node **v22.18.0**, DSH file
+sandbox `workspace-write`, **no network**, no Alpaca credentials installed. Scope: verifier wrote
+**only** `test/integration.test.js`, `test/security.test.js` and this section; one behavioural defect
+was reported to the Lead (with a minimal repro) and fixed by the Lead in `src/engine.js`; no other
+module under test was edited by the verifier.
+
+What v3.3 changes: **Trading P&L = equity − capital contributed** (`capitalContributionsUsd`), so
+reward payouts are capital contributions, never profit; rewards are paid on measured weekly **trading
+performance** (return on contributed capital), not equity; one-time idempotent migration
+(`stateDir/capital-v33.json`) gives every legacy ledger record the exact fair basis (registry endowment
++ lifetime rewards from `rewards.json` history).
+
+### 11.1 Reproduce
+
+The sandbox blocks `node --test test/`, so every suite runs **directly** in a fresh Node process from
+`D:\CounterStikers\packages\automaton-trading`:
+
+```powershell
+cd D:\CounterStikers\packages\automaton-trading
+
+node test/integration.test.js    # verifier: v3.3 fair P&L, migration, rewards, payout, dayStats, status
+node test/security.test.js       # verifier: v3.3 reward virtual-only surface, history whitelist, secrets
+node test/mortality.test.js      # builder-owned
+node test/market.test.js         # builder-owned
+node test/plugin.test.js         # builder-owned (UI helpers; 49 green per builder)
+node test/rankings.test.js       # builder-owned
+node test/control.test.js        # builder-owned
+node test/research.test.js       # builder-owned
+node test/bot-agent.test.js      # builder-owned
+node test/instruments.test.js    # builder-owned
+```
+
+Real-live-state migration dry run (temp copy of the REAL `automaton-data`, deterministic **sim**
+broker, no network/credentials). Save as a throwaway file in the package root and delete afterwards:
+
+```js
+// packages/automaton-trading/.v33-dryrun.mjs   (throwaway; sim broker; no credentials)
+import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
+import { loadConfig, statePaths } from './src/config.js';
+import { createBroker } from './src/broker-sim.js';
+import { createAutomaton } from './src/orchestrator.js';
+const LIVE = 'D:\\CounterStikers\\automaton-data';
+const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'v33-dryrun-'));
+for (const f of ['config.json','settings.json','registry.json','ledger.json','rewards.json',
+  'rankings.json','day-stats.json','state.json','treasury.json','deaths.json',
+  'instruments-v3-symbols.json','portfolio-v32.json','automaton.config.json']) {
+  if (fs.existsSync(path.join(LIVE, f))) fs.copyFileSync(path.join(LIVE, f), path.join(copy, f));
+}
+for (const d of ['specs','research','agents']) {
+  if (fs.existsSync(path.join(LIVE, d))) fs.cpSync(path.join(LIVE, d), path.join(copy, d), { recursive: true });
+}
+const { config } = loadConfig({ cwd: copy, env: {}, configFile: path.join(copy, 'config.json'),
+  overrides: { mode: 'sim', paths: { stateDir: copy, envFile: path.join(copy, '.env') } } });
+const clock = { now: () => Date.UTC(2026, 10, 22, 15), iso: () => new Date(Date.UTC(2026, 10, 22, 15)).toISOString() };
+const broker = createBroker(config, { seed: 7, accountEquityUsd: 100000, clock });
+const a1 = await createAutomaton({ config, paths: statePaths(config), broker, clock }); await a1.init();
+const gap = (await a1.status()).agents.find((row) => row.id === 'atm-483016bc');
+console.log(JSON.stringify({ marker: JSON.parse(fs.readFileSync(path.join(copy, 'capital-v33.json'), 'utf8')),
+  gapCapital: gap.capital.contributedUsd, gapReward: gap.capital.rewardCapitalUsd,
+  gapTradingPnl: gap.tradingPnlUsd, rewardedAgents: (await a1.status()).engine.capitalAccounting.rewardedAgents,
+  lifetime: (await a1.status()).engine.capitalAccounting.rewardsLifetimeTotalUsd }));
+// idempotent restart (fresh instances, same state dir):
+const a2 = await createAutomaton({ config, paths: statePaths(config),
+  broker: createBroker(config, { seed: 7, accountEquityUsd: 100000, clock }), clock }); await a2.init();
+const e2 = a2._internals.ledger.equity('atm-483016bc', {});
+console.log(JSON.stringify({ secondInitCapital: e2.capitalContributionsUsd,
+  secondInitReward: e2.rewardCapitalUsd, secondInitTradingPnl: e2.tradingPnlUsd }));
+```
+
+### 11.2 Results (fresh runs, 2026-11-22; all processes exit 0)
+
+| suite | tests | pass | fail | notes |
+|---|---:|---:|---:|---|
+| `test/integration.test.js` (verifier) | **78** | **78** | 0 | 53 pre-existing + 25 new v3.3 tests (L1-L5 + 1 mandate-growth test) |
+| `test/security.test.js` (verifier) | **63** | **63** | 0 | 58 pre-existing + 5 new v3.3 tests (§M reward surface, §N market view) |
+| `test/mortality.test.js` | 88 | 88 | 0 | builder-owned, unchanged |
+| `test/market.test.js` | 50 | 50 | 0 | builder-owned, unchanged |
+| `test/plugin.test.js` | 49 | 49 | 0 | builder-owned UI suite, unchanged |
+| `test/rankings.test.js` | 29 | 29 | 0 | builder-owned, unchanged |
+| `test/control.test.js` | 18 | 18 | 0 | builder-owned, unchanged |
+| `test/research.test.js` | 13 | 13 | 0 | builder-owned, unchanged |
+| `test/bot-agent.test.js` | 9 | 9 | 0 | builder-owned, unchanged |
+| `test/instruments.test.js` | 7 | 7 | 0 | builder-owned, unchanged |
+| **total** | **404** | **404** | **0** | verifier additions only; no existing assertion weakened |
+
+Runtimes on this host: integration ≈ 2.6 s, security ≈ 0.6 s. An independent throwaway probe pass over
+ledger fairness (14 checks), rankings/rewards rules (22 checks), a scripted sim e2e payout world
+(17 checks) and the real live-state migration dry run (13 checks) was also green.
+
+Real-live-state migration dry-run output (the exact live state at verification time: 30 alive agents,
+21/9 strategy mix, ledger declared-endowment $20 vs registry $50, W44/W45 rewards history):
+
+```text
+PASS migration marker capital-v33.json written version 2
+PASS all 30 registry agents capitalVersion 2
+PASS lifetime rewards W44/W45 = 129.18 across 6 agents
+PASS GapFade META fair P&L: equity 106.86, capital 108.56, trading -1.70, reward 58.56
+PASS non-reward agents: capital = registry endowment 50, reward 0
+PASS cash/treasury/ids/fills/positions preserved (no money created by migration)
+PASS pool total conserved by migration (reclassification only)
+PASS persisted ledger records carry v3.3 capital fields
+PASS status agents[] capital/pnl/rewards/tradingPnlUsd
+PASS status engine.rewards rules/budget/lifetime + engine.capitalAccounting
+PASS second init is idempotent: no double count, same fair P&L
+PASS second init persists no duplicate capital-basis events
+PASS marker loss alone does not double count (capitalVersion gate)
+SUMMARY pass=13 fail=0
+```
+
+### 11.3 Verified behaviour (what the new tests prove)
+
+1. **Ledger fairness (`src/ledger.js`).** `ensureAgent(endowment)+grant(endowment)` counts the basis
+   once; a treasury→agent reward transfer raises cash, `capitalContributionsUsd` and
+   `rewardCapitalUsd` by the same amount and leaves `tradingPnlUsd` exactly unchanged (also when the
+   classification comes from a `/reward/i` reason without a category); an agent→treasury transfer is a
+   capital withdrawal (reduces capital, never P&L); a realized fill profit moves only trading P&L and
+   `tradingPnlPct` is a fraction (0.01 = +1%); `setCapitalBasis` is a cash-free, idempotent
+   reclassification and later grants add capital to the migrated basis; `pool().totalUsd` is conserved
+   (moved, never created); legacy persisted records without capital fields load as
+   `capitalContributionsUsd = declaredEndowment + credits`, `rewardCapitalUsd = 0`,
+   `capitalVersion = 1`.
+2. **Real-state migration (`src/orchestrator.js`).** On the copied live state: 30/30 agents get
+   `capitalVersion 2` with base = registry `$50` (the ledger's declared `$20` is not reused), exactly
+   **$129.18** lifetime reward capital across the 6 historical winners, id/cash/fill/position survival,
+   unchanged pool total, the contract's GapFade META example (`106.86 − 108.56 = −1.70`), a version-2
+   marker, and idempotence: a second init does no migration and adds no capital-basis event; deleting
+   the marker alone re-runs with `migrated: 0` and no double count (`capitalVersion` is the gate).
+   `status.agents[].capital/pnl/rewards/tradingPnlUsd` and
+   `engine.rewards.rules/budgetUsd/lifetimeTotalUsd` + `engine.capitalAccounting` match the contract,
+   with fractions for `tradingPnlPct`/`pnl.tradingPct` and percent points (0..100) for
+   `capital.rewardSharePct`.
+3. **Rankings (`src/rankings.js`).** Period trading baseline/last, carry-forward into a new period and
+   archived `previousBaseline/previousLast` all expose `tradingPnlUsd/tradingPnlPct` (fraction),
+   `baselineCapitalUsd/baselineTradingPlUsd` and `periodTrades`; a completed period is still rankable
+   after the boundary roll (`stored: true`); legacy equity-only observations produce `null` trading
+   fields (never fabricated).
+4. **Rewards (`src/rewards.js`).** Eligibility gates (no measured baseline, profit ≤ `$0.05`, return
+   ≤ 0, `periodTrades` < 3, drawdown > 20%) all record a `skipped` payout with zero transfers; ranking
+   is by period trading **return** (not dollars); budget = 10% of pool capped by `maxPerPeriodUsd`,
+   allocation-cap remaining and the pool itself; top-3 **50/30/20**; per-agent **50% of contributed
+   capital** cap; proportional scaling when shares over-allocate; cents floor; no pool → skip; one
+   payout per periodKey (`already_applied` on replay); `lifetimeForAgent`/`historyForAgent` and the
+   persisted history/lifetime map; new settings win and deprecated `rankPercents`/`account-cash` are
+   mapped away (basis is always `trading-performance`).
+5. **End-to-end payout (deterministic sim, zero burn, no orders between cycles).** Two real round-trip
+   fills per agent (periodTrades = 4) across a weekly boundary produce a `$100` budget payout of
+   **50/30/20** to the three ranked agents; each winner's equity and contributed/reward capital rise by
+   exactly the payout, base capital and **trading P&L do not change at all**, the treasury pool total is
+   conserved, a second tick in the new period does not pay again, a replay is rejected, the mandate /
+   order-size budget grows by 50% of the paid capital while measured P&L stays trading-only, and the
+   status contract above is served by a stopped (never trading) engine and by `marketView`.
+6. **Day P&L / daily loss.** With `risk.maxDailyLossPct = 0.001`, a +$500 reward payout does **not**
+   appear as a daily gain, a −$500 **capital withdrawal does not appear as a daily loss** (an
+   equity-based rule would have killed the bot), while a real −$50 trading loss produces the
+   `daily_loss_limit` verdict from the persisted trading day P&L and the sim demo Reaper executes it on
+   the next cycle (obituary cause `daily_loss_limit`). Persisted day-stats carry
+   `startTradingPlUsd`/`pnlUsd` trading-only.
+7. **Reward risk gate.** A higher-period-return bot whose equity is reward-inflated is still rejected
+   when its **trading** drawdown relative to contributed capital exceeds 20% (`riskByAgent.drawdownPct`
+   = max(equity drawdown, trading loss / contributed capital)); the eligible bot is paid instead.
+8. **Security (adversarial).** `rewards.js` imports no broker/network/child-process module and its only
+   economy write is `ledger.transfer(TREASURY_ID, …)`; an adversarial ledger proxy proves a payout calls
+   **only** `transfer` (category `reward`, reason `reward:<key>`) and that money is moved not created; a
+   sim broker's `getAccount()` JSON is byte-identical before/after a payout (no broker/order/transfer
+   surface); reward history is a documented field whitelist (persisted `apiSecret`/`credentials` junk is
+   dropped by normalization and never reaches status/tools); `TOOL_NAMES` is still 10 with no
+   reward/payout/transfer tool; `/automaton/market` (`GET`/`HEAD`, loopback) exposes the fair trading day
+   P&L as a **fraction** and leaks no credential loaded from the env file.
+
+### 11.4 Defects found in this round
+
+1. **D-V33-1 (behavioural, fixed) — `engine.marketView().portfolio.dayPnlPct`/`tradingDayPnlPct` were
+   100× too large.** `src/engine.js` computed `Math.round((dayPnlUsd / dayCapitalUsd) * 1000000) /
+   10000`, i.e. percent points, while the v3.3 contract, per-agent `agents[].tradingDayPct` (rankings
+   fraction) and the UI `pctPoints()` helper all expect a **fraction**. Repro: sim state with
+   `tradingDayPnlUsd −28` over `$15,600` contributed capital returned `tradingDayPnlPct −0.1795`
+   (i.e. −17.95 points) instead of `−0.001794`; the panel then rendered 100× for any |return| < 1%.
+   Reported to the Lead with the expression and repro; fixed by the Lead in `src/engine.js`
+   (`Math.round((dayPnlUsd / dayCapitalUsd) * 1000000) / 1000000`, both aliases) and re-verified by the
+   new integration L4 + security §N regressions (fraction bound, alias equality, and
+   `pct = usd / Σ contributed capital` to 1e-6).
+2. **Docs (reported, fixed — no behavioural effect).** `docs/CONTROL-PANEL.md` contained stale v3.2
+   snippets that contradicted the v3.3 rules in the same file: the `settings.json` example (lines
+   ~20-27) used `rankPercents`/`basis:'account-cash'`, the `set-reward-settings` example (line ~50)
+   listed only the old fields, the panel section described "three percentage inputs" with a
+   "1st = 5% × cash" preview, and the "Tests" section said "default winners/amounts from cash". All of
+   these were reported to the Lead and are **fixed** on the current tree (new `rankShares`/
+   `rewardBudgetPctOfPool`/caps/min-profit/trades/drawdown fields; trading P&L vs equity; reward history;
+   fair payout tests); only the historical 2026-10-29 request paragraph at the top still quotes the old
+   5/3/2-of-cash idea as the original operator request. `docs/FAIR-PNL-REWARDS.md`, RUNBOOK §8g,
+   ARCHITECTURE, README and CHANGELOG were already correct.
+
+No other behavioural defect was found; the pre-existing suites were not modified and no assertion was
+weakened.
+
+### 11.5 Remaining gaps (explicit — NOT verified)
+
+1. **Live Alpaca network behaviour is unverified** (no credentials/network in this session): the reward
+   path is ledger-only by construction and no broker method is reachable from `rewards.js`, but the
+   real paper account reconciliation after a live payout, and the real `/v2/stocks` data used to rank a
+   live week, were not exercised.
+2. **Browser/visual UI verification was not performed.** The builder reports the plugin suite 49/49
+   green (re-run green here) and this round verified the JSON contract and percent scales it consumes,
+   but the rendered Trading-P&L/Rewards columns, detail reward-history table and Rewards tab were not
+   checked in a browser; the installed Host needs a restart to serve the v3.3 bundle and to run the live
+   migration.
+3. **The running Host has not executed the migration.** This round proves a **copy** of the live
+   `automaton-data` migrates correctly and idempotently; the live process itself was not restarted, so
+   the live state dir is (at verification time) still pre-v3.3. On the first v3.3 start the completed
+   period will be ranked with pre-v3.3 equity-only baselines and correctly skipped
+   (`no_measured_trading_baseline`); the first fair payout needs one period measured with trading
+   baselines.
+4. **No long-run population / reward-distribution study.** One weekly payout is verified end-to-end in
+   a deterministic sim world; no multi-week compounding/selection effect of repeated 10%-of-pool
+   payouts on population survival, drawdown or treasury runway was measured. The live profile also
+   raises `account.allocationCapPct` 0.8 → 0.9 (documented risk increase in RUNBOOK §8g) which was not
+   stress-tested against the reconciliation halt thresholds.
+5. **The drawdown reward gate uses `max(equity drawdown vs endowment, trading loss / contributed
+   capital)`** (per the Lead's fix). Its interaction with the Treasurer's own death thresholds was
+   verified only for the constructed 20%-vs-contributed-capital case; the exact boundary where the gate
+   and the death rules meet over many periods is not characterized.
+6. **Assignment/early-exercise, margin-call waterfall, borrow/locate and option settlement remain
+   unmodelled** (carried over from §9/§10); v3.3 changes no instrument math.
+7. **Synthetic `__treasury__` ledger record** is not a registry agent and therefore stays
+   `capitalVersion 1` after migration (contract §7 migrates registry agents only). It is never ranked,
+   rewarded or exposed; its cash is counted only through `ledger.pool()`. Observation, not a defect.
+8. **Payout measurement granularity.** The completed period is ranked from the last stored observation
+   before the boundary (one tick cadence), so trades/P&L during the final partial tick interval are
+   included at the next observation only; acceptable per the ranking design but not tested at sub-cycle
+   granularity.
+
+### 11.6 Verdict (v3.3)
+
+The fair-P&L/capital-only-reward model is real and enforced end-to-end, not a UI relabel: the ledger
+separates contributed capital from equity and rewards are classified as capital with exact conservation
+and no P&L effect; rankings and the scheduler use measured period **trading return**; the real live
+state migrates to the documented fair basis (30/30 agents, $129.18 lifetime, GapFade META −$1.70)
+idempotently; payouts are 10%-of-pool, 50/30/20, capped, transfer-only virtual capital that raises
+buying power/mandate size and never P&L; daily-loss/day-stats are trading-based (a reward or a capital
+withdrawal cannot look like P&L); status/marketView expose the fair numbers with consistent fraction vs
+percent-point scales; and the reward module adds no broker/transfer/order/tool surface and leaks no
+secrets. One behavioural defect was found and fixed this round (D-V33-1, marketView portfolio percent
+scale, 100×), and one documentation inconsistency was reported (builder-owned CONTROL-PANEL snippets).
+**Verified as a paper/sim fair-P&L and performance-reward capability; live broker/UI visual behaviour,
+the live-process migration and long-run reward effects remain unverified.**

@@ -42,6 +42,8 @@ import { createReaper } from '../src/reaper.js';
 import { createEngine } from '../src/engine.js';
 import { createJournal } from '../src/journal.js';
 import { createLedger } from '../src/ledger.js';
+import { createRankings } from '../src/rankings.js';
+import { createRewards, resolveRewardSettings } from '../src/rewards.js';
 import { createRegistry } from '../src/registry.js';
 import { OBITUARY_FIELDS, validateObituary } from '../src/journal.js';
 import { burnPerHour, createTreasurer, deriveInstrumentPermissions } from '../src/treasurer.js';
@@ -3394,3 +3396,1089 @@ describe('v3.2 engine.marketView analytics and halted/CRITICAL recovery', () => 
     assert.ok(Array.isArray(stoppedStatus.agents));
   });
 });
+
+// ===========================================================================
+// L. v3.3 fair P&L, capital-only performance rewards and migration
+//    (independent verification of docs/FAIR-PNL-REWARDS.md; verifier-owned)
+// ===========================================================================
+
+const REWARDED_LEGACY = Object.freeze({
+  'atm-483016bc': 58.56, // GapFade META
+  'atm-72e7db49': 35.13, // Breakout AAPL 2
+  'atm-e0cd5998': 23.42, // Breakout F
+  'atm-169e0921': 6.04, // Breakout AMD
+  'atm-6d78cf8d': 3.62, // GapFade GOOGL
+  'atm-5f4dc0e9': 2.41, // Breakout GOOGL 2
+});
+
+/** 30 real-shaped legacy v3.2 registry/ledger rows (ids, names, families, cash, costs, trades). */
+const LEGACY_AGENTS = Object.freeze([
+  ['atm-74c0d697', 'Momentum F', 'momentum', 'F', 48.48310775, 0, 1.51689225, 0],
+  ['atm-ad7db998', 'Momentum MSFT', 'momentum', 'MSFT', 48.48410775, 0, 1.51589225, 0],
+  ['atm-1b52d14c', 'Momentum NVDA', 'momentum', 'NVDA', 48.48610775, 0, 1.51389225, 0],
+  ['atm-9dbdbc38', 'Momentum SOFI', 'momentum', 'SOFI', 48.46710775, -0.03, 1.50289225, 4],
+  ['atm-3d4b951c', 'Momentum META', 'momentum', 'META', 48.43124651, -0.07, 1.51389225, 10],
+  ['atm-5385d942', 'MeanRev AMZN', 'meanrev', 'AMZN', 43.32610775, -0.03, 1.51389225, 10],
+  ['atm-9168aab4', 'MeanRev BAC', 'meanrev', 'BAC', 48.48210775, -0.01, 1.50789225, 2],
+  ['atm-0af7fa29', 'MeanRev TSLA', 'meanrev', 'TSLA', 43.38354599, 0.05, 1.50989225, 12],
+  ['atm-c4d00d9a', 'MeanRev SPY 2', 'meanrev', 'SPY', 48.49310775, 0, 1.50689225, 0],
+  ['atm-a1aae193', 'Breakout INTC 2', 'breakout', 'INTC', 41.51010775, 0.02, 1.69989225, 23],
+  ['atm-72e7db49', 'Breakout AAPL 2', 'breakout', 'AAPL', 74.03154267, 0.04, 1.69989225, 24],
+  ['atm-a6f0c033', 'Breakout MSFT', 'breakout', 'MSFT', 43.25210775, 0.01, 1.69789225, 20],
+  ['atm-e0cd5998', 'Breakout F', 'breakout', 'F', 71.71110775, 0, 1.69889225, 22],
+  ['atm-169e0921', 'Breakout AMD', 'breakout', 'AMD', 48.58623655, -0.12, 1.68289225, 23],
+  ['atm-1c441f0b', 'Breakout META', 'breakout', 'META', 43.23410775, 0.03, 1.69589225, 22],
+  ['atm-182df876', 'Breakout SOFI', 'breakout', 'SOFI', 46.028165, 0.06, 1.79589225, 42],
+  ['atm-5f4dc0e9', 'Breakout GOOGL 2', 'breakout', 'GOOGL', 47.46610775, 0.08, 1.80389225, 40],
+  ['atm-93650747', 'Breakout TSLA 2', 'breakout', 'TSLA', 48.16341915, 0, 1.80289225, 42],
+  ['atm-66de927f', 'Breakout BAC', 'breakout', 'BAC', 48.16410775, -0.05, 1.78589225, 40],
+  ['atm-b788dce4', 'Breakout QQQ 2', 'breakout', 'QQQ', 42.66010775, -0.19, 1.77989225, 41],
+  ['atm-74888551', 'GapFade AAPL', 'gapfade', 'AAPL', 48.20610775, -0.01, 1.78389225, 6],
+  ['atm-0a7678bd', 'GapFade INTC', 'gapfade', 'INTC', 48.20610775, -0.01, 1.78389225, 36],
+  ['atm-8ecc828c', 'GapFade NVDA', 'gapfade', 'NVDA', 48.20610775, 0.01, 1.78389225, 22],
+  ['atm-6e6729fa', 'GapFade AMD', 'gapfade', 'AMD', 48.22610775, 0, 1.78389225, 4],
+  ['atm-483016bc', 'GapFade META', 'gapfade', 'META', 106.86016832, 0.07, 1.78389225, 18],
+  ['atm-231cc090', 'GapFade AMZN', 'gapfade', 'AMZN', 48.21710775, 0, 1.78289225, 0],
+  ['atm-6d78cf8d', 'GapFade GOOGL', 'gapfade', 'GOOGL', 51.781165, -0.06, 1.78189225, 2],
+  ['atm-d022131b', 'GapFade TSLA', 'gapfade', 'TSLA', 48.21810775, 0, 1.78189225, 0],
+  ['atm-3f96d08c', 'GapFade SPY', 'gapfade', 'SPY', 48.21610775, 0, 1.78389225, 0],
+  ['atm-48a1c1d4', 'GapFade QQQ', 'gapfade', 'QQQ', 48.24810775, 0.05, 1.78189225, 16],
+]);
+
+/** The real v3.2 live rewards journal shape (two paid weeks, one skipped week, legacy `percent`). */
+const LEGACY_REWARDS = Object.freeze({
+  version: 1,
+  lastPeriodKey: '2026-W47',
+  lastRunAt: '2026-11-16T09:10:36.948Z',
+  lastWinners: [],
+  history: [
+    { period: 'weekly', periodKey: '2026-W44', at: '2026-11-02T14:34:44.813Z', winners: [
+      { rank: 1, agentId: 'atm-483016bc', name: 'GapFade META', percent: 0.05, amountUsd: 58.56 },
+      { rank: 2, agentId: 'atm-72e7db49', name: 'Breakout AAPL 2', percent: 0.03, amountUsd: 35.13 },
+      { rank: 3, agentId: 'atm-e0cd5998', name: 'Breakout F', percent: 0.02, amountUsd: 23.42 },
+    ] },
+    { period: 'weekly', periodKey: '2026-W45', at: '2026-11-11T14:35:39.515Z', winners: [
+      { rank: 1, agentId: 'atm-169e0921', name: 'Breakout AMD', percent: 0.05, amountUsd: 6.04 },
+      { rank: 2, agentId: 'atm-6d78cf8d', name: 'GapFade GOOGL', percent: 0.03, amountUsd: 3.62 },
+      { rank: 3, agentId: 'atm-5f4dc0e9', name: 'Breakout GOOGL 2', percent: 0.02, amountUsd: 2.41 },
+    ] },
+    { period: 'weekly', periodKey: '2026-W46', at: '2026-11-16T09:10:36.948Z', winners: [], skipped: true },
+  ],
+  nextRunAt: '2026-11-23T00:00:00.000Z',
+  updatedAt: '2026-11-16T09:10:36.948Z',
+});
+
+/**
+ * Write a REAL-shaped v3.2 state dir (30 legacy ledger records with no v3.3 capital fields,
+ * registry endowments $50 while the ledger declared $20, live rewards history) and return the
+ * layered sim config that points at it. Used for the migration dry run below.
+ */
+function writeLegacyV32State(overrides = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-migration-'));
+  createdDirs.push(dir);
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const at = '2026-11-22T09:00:00.000Z';
+  const agents = {};
+  const ledgerAgents = {};
+  for (const [id, name, family, symbol, cash, realized, costs, trades] of LEGACY_AGENTS) {
+    agents[id] = {
+      id,
+      name,
+      parentId: null,
+      generation: 0,
+      bornAt: '2026-10-26T13:31:00.000Z',
+      status: 'alive',
+      endowmentUsd: 50,
+      genome: { symbol, family },
+      symbols: [symbol],
+      specIds: {},
+      mutation: null,
+      specId: null,
+      tier: family === 'momentum' || family === 'meanrev' ? 'swing' : 'day',
+      notes: [],
+    };
+    ledgerAgents[id] = {
+      agentId: id,
+      cashUsd: cash,
+      positions: {},
+      realizedPlUsd: realized,
+      costsUsd: costs,
+      costsByRole: {},
+      grossSpendUsd: 0,
+      grossRevenueUsd: 0,
+      creditsUsd: 0,
+      trades,
+      firstProfitAt: null,
+      // v3.2 records declared $20 and have NO v3.3 capital fields at all.
+      declaredEndowmentUsd: 20,
+      startedAt: '2026-10-26T13:31:00.000Z',
+      fills: [],
+      events: [],
+      markPrices: {},
+      lastUnrealizedUsd: 0,
+      lastMarginDebtUsd: 0,
+      lastGrossExposureUsd: 0,
+      lastNetExposureUsd: 0,
+      updatedAt: at,
+    };
+  }
+  ledgerAgents.__treasury__ = {
+    agentId: '__treasury__', cashUsd: 370.82, positions: {}, realizedPlUsd: 0, costsUsd: 0,
+    costsByRole: {}, grossSpendUsd: 0, grossRevenueUsd: 0, creditsUsd: 0, trades: 0,
+    firstProfitAt: null, declaredEndowmentUsd: 0, startedAt: '2026-10-26T13:31:00.000Z',
+    fills: [], events: [], markPrices: {}, lastUnrealizedUsd: 0, lastMarginDebtUsd: 0,
+    lastGrossExposureUsd: 0, lastNetExposureUsd: 0, updatedAt: at,
+  };
+  fs.writeFileSync(path.join(stateDir, 'registry.json'), JSON.stringify({ version: 2, cap: 60, agents }));
+  fs.writeFileSync(path.join(stateDir, 'ledger.json'), JSON.stringify({ version: 3, anchored: true, anchoredAt: at, agents: ledgerAgents }));
+  fs.writeFileSync(path.join(stateDir, 'rewards.json'), JSON.stringify(LEGACY_REWARDS));
+  // Legacy v3.2 rankings state for one agent: no trading/capital marks at all.
+  fs.writeFileSync(path.join(stateDir, 'rankings.json'), JSON.stringify({
+    version: 1,
+    updatedAt: '2026-11-20T20:00:00.000Z',
+    agents: {
+      'atm-483016bc': {
+        name: 'GapFade META',
+        baseline: { daily: { key: '2026-11-20', equityUsd: 160.3 }, weekly: { key: '2026-W47', equityUsd: 160.3 }, monthly: { key: '2026-11', equityUsd: 160.3 } },
+        last: { daily: { key: '2026-11-20', equityUsd: 160.3, trades: 18, atMs: T0 }, weekly: { key: '2026-W47', equityUsd: 160.3, trades: 18, atMs: T0 }, monthly: { key: '2026-11', equityUsd: 160.3, trades: 18, atMs: T0 } },
+        previousBaseline: {},
+        previousLast: {},
+      },
+    },
+  }));
+  // Legacy day-stats without the trading baseline (loadDayStats must anchor it fairly).
+  fs.writeFileSync(path.join(stateDir, 'day-stats.json'), JSON.stringify({
+    dayKey: '2026-11-20',
+    agents: Object.fromEntries(LEGACY_AGENTS.map(([id]) => [id, { ordersCount: 0, startEquityUsd: 50, pnlUsd: 0 }])),
+  }));
+  // Markers so unrelated one-time migrations do not mutate the copied state.
+  fs.writeFileSync(path.join(stateDir, 'instruments-v3-symbols.json'), JSON.stringify({ version: 1, at, assigned: 10 }));
+  const configFile = path.join(dir, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    mode: 'sim',
+    population: { initial: 30, cap: 60 },
+    endowmentUsd: 50,
+    // The live profile endowments are $50, so the child endowment must stay under 2x that.
+    replication: { childEndowmentUsd: 25 },
+    account: { allocationCapPct: 0.9 },
+    ...overrides.config,
+  }));
+  const { config } = loadConfig({
+    cwd: dir,
+    env: {},
+    configFile,
+    overrides: {
+      mode: 'sim',
+      paths: { stateDir, envFile: path.join(dir, '.env') },
+      rewards: { maxPerPeriodUsd: 100 },
+      ...(overrides.overrides ?? {}),
+    },
+  });
+  return { dir, stateDir, config, paths: statePaths(config) };
+}
+
+function legacyLedgerTotal() {
+  let total = 370.82;
+  for (const [, , , , cash] of LEGACY_AGENTS) total += cash;
+  return Math.round(total * 100) / 100;
+}
+
+/** The exact sum `ledger.pool().totalUsd` returns for the legacy state (round2 per record). */
+function legacyPoolTotal() {
+  let allocated = 0;
+  for (const [, , , , cash] of LEGACY_AGENTS) allocated += Math.round(cash * 100) / 100;
+  return Math.round((Math.round(370.82 * 100) / 100 + Math.round(allocated * 100) / 100) * 100) / 100;
+}
+
+// ---------------------------------------------------------------------------
+// L1. ledger fairness: capital vs trading P&L
+// ---------------------------------------------------------------------------
+describe('v3.3 ledger fairness: capital contributions are never trading P&L', () => {
+  function makeLedger(dir, clock) {
+    const { config } = loadConfig({
+      cwd: dir,
+      env: {},
+      configFile: path.join(dir, 'no-such-config.json'),
+      overrides: { mode: 'sim', paths: { stateDir: path.join(dir, 'state'), envFile: path.join(dir, '.env') } },
+    });
+    return createLedger({ paths: statePaths(config), config, clock });
+  }
+
+  it('genesis capital is counted once; a reward raises cash/capital/reward but not trading P&L', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledger = makeLedger(dir, clock);
+    ledger.ensureAgent('a1', { endowmentUsd: 5000, at: clock.now() });
+    ledger.grant('a1', 5000, { reason: 'genesis-endowment', at: clock.now() });
+    let view = ledger.equity('a1', {});
+    assert.equal(view.cashUsd, 5000);
+    assert.equal(view.capitalContributionsUsd, 5000, 'genesis endowment must not be counted twice');
+    assert.equal(view.rewardCapitalUsd, 0);
+    assert.equal(view.baseCapitalUsd, 5000);
+    assert.equal(view.tradingPnlUsd, 0);
+
+    ledger.ensureAgent('__treasury__', { endowmentUsd: 0 });
+    ledger.grant('__treasury__', 10000, { reason: 'pool' });
+    ledger.transfer('__treasury__', 'a1', 250, { reason: 'reward:2026-W44', category: 'reward', at: clock.now() });
+    view = ledger.equity('a1', {});
+    assert.equal(view.cashUsd, 5250);
+    assert.equal(view.capitalContributionsUsd, 5250, 'reward payout is contributed capital');
+    assert.equal(view.rewardCapitalUsd, 250, 'reward capital is tracked separately');
+    assert.equal(view.baseCapitalUsd, 5000);
+    assert.equal(view.tradingPnlUsd, 0, 'a reward must never be trading profit');
+    // A /reward/i reason with no category is classified the same way (documented fallback).
+    ledger.transfer('__treasury__', 'a1', 50, { reason: 'weekly reward 2026-W45', at: clock.now() });
+    assert.equal(ledger.equity('a1', {}).rewardCapitalUsd, 300);
+    assert.equal(ledger.equity('a1', {}).tradingPnlUsd, 0);
+  });
+
+  it('realized fill profit moves trading P&L only; the trading return is a fraction', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledger = makeLedger(dir, clock);
+    ledger.ensureAgent('a2', { endowmentUsd: 1000, at: clock.now() });
+    ledger.grant('a2', 1000, { reason: 'genesis-endowment', at: clock.now() });
+    ledger.applyFill('a2', { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100, at: clock.now() });
+    ledger.applyFill('a2', { symbol: 'AAPL', side: 'sell', qty: 1, priceUsd: 110, at: clock.now() });
+    const view = ledger.equity('a2', {});
+    assert.equal(view.capitalContributionsUsd, 1000, 'fills never change capital');
+    assert.equal(view.tradingPnlUsd, 10);
+    assert.equal(view.tradingPnlPct, 0.01, 'tradingPnlPct is a FRACTION (0.01 = +1%)');
+  });
+
+  it('a treasury transfer out is a capital withdrawal, never trading P&L', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledger = makeLedger(dir, clock);
+    ledger.ensureAgent('a3', { endowmentUsd: 1000, at: clock.now() });
+    ledger.grant('a3', 1000, { reason: 'genesis-endowment', at: clock.now() });
+    ledger.ensureAgent('__treasury__', { endowmentUsd: 0 });
+    ledger.applyFill('a3', { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100, at: clock.now() });
+    ledger.applyFill('a3', { symbol: 'AAPL', side: 'sell', qty: 1, priceUsd: 110, at: clock.now() });
+    ledger.transfer('a3', '__treasury__', 600, { reason: 'capital withdrawal', at: clock.now() });
+    const view = ledger.equity('a3', {});
+    assert.equal(view.capitalContributionsUsd, 400, 'withdrawal reduces capital');
+    assert.equal(view.rewardCapitalUsd, 0);
+    assert.equal(view.tradingPnlUsd, 10, 'withdrawal must not look like a trading loss');
+  });
+
+  it('setCapitalBasis is a reclassification: idempotent, no cash/P&L movement, later grants add capital', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledger = makeLedger(dir, clock);
+    ledger.ensureAgent('legacy', { endowmentUsd: 20, at: clock.now() });
+    ledger.grant('legacy', 20, { reason: 'genesis-endowment' });
+    const cashBefore = ledger.snapshot('legacy').cashUsd;
+    ledger.setCapitalBasis('legacy', { baseCapitalUsd: 50, rewardCapitalUsd: 30, reason: 'v3.3 migration', at: clock.now() });
+    const first = ledger.capitalOf('legacy');
+    ledger.setCapitalBasis('legacy', { baseCapitalUsd: 50, rewardCapitalUsd: 30, reason: 'v3.3 migration', at: clock.now() });
+    const second = ledger.capitalOf('legacy');
+    assert.equal(first.capitalContributionsUsd, 80);
+    assert.equal(first.rewardCapitalUsd, 30);
+    assert.equal(first.baseCapitalUsd, 50);
+    assert.equal(second.capitalContributionsUsd, 80, 'basis setter is idempotent');
+    assert.equal(ledger.snapshot('legacy').cashUsd, cashBefore, 'a basis reclassification never moves cash');
+    assert.equal(first.tradingPnlUsd, 20 - 80, 'trading P&L is measured against the migrated basis');
+    ledger.grant('legacy', 10, { reason: 'top-up' });
+    const after = ledger.capitalOf('legacy');
+    assert.equal(after.capitalContributionsUsd, 90, 'a later grant adds capital to the migrated basis');
+    assert.equal(after.rewardCapitalUsd, 30);
+  });
+
+  it('the treasury pool is conserved by reward payouts (money is moved, not created)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledger = makeLedger(dir, clock);
+    ledger.ensureAgent('__treasury__', { endowmentUsd: 0 });
+    ledger.grant('__treasury__', 10000, { reason: 'pool-anchor' });
+    ledger.ensureAgent('p1', { endowmentUsd: 5000, at: clock.now() });
+    ledger.grant('p1', 5000, { reason: 'genesis-endowment', at: clock.now() });
+    const before = ledger.pool();
+    const treasuryBefore = ledger.snapshot('__treasury__').cashUsd;
+    ledger.transfer('__treasury__', 'p1', 100, { reason: 'reward:2026-W44', category: 'reward', at: clock.now() });
+    const after = ledger.pool();
+    assert.equal(after.totalUsd, before.totalUsd, 'the virtual economy neither created nor destroyed money');
+    assert.equal(ledger.snapshot('__treasury__').cashUsd, treasuryBefore - 100);
+    assert.equal(ledger.snapshot('p1').cashUsd, 5100);
+  });
+
+  it('legacy persisted records without capital fields load with the documented fallback (version 1)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-ledger-'));
+    createdDirs.push(dir);
+    const clock = makeClock(T0);
+    const ledgerPath = path.join(dir, 'ledger.json');
+    fs.writeFileSync(ledgerPath, JSON.stringify({
+      version: 3, anchored: true, anchoredAt: null,
+      agents: {
+        'old-1': {
+          agentId: 'old-1', cashUsd: 42.5, positions: {}, realizedPlUsd: 2.5, costsUsd: 0,
+          costsByRole: {}, grossSpendUsd: 0, grossRevenueUsd: 0, creditsUsd: 7.5, trades: 3,
+          firstProfitAt: null, declaredEndowmentUsd: 40, startedAt: T0,
+          fills: [], events: [], markPrices: {}, lastUnrealizedUsd: 0,
+          lastMarginDebtUsd: 0, lastGrossExposureUsd: 0, lastNetExposureUsd: 0,
+        },
+      },
+    }));
+    const { config } = loadConfig({
+      cwd: dir, env: {}, configFile: path.join(dir, 'no-such-config.json'),
+      overrides: { mode: 'sim', paths: { stateDir: dir, envFile: path.join(dir, '.env') } },
+    });
+    const legacyLedger = createLedger({ paths: { ledger: ledgerPath }, config, clock });
+    await legacyLedger.load();
+    const view = legacyLedger.snapshot('old-1');
+    assert.equal(view.capitalContributionsUsd, 47.5, 'fallback = declaredEndowment + credits');
+    assert.equal(view.rewardCapitalUsd, 0);
+    assert.equal(view.capitalVersion, 1);
+    assert.equal(view.tradingPnlUsd, -5, 'trading P&L is measured against the fallback basis');
+    assert.equal(legacyLedger.hasCapitalAccounting('old-1'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L2. migration: real-shaped v3.2 live state -> fair capital basis (idempotent)
+// ---------------------------------------------------------------------------
+describe('v3.3 migration: real-shaped v3.2 live state gets a fair capital basis (idempotent)', () => {
+  it('migrates 30/30 legacy agents, classifies lifetime rewards and computes fair trading P&L', async () => {
+    const world = writeLegacyV32State();
+    const clock = makeClock(Date.UTC(2026, 10, 22, 15, 0, 0));
+    const broker = createSimBroker(world.config, { seed: 7, accountEquityUsd: legacyLedgerTotal(), clock });
+    const automaton = await createAutomaton({ config: world.config, paths: world.paths, broker, clock });
+    await automaton.init();
+    const { ledger, registry } = automaton._internals;
+
+    const marker = readJsonFile(path.join(world.stateDir, 'capital-v33.json'));
+    assert.equal(marker.version, 2);
+    assert.equal(marker.migrated, 30, 'all 30 legacy agents migrated');
+    assert.equal(round2(marker.lifetimeRewardsUsd), 129.18, 'W44+W45 lifetime rewards');
+
+    assert.equal(registry.all().length, 30);
+    for (const agent of registry.all()) {
+      const capital = ledger.capitalOf(agent.id);
+      assert.equal(capital.capitalVersion, 2, `${agent.id} capitalVersion 2`);
+      assert.equal(capital.baseCapitalUsd, 50, `${agent.id} base = registry endowment ($50, the $20 ledger declared basis is not reused)`);
+      assert.equal(capital.rewardCapitalUsd, REWARDED_LEGACY[agent.id] ?? 0, `${agent.id} reward capital`);
+      assert.equal(capital.capitalContributionsUsd, round2(50 + (REWARDED_LEGACY[agent.id] ?? 0)));
+    }
+    // The live example from the contract: equity 106.86 - (50 + 58.56) = -1.70 fair trading P&L.
+    const gap = ledger.equity('atm-483016bc', {});
+    assert.equal(gap.equityUsd, 106.86);
+    assert.equal(gap.capitalContributionsUsd, 108.56);
+    assert.equal(gap.rewardCapitalUsd, 58.56);
+    assert.equal(gap.baseCapitalUsd, 50);
+    assert.equal(gap.tradingPnlUsd, -1.7);
+    assert.equal(gap.tradingPnlPct, -0.0157, 'ledger trading return is a 4dp fraction');
+    // Money and trade history are untouched: migration is a reclassification.
+    for (const agent of registry.all()) {
+      const raw = JSON.parse(fs.readFileSync(path.join(world.stateDir, 'ledger.json'), 'utf8')).agents[agent.id];
+      const expected = LEGACY_AGENTS.find(([id]) => id === agent.id);
+      assert.equal(raw.cashUsd, expected[4], `${agent.id} cash preserved`);
+      assert.equal(raw.capitalVersion, 2, `${agent.id} persisted capitalVersion`);
+    }
+    const pool = ledger.pool();
+    assert.equal(pool.totalUsd, legacyPoolTotal(), 'pool total is unchanged by the reclassification');
+
+    // Status contract on the migrated state.
+    const status = await automaton.status();
+    const row = status.agents.find((agent) => agent.id === 'atm-483016bc');
+    assert.equal(row.tradingPnlUsd, -1.7);
+    assert.equal(row.capital.contributedUsd, 108.56);
+    assert.equal(row.capital.baseUsd, 50);
+    assert.equal(row.capital.rewardCapitalUsd, 58.56);
+    assert.equal(row.capital.capitalVersion, 2);
+    assert.equal(row.capital.rewardSharePct, Math.round((58.56 / 108.56) * 10000) / 100, 'rewardSharePct is percent points');
+    assert.ok(Math.abs(row.capital.rewardSharePct) > 1, 'percent points, not a fraction');
+    assert.equal(row.pnl.tradingUsd, -1.7);
+    assert.equal(row.pnl.tradingPct, Math.round((-1.7 / 108.56) * 1000000) / 1000000, 'pnl.tradingPct is a fraction');
+    assert.equal(row.pnl.rewardsUsd, 58.56);
+    assert.equal(row.pnl.netUsd, -1.7, 'legacy netUsd alias now means trading P&L');
+    assert.equal(row.rewards.lifetimeUsd, 58.56);
+    assert.equal(row.rewards.count, 1);
+    const historyRow = row.rewards.history[0];
+    assert.equal(historyRow.periodKey, '2026-W44');
+    assert.equal(historyRow.rank, 1);
+    assert.equal(historyRow.amountUsd, 58.56);
+
+    const accounting = status.engine.capitalAccounting;
+    assert.equal(accounting.version, 2);
+    assert.equal(accounting.rewardedAgents, 6);
+    assert.equal(round2(accounting.rewardsLifetimeTotalUsd), 129.18);
+    assert.equal(round2(status.engine.rewards.lifetimeTotalUsd), 129.18);
+    assert.equal(status.engine.rewards.rules.basis, 'trading-performance');
+    assert.deepEqual(status.engine.rewards.rules.rankShares, [0.5, 0.3, 0.2]);
+    assert.equal(status.engine.rewards.rules.rewardBudgetPctOfPool, 0.1);
+    assert.equal(status.engine.rewards.rules.minTrades, 3);
+    assert.equal(status.engine.rewards.rules.minTradingProfitUsd, 0.05);
+  });
+
+  it('is idempotent: a second init (and a lost marker) never counts the basis or rewards twice', async () => {
+    const world = writeLegacyV32State();
+    const clock = makeClock(Date.UTC(2026, 10, 22, 15, 0, 0));
+    const broker = createSimBroker(world.config, { seed: 7, accountEquityUsd: legacyLedgerTotal(), clock });
+    const first = await createAutomaton({ config: world.config, paths: world.paths, broker, clock });
+    await first.init();
+    const markerAt = readJsonFile(path.join(world.stateDir, 'capital-v33.json')).at;
+
+    const broker2 = createSimBroker(world.config, { seed: 7, accountEquityUsd: legacyLedgerTotal(), clock });
+    const second = await createAutomaton({ config: world.config, paths: world.paths, broker: broker2, clock });
+    await second.init();
+    const view = second._internals.ledger.equity('atm-483016bc', {});
+    assert.equal(view.capitalContributionsUsd, 108.56, 'no double count on restart');
+    assert.equal(view.rewardCapitalUsd, 58.56);
+    assert.equal(view.tradingPnlUsd, -1.7);
+    const marker = readJsonFile(path.join(world.stateDir, 'capital-v33.json'));
+    assert.equal(marker.at, markerAt, 'an idempotent restart leaves the marker untouched');
+    const record = readJsonFile(path.join(world.stateDir, 'ledger.json')).agents['atm-483016bc'];
+    assert.equal(record.events.filter((event) => event.kind === 'capital-basis').length, 1, 'one capital-basis event per agent');
+
+    // Losing the marker file alone must NOT re-baseline: `capitalVersion` is the gate.
+    fs.rmSync(path.join(world.stateDir, 'capital-v33.json'));
+    const broker3 = createSimBroker(world.config, { seed: 7, accountEquityUsd: legacyLedgerTotal(), clock });
+    const third = await createAutomaton({ config: world.config, paths: world.paths, broker: broker3, clock });
+    await third.init();
+    const thirdView = third._internals.ledger.equity('atm-483016bc', {});
+    assert.equal(thirdView.capitalContributionsUsd, 108.56, 'a lost marker must not double count');
+    assert.equal(thirdView.tradingPnlUsd, -1.7);
+    const rewritten = readJsonFile(path.join(world.stateDir, 'capital-v33.json'));
+    assert.equal(rewritten.version, 2);
+    assert.equal(rewritten.migrated, 0, 'no agent needed re-migration');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L3. rankings + rewards rules (fair eligibility, shares, caps, archived payout)
+// ---------------------------------------------------------------------------
+describe('v3.3 rankings/rewards rules: trading baselines, eligibility, shares, caps, lifetime', () => {
+  function makeRankings(dir, clock) {
+    return createRankings({ paths: { rankings: path.join(dir, 'rankings.json') }, config: { paths: { stateDir: dir } }, clock });
+  }
+  function makeRewardsInstance(dir, clock, rewardsOverrides = {}) {
+    return createRewards({
+      paths: { rewardsFile: path.join(dir, 'rewards.json') },
+      config: { paths: { stateDir: dir }, rewards: { maxPerPeriodUsd: 100, ...rewardsOverrides } },
+      clock,
+    });
+  }
+  function rewardRow(overrides = {}) {
+    return {
+      agentId: 'a', name: 'A', tradingPnlUsd: 10, baselineTradingPlUsd: 0, tradingPnlPct: 0.01,
+      capitalUsd: 5000, baselineCapitalUsd: 5000, periodTrades: 5, ...overrides,
+    };
+  }
+  function captureLedger() {
+    const calls = [];
+    const ledger = { transfer: async (from, to, amount, options) => { calls.push({ from, to, amount, options }); return {}; } };
+    return { calls, ledger };
+  }
+
+  it('rankings track the period trading baseline, carry it forward and archive the completed period', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rank-'));
+    createdDirs.push(dir);
+    let now = Date.UTC(2026, 10, 16, 12, 0, 0); // Mon 2026-11-16 (2026-W47)
+    const clock = { now: () => now, iso: () => new Date(now).toISOString() };
+    const rankings = makeRankings(dir, clock);
+    await rankings.load();
+    await rankings.record({ atMs: now, equityByAgent: {
+      a: { name: 'A', equityUsd: 5000, trades: 10, tradingPlUsd: 100, capitalUsd: 5000 },
+      b: { name: 'B', equityUsd: 5000, trades: 20, tradingPlUsd: 0, capitalUsd: 5000 },
+    } });
+    now += 60_000;
+    await rankings.record({ atMs: now, equityByAgent: {
+      a: { name: 'A', equityUsd: 5200, trades: 14, tradingPlUsd: 200, capitalUsd: 5000 },
+      b: { name: 'B', equityUsd: 4950, trades: 22, tradingPlUsd: -50, capitalUsd: 5000 },
+    } });
+    const row = rankings.compute({ atMs: now, stored: true }).periods.weekly.find((entry) => entry.agentId === 'a');
+    assert.equal(row.tradingPnlUsd, 100);
+    assert.equal(row.tradingPnlPct, 0.02, 'tradingPnlPct is a fraction');
+    assert.equal(row.periodTrades, 4);
+    assert.equal(row.baselineTradingPlUsd, 100);
+    assert.equal(row.baselineCapitalUsd, 5000);
+    // Roll into the next week: W47 is archived and must still rank for the rewards scheduler.
+    now = Date.UTC(2026, 10, 23, 12, 0, 0); // Mon 2026-11-23 (2026-W48)
+    await rankings.record({ atMs: now, equityByAgent: {
+      a: { name: 'A', equityUsd: 5300, trades: 16, tradingPlUsd: 300, capitalUsd: 5100 },
+      b: { name: 'B', equityUsd: 4900, trades: 24, tradingPlUsd: -100, capitalUsd: 5000 },
+    } });
+    const archived = rankings.compute({ atMs: Date.UTC(2026, 10, 22, 23, 0, 0), stored: true })
+      .periods.weekly.find((entry) => entry.agentId === 'a');
+    assert.equal(archived.tradingPnlUsd, 100, 'the completed period keeps its trading P&L');
+    assert.equal(archived.tradingPnlPct, 0.02);
+    assert.equal(archived.periodTrades, 4);
+    const carried = rankings.compute({ atMs: now, stored: true }).periods.weekly.find((entry) => entry.agentId === 'a');
+    assert.equal(carried.baselineTradingPlUsd, 200, 'the previous last observation is carried forward');
+    assert.equal(carried.tradingPnlUsd, 100);
+    // A legacy observation without trading fields must never fabricate a trading P&L.
+    await rankings.record({ atMs: now + 60_000, equityByAgent: { legacy: { name: 'Legacy', equityUsd: 1000, trades: 5 } } });
+    const legacy = rankings.compute({ atMs: now + 60_000, stored: true }).periods.weekly.find((entry) => entry.agentId === 'legacy');
+    assert.equal(legacy.tradingPnlUsd, null);
+    assert.equal(legacy.tradingPnlPct, null);
+  });
+
+  it('pays top-3 by period trading RETURN with 50/30/20 shares of a 10% pool budget', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir);
+    const clock = makeClock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const rewards = makeRewardsInstance(dir, clock);
+    await rewards.load();
+    const { calls, ledger } = captureLedger();
+    const result = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [
+        rewardRow({ agentId: 'a', name: 'A', tradingPnlUsd: 50, tradingPnlPct: 0.01 }),
+        rewardRow({ agentId: 'b', name: 'B', tradingPnlUsd: 30, tradingPnlPct: 0.03 }), // best return
+        rewardRow({ agentId: 'c', name: 'C', tradingPnlUsd: 40, tradingPnlPct: 0.02 }),
+      ] } },
+      poolUsd: 1000,
+      ledger,
+    });
+    assert.equal(result.applied, true);
+    assert.equal(result.budgetUsd, 100, 'budget = 10% of the pool');
+    assert.deepEqual(result.winners.map((winner) => winner.agentId), ['b', 'c', 'a'], 'ranked by trading return');
+    assert.deepEqual(result.winners.map((winner) => winner.amountUsd), [50, 30, 20]);
+    assert.deepEqual(result.winners.map((winner) => winner.share), [0.5, 0.3, 0.2]);
+    assert.equal(calls.length, 3);
+    for (const call of calls) {
+      assert.equal(call.from, '__treasury__');
+      assert.equal(call.options.category, 'reward');
+      assert.match(call.options.reason, /^reward:/);
+    }
+    assert.equal(rewards.lifetimeForAgent('b'), 50);
+    assert.equal(rewards.status().lifetimeTotalUsd, 100);
+    const history = rewards.historyForAgent('b');
+    assert.equal(history.length, 1);
+    assert.equal(history[0].periodTradingPnlPct, 0.03);
+    assert.equal(history[0].periodTrades, 5);
+  });
+
+  it('rejects every ineligible candidate without moving money', async () => {
+    const cases = [
+      ['no_measured_trading_baseline', rewardRow({ tradingPnlUsd: null })],
+      ['no_measured_trading_baseline', rewardRow({ baselineTradingPlUsd: null })],
+      ['no_eligible_agents', rewardRow({ tradingPnlUsd: 0.01 })],
+      ['no_eligible_agents', rewardRow({ tradingPnlPct: 0 })],
+      ['no_eligible_agents', rewardRow({ periodTrades: 2 })],
+      ['no_eligible_agents', rewardRow({ drawdownPct: 0.5 })],
+    ];
+    for (const [reason, candidate] of cases) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+      createdDirs.push(dir);
+      const clock = makeClock(Date.UTC(2026, 10, 18, 12, 0, 0));
+      const rewards = makeRewardsInstance(dir, clock);
+      await rewards.load();
+      const { calls, ledger } = captureLedger();
+      const result = await rewards.apply({
+        due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+        rankings: { periods: { weekly: [candidate] } },
+        poolUsd: 1000,
+        ledger,
+      });
+      assert.equal(result.skipped, true, reason);
+      assert.equal(result.applied, true, `${reason}: a skip is recorded`);
+      assert.equal(result.eligibleCount, 0, reason);
+      assert.equal(result.reason, reason, reason);
+      assert.equal(calls.length, 0, `${reason}: no transfer`);
+      assert.equal(result.winners.length, 0, reason);
+    }
+    // Explicit drawdown gate via the risk views (scalar or object form).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir);
+    const clock = makeClock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const rewards = makeRewardsInstance(dir, clock);
+    await rewards.load();
+    const { calls, ledger } = captureLedger();
+    const gated = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [rewardRow({ drawdownPct: 0.01 })] } },
+      poolUsd: 1000,
+      riskByAgent: { a: 0.25 },
+      ledger,
+    });
+    assert.equal(gated.eligibleCount, 0, 'riskByAgent drawdown above the 20% gate rejects');
+    assert.equal(calls.length, 0);
+  });
+
+  it('caps the budget (allocation headroom, maxPerPeriod), the per-agent capital cap, and floors to cents', async () => {
+    const clock = makeClock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const cases = [
+      // [overrides, applyOpts, expectedBudget, expectedAmounts]
+      [{ maxPerPeriodUsd: null, rewardBudgetPctOfPool: 0.1 }, { poolUsd: 1000, allocationCapRemainingUsd: 12.34 }, 12.34, [6.17, 3.7, 2.46]],
+      [{ maxPerPeriodUsd: 7.77 }, { poolUsd: 1000 }, 7.77, [3.88, 2.33, 1.55]],
+    ];
+    for (const [overrides, applyOpts, expectedBudget, expectedAmounts] of cases) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+      createdDirs.push(dir);
+      const rewards = makeRewardsInstance(dir, clock, overrides);
+      await rewards.load();
+      const { calls, ledger } = captureLedger();
+      const result = await rewards.apply({
+        due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+        rankings: { periods: { weekly: [
+          rewardRow({ agentId: 'a', tradingPnlPct: 0.03 }),
+          rewardRow({ agentId: 'b', tradingPnlPct: 0.02 }),
+          rewardRow({ agentId: 'c', tradingPnlPct: 0.01 }),
+        ] } },
+        ledger,
+        ...applyOpts,
+      });
+      assert.equal(result.budgetUsd, expectedBudget);
+      assert.deepEqual(result.winners.map((winner) => winner.amountUsd), expectedAmounts);
+      for (const winner of result.winners) assert.equal(winner.amountUsd, Math.floor(winner.amountUsd * 100) / 100, 'cents only');
+      assert.ok(result.winners.reduce((sum, winner) => sum + winner.amountUsd, 0) <= result.budgetUsd);
+      assert.equal(calls.length, result.winners.length);
+    }
+    // Per-agent cap: 50% of contributed capital, never above the rank share.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir);
+    const rewards = makeRewardsInstance(dir, clock);
+    await rewards.load();
+    const { ledger } = captureLedger();
+    const capped = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [
+        rewardRow({ agentId: 'small', tradingPnlPct: 0.05, capitalUsd: 40, baselineCapitalUsd: 40 }), // cap 20
+        rewardRow({ agentId: 'big', tradingPnlPct: 0.04, capitalUsd: 100000 }),
+      ] } },
+      poolUsd: 1000,
+      ledger,
+    });
+    const small = capped.winners.find((winner) => winner.agentId === 'small');
+    assert.equal(small.amountUsd, 20, 'single reward capped at 50% of contributed capital');
+    assert.ok(small.amountUsd <= 40 * 0.5);
+    const big = capped.winners.find((winner) => winner.agentId === 'big');
+    assert.equal(big.amountUsd, 30, 'uncapped winner still gets its 30% share');
+    // Over-allocating rank shares are scaled back to the budget.
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir2);
+    const rewards2 = makeRewardsInstance(dir2, clock, { rankShares: [0.8, 0.8, 0.8] });
+    await rewards2.load();
+    const scaled = await rewards2.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [
+        rewardRow({ agentId: 'a', tradingPnlPct: 0.03 }),
+        rewardRow({ agentId: 'b', tradingPnlPct: 0.02 }),
+        rewardRow({ agentId: 'c', tradingPnlPct: 0.01 }),
+      ] } },
+      poolUsd: 1000,
+      ledger: captureLedger().ledger,
+    });
+    const paid = scaled.winners.reduce((sum, winner) => sum + winner.amountUsd, 0);
+    assert.ok(paid <= scaled.budgetUsd, 'scaled shares never exceed the budget');
+    assert.equal(paid, 99.99, 'floor to cents');
+  });
+
+  it('records skips, pays a period at most once, and never pays without a pool', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir);
+    const clock = makeClock(Date.UTC(2026, 10, 18, 12, 0, 0));
+    const rewards = makeRewardsInstance(dir, clock);
+    await rewards.load();
+    const { calls, ledger } = captureLedger();
+    const empty = await rewards.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [] } },
+      poolUsd: 1000,
+      ledger,
+    });
+    assert.equal(empty.skipped, true);
+    assert.equal(empty.reason, 'no_candidates');
+    assert.equal(calls.length, 0);
+
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir2);
+    const rewards2 = makeRewardsInstance(dir2, clock);
+    await rewards2.load();
+    const noPool = await rewards2.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [rewardRow()] } },
+      poolUsd: 0,
+      ledger: captureLedger().ledger,
+    });
+    assert.equal(noPool.skipped, true);
+    assert.equal(noPool.reason, 'no_budget');
+    assert.equal(noPool.budgetUsd, 0);
+
+    const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'atm-v33-rewards-'));
+    createdDirs.push(dir3);
+    const rewards3 = makeRewardsInstance(dir3, clock);
+    await rewards3.load();
+    const first = captureLedger();
+    const applyArgs = {
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [rewardRow({ tradingPnlPct: 0.05 })] } },
+      poolUsd: 1000,
+    };
+    const once = await rewards3.apply({ ...applyArgs, ledger: first.ledger });
+    const replay = await rewards3.apply({ ...applyArgs, ledger: first.ledger });
+    assert.equal(once.winners.length, 1);
+    assert.equal(first.calls.length, 1);
+    assert.equal(replay.applied, false, 'a completed period is payable once');
+    assert.equal(replay.reason, 'already_applied');
+    assert.equal(first.calls.length, 1, 'no duplicate transfer');
+    assert.equal(rewards3.getState().history.filter((entry) => entry.periodKey === '2026-W47').length, 1);
+  });
+
+  it('resolves only the v3.3 reward settings (legacy account-cash names are mapped away)', () => {
+    const resolved = resolveRewardSettings({ rewards: {
+      basis: 'account-cash', rankPercents: [0.05, 0.03, 0.02], rankShares: [0.5, 0.3, 0.2],
+      rewardBudgetPctOfPool: 0.25, maxRewardPerAgentPctOfCapital: 0.4,
+      minTradingProfitUsd: 0.5, minTrades: 4, maxDrawdownPct: 0.15, maxPerPeriodUsd: 12,
+    } });
+    assert.equal(resolved.basis, 'trading-performance', 'account-cash can never be selected again');
+    assert.deepEqual(resolved.rankShares, [0.5, 0.3, 0.2]);
+    assert.equal(resolved.rewardBudgetPctOfPool, 0.25);
+    assert.equal(resolved.maxRewardPerAgentPctOfCapital, 0.4);
+    assert.equal(resolved.minTradingProfitUsd, 0.5);
+    assert.equal(resolved.minTrades, 4);
+    assert.equal(resolved.maxDrawdownPct, 0.15);
+    assert.equal(resolved.maxPerPeriodUsd, 12);
+    const legacyOnly = resolveRewardSettings({ rewards: { basis: 'account-cash', rankPercents: [0.05, 0.03, 0.02] } });
+    assert.equal(legacyOnly.basis, 'trading-performance');
+    assert.equal(legacyOnly.minTrades, 3, 'documented default');
+    assert.equal(legacyOnly.rewardBudgetPctOfPool, 0.1, 'documented default');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L4. end-to-end: a reward becomes CAPITAL, never P&L (deterministic sim world)
+// ---------------------------------------------------------------------------
+describe('v3.3 end-to-end: rewards pay capital, not P&L (deterministic sim, no network)', () => {
+  const world = {};
+
+  before(async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 6 },
+      burn: { inferencePerCycleUsd: 0, dataPerCycleUsd: 0, hostingPerHourUsd: 0, committedMonthlyUsd: 0 },
+      // Big cadence + explicit analysis stamps => the payout ticks cannot trade; burn is zero,
+      // so trading P&L can only move through the ledger fills the test injects.
+      cadence: { day: { intervalSec: 86400, timeframe: '1Min' }, swing: { intervalSec: 86400, timeframe: '1Hour' } },
+      rewards: { maxPerPeriodUsd: 100 },
+      // Large absolute order cap so the mandate size is the % of equity: reward capital then
+      // visibly grows the order-sizing budget (buying power), while P&L stays trading-only.
+      risk: { maxOrderNotionalUsd: 10000, maxOrderPctOfEquity: 0.5 },
+    });
+    const clock = makeClock(Date.UTC(2026, 10, 21, 2, 0, 0)); // Sat 02:00Z -> weekly 2026-W47
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    world.env = env;
+    world.clock = clock;
+    world.broker = broker;
+    world.automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await world.automaton.init();
+    world.internals = world.automaton._internals;
+    world.ledger = world.internals.ledger;
+    world.registry = world.internals.registry;
+    world.agents = world.registry.alive();
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    clock.advance(CYCLE_MS);
+    world.tick1 = await world.automaton.tick();
+    // Real trading results + trade counts through the ledger fill path (round trips at a profit).
+    for (const [index, profit] of [[0, 111], [1, 61], [2, 31]]) {
+      const agentId = world.agents[index].id;
+      world.ledger.applyFill(agentId, { symbol: 'AAPL', side: 'buy', qty: profit / 10, priceUsd: 100, at: clock.now() });
+      world.ledger.applyFill(agentId, { symbol: 'AAPL', side: 'sell', qty: profit / 10, priceUsd: 110, at: clock.now() });
+    }
+    for (const agent of world.agents) {
+      world.ledger.applyFill(agent.id, { symbol: 'MSFT', side: 'buy', qty: 1, priceUsd: 50, at: clock.now() });
+      world.ledger.applyFill(agent.id, { symbol: 'MSFT', side: 'sell', qty: 1, priceUsd: 50.5, at: clock.now() });
+    }
+    await world.ledger.save();
+    clock.advance(CYCLE_MS);
+    world.tick2 = await world.automaton.tick();
+    world.weekRows = (await world.automaton.status()).rankings.periods.weekly;
+    // Cross the weekly boundary; stamp analysis so the payout tick cannot trade.
+    clock.set(Date.UTC(2026, 10, 23, 0, 1, 0)); // Mon 2026-11-23 -> 2026-W48
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.before = world.agents.map((agent) => ({
+      id: agent.id,
+      equity: world.ledger.equity(agent.id, {}),
+      capital: world.ledger.capitalOf(agent.id),
+    }));
+    world.poolBefore = world.ledger.pool();
+    world.tick3 = await world.automaton.tick();
+    world.payout = world.tick3.rewards;
+    world.after = world.agents.map((agent) => ({
+      id: agent.id,
+      equity: world.ledger.equity(agent.id, {}),
+      capital: world.ledger.capitalOf(agent.id),
+    }));
+    world.poolAfter = world.ledger.pool();
+    // Treasury mandate sizing: tick3 saw the pre-payout equities; tick4 prices the reward capital.
+    world.mandatesBefore = structuredClone(world.internals.state.lastTreasury?.mandates ?? {});
+    world.mandateViewsBefore = structuredClone(world.internals.state.lastTreasury?.agentViews ?? []);
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.tick4 = await world.automaton.tick();
+    world.mandatesAfter = structuredClone(world.internals.state.lastTreasury?.mandates ?? {});
+    world.mandateViewsAfter = structuredClone(world.internals.state.lastTreasury?.agentViews ?? []);
+    // A small trading loss AFTER the payout gives the market view a non-zero daily P&L, which is
+    // what makes the UI percent-scale regression meaningful (a fraction, never 100x).
+    world.ledger.applyFill(world.agents[0].id, { symbol: 'AAPL', side: 'buy', qty: 2, priceUsd: 100, at: clock.now() });
+    world.ledger.applyFill(world.agents[0].id, { symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 90, at: clock.now() });
+    await world.ledger.save();
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.tick5 = await world.automaton.tick();
+    world.final = world.agents.map((agent) => ({
+      id: agent.id,
+      equity: world.ledger.equity(agent.id, {}),
+      capital: world.ledger.capitalOf(agent.id),
+    }));
+    world.rewardsState = createRewards({ paths: env.paths, config: env.config, clock });
+    await world.rewardsState.load();
+    world.status = await world.automaton.status();
+  });
+
+  it('measures a trading baseline first and never rewards an unmeasured period', () => {
+    assert.equal(world.tick1.rewards?.due, false, 'the first cycle anchors the period, it cannot pay');
+    assert.equal((world.tick1.rewards?.winners?.length ?? 0), 0);
+    assert.equal(world.weekRows.length, 3);
+    for (const row of world.weekRows) {
+      assert.ok(row.tradingPnlUsd > 30, `measured period trading P&L, got ${row.tradingPnlUsd}`);
+      assert.ok(row.tradingPnlPct > 0 && row.tradingPnlPct < 0.1, `fraction return, got ${row.tradingPnlPct}`);
+      assert.equal(row.periodTrades, 4, 'period trades are measured');
+      assert.equal(row.baselineTradingPlUsd, 0);
+      assert.equal(row.baselineCapitalUsd, 5000);
+    }
+    assert.deepEqual(world.weekRows.map((row) => row.agentId), world.agents.map((agent) => agent.id), 'ranked by trading return');
+  });
+
+  it('pays the top-3 50/30/20 of the $100 budget as reward capital on a new period', () => {
+    assert.equal(world.payout.periodKey, '2026-W47');
+    assert.equal(world.payout.basis, 'trading-performance');
+    assert.equal(world.payout.budgetUsd, 100);
+    assert.deepEqual(world.payout.winners.map((winner) => winner.amountUsd), [50, 30, 20]);
+    assert.deepEqual(world.payout.winners.map((winner) => winner.agentId), world.agents.map((agent) => agent.id));
+    assert.deepEqual(world.payout.winners.map((winner) => winner.share), [0.5, 0.3, 0.2]);
+    for (const winner of world.payout.winners) {
+      assert.equal(winner.capitalUsd, 5000);
+      assert.ok(winner.periodTradingPnlUsd > 0 && winner.periodTradingPnlUsd < 200);
+      assert.ok(winner.periodTradingPnlPct > 0);
+      assert.equal(winner.periodTrades, 4);
+    }
+  });
+
+  it('increases equity and contributed/reward capital by the payout while trading P&L stays EXACTLY unchanged', () => {
+    for (let index = 0; index < world.agents.length; index += 1) {
+      const before = world.before[index];
+      const after = world.after[index];
+      const amount = world.payout.winners[index].amountUsd;
+      assert.equal(after.capital.capitalContributionsUsd, before.capital.capitalContributionsUsd + amount, 'capital contribution');
+      assert.equal(after.capital.rewardCapitalUsd, before.capital.rewardCapitalUsd + amount, 'reward capital');
+      assert.equal(after.capital.baseCapitalUsd, before.capital.baseCapitalUsd, 'base capital unchanged');
+      assert.equal(after.equity.equityUsd, before.equity.equityUsd + amount, 'total equity rises by the capital');
+      assert.equal(after.equity.tradingPnlUsd, before.equity.tradingPnlUsd, 'trading P&L must NOT change');
+      assert.equal(after.equity.equityUsd - after.equity.capitalContributionsUsd, after.equity.tradingPnlUsd, 'fair identity');
+    }
+    const executed = world.tick3.executions.reduce((sum, entry) => sum + (entry.orders ?? 0), 0);
+    assert.equal(executed, 0, 'the payout tick placed no order (isolated reward effect)');
+  });
+
+  it('reward capital raises buying power and the mandate/order-size budget, never measured P&L', () => {
+    for (let index = 0; index < world.agents.length; index += 1) {
+      const agentId = world.agents[index].id;
+      const amount = world.payout.winners[index].amountUsd;
+      const viewBefore = world.mandateViewsBefore.find((view) => view.agentId === agentId);
+      const viewAfter = world.mandateViewsAfter.find((view) => view.agentId === agentId);
+      assert.ok(viewBefore && viewAfter, 'treasury priced the agent');
+      assert.equal(round2(viewAfter.equityUsd - viewBefore.equityUsd), amount, 'the reward raises buying power by its amount');
+      const mandateBefore = world.mandatesBefore[agentId];
+      const mandateAfter = world.mandatesAfter[agentId];
+      assert.ok(mandateBefore && mandateAfter, 'mandate issued');
+      assert.ok(mandateAfter.sizeBudgetUsd > mandateBefore.sizeBudgetUsd, 'mandate/order sizing can grow with reward capital');
+      assert.equal(round2(mandateAfter.sizeBudgetUsd - mandateBefore.sizeBudgetUsd), round2(amount * 0.5), 'size follows the % of equity');
+      assert.equal(mandateAfter.sizeBudgetUsd, round2(0.5 * viewAfter.equityUsd), 'size budget = 50% of post-reward equity');
+    }
+  });
+
+  it('conserves the treasury pool and never pays the same period twice', () => {
+    assert.equal(world.poolAfter.totalUsd, world.poolBefore.totalUsd, 'money moved, not created');
+    assert.equal(world.poolAfter.poolUsd, round2(world.poolBefore.poolUsd - 100), 'unallocated pool paid out');
+    assert.equal(world.tick4.rewards?.due, false, 'the next tick in the new period does not pay');
+    assert.equal(world.tick4.rewards?.winners?.length ?? 0, 0);
+  });
+
+  it('persists reward history/lifetime and refuses a replayed payout', async () => {
+    const stateRewards = world.rewardsState.getState();
+    const entry = stateRewards.history.find((item) => item.periodKey === '2026-W47');
+    assert.ok(entry);
+    assert.equal(entry.budgetUsd, 100);
+    assert.equal(entry.basis, 'trading-performance');
+    assert.equal(entry.winners.length, 3);
+    assert.equal(entry.winners[0].share, 0.5);
+    assert.ok(entry.winners[0].periodTradingPnlPct > 0);
+    assert.equal(entry.winners[0].periodTrades, 4);
+    assert.equal(world.rewardsState.lifetimeForAgent(world.agents[0].id), 50);
+    assert.equal(world.rewardsState.lifetimeForAgent(world.agents[1].id), 30);
+    assert.equal(world.rewardsState.lifetimeForAgent(world.agents[2].id), 20);
+    assert.equal(world.rewardsState.status().lifetimeTotalUsd, 100);
+    const replay = await world.rewardsState.apply({
+      due: { period: 'weekly', periodKey: '2026-W47', completed: true, currentPeriodKey: '2026-W48' },
+      rankings: { periods: { weekly: [] } },
+      poolUsd: 1000,
+      ledger: world.ledger,
+    });
+    assert.equal(replay.applied, false);
+    assert.equal(replay.reason, 'already_applied');
+    assert.equal(world.rewardsState.getState().history.filter((item) => item.periodKey === '2026-W47').length, 1);
+  });
+
+  it('exposes the v3.3 status contract with consistent percent scales', () => {
+    const status = world.status;
+    assert.equal(status.engine.capitalAccounting.version, 2);
+    assert.equal(status.engine.capitalAccounting.rewardedAgents, 3);
+    assert.equal(round2(status.engine.capitalAccounting.rewardsLifetimeTotalUsd), 100);
+    assert.equal(status.engine.rewards.rules.basis, 'trading-performance');
+    assert.deepEqual(status.engine.rewards.rules.rankShares, [0.5, 0.3, 0.2]);
+    assert.ok(Array.isArray(status.engine.rewards.rules.explain) && status.engine.rewards.rules.explain.length >= 4);
+    assert.equal(status.engine.rewards.budgetUsd, 100, 'next-period budget preview (maxPerPeriodUsd cap)');
+    assert.equal(round2(status.engine.rewards.lifetimeTotalUsd), 100);
+    assert.equal(status.engine.rewards.history.length, 1);
+    for (let index = 0; index < world.agents.length; index += 1) {
+      const amount = world.payout.winners[index].amountUsd;
+      const row = status.agents.find((agent) => agent.id === world.agents[index].id);
+      assert.equal(row.capital.contributedUsd, 5000 + amount);
+      assert.equal(row.capital.baseUsd, 5000);
+      assert.equal(row.capital.rewardCapitalUsd, amount);
+      assert.equal(row.capital.capitalVersion, 2);
+      assert.equal(row.capital.rewardSharePct, Math.round((amount / (5000 + amount)) * 10000) / 100, 'rewardSharePct = percent points');
+      assert.ok(row.capital.rewardSharePct > 0 && row.capital.rewardSharePct <= 100);
+      assert.equal(row.rewards.lifetimeUsd, amount);
+      assert.equal(row.rewards.count, 1);
+      assert.equal(row.rewards.history.length, 1);
+      assert.equal(row.rewards.history[0].periodKey, '2026-W47');
+      assert.equal(row.rewards.history[0].amountUsd, amount);
+      assert.equal(row.tradingPnlUsd, world.final[index].equity.tradingPnlUsd);
+      assert.equal(row.pnl.tradingUsd, row.tradingPnlUsd);
+      assert.equal(row.pnl.tradingPct, row.tradingPnlPct);
+      assert.equal(row.tradingPnlPct, Math.round((row.tradingPnlUsd / world.final[index].capital.capitalContributionsUsd) * 1000000) / 1000000, 'fraction');
+      assert.ok(Math.abs(row.tradingPnlPct) < 1, 'tradingPnlPct must be a fraction');
+      assert.equal(row.pnl.netUsd, row.tradingPnlUsd, 'legacy netUsd alias means trading P&L');
+      assert.equal(row.pnl.rewardsUsd, amount);
+    }
+  });
+
+  it('serves status and marketView for a stopped (never trading) engine without a 100x percent bug', async () => {
+    const status = await world.automaton.status();
+    assert.equal(status.engine.running, false);
+    const stoppedEngine = createEngine({
+      cwd: world.env.dir,
+      envFile: path.join(world.env.dir, '.env'),
+      clock: world.clock,
+      overrides: { stateDir: world.env.paths.stateDir, mode: 'sim', accountEquityUsd: 100000 },
+    });
+    const engineStatus = await stoppedEngine.status();
+    assert.equal(engineStatus.engine.running, false);
+    assert.equal(engineStatus.engine.capitalAccounting.version, 2);
+    assert.equal(engineStatus.engine.rewards.rules.basis, 'trading-performance');
+    const view = await stoppedEngine.marketView();
+    assert.equal(view.ok, true);
+    const portfolio = view.portfolio;
+    assert.equal(typeof portfolio.tradingDayPnlUsd, 'number');
+    assert.equal(portfolio.dayPnlUsd, portfolio.tradingDayPnlUsd, 'fair trading alias');
+    assert.equal(portfolio.dayPnlPct, portfolio.tradingDayPnlPct, 'fair trading alias');
+    assert.ok(Math.abs(portfolio.tradingDayPnlPct) < 1, `portfolio tradingDayPnlPct must be a FRACTION, got ${portfolio.tradingDayPnlPct}`);
+    const totalCapital = view.agents.reduce((sum, agent) => sum + (Number(agent.capitalUsd) || 0), 0);
+    assert.ok(totalCapital > 0);
+    assert.equal(
+      portfolio.tradingDayPnlPct,
+      Math.round((portfolio.tradingDayPnlUsd / totalCapital) * 1000000) / 1000000,
+      'portfolio pct = trading day P&L / contributed capital (fraction)',
+    );
+    const dayUsdSum = view.agents.reduce((sum, agent) => sum + (Number(agent.tradingDayPnlUsd) || 0), 0);
+    assert.equal(portfolio.tradingDayPnlUsd, round2(dayUsdSum), 'portfolio day P&L is the per-agent trading sum');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L5. daily loss is measured on trading P&L only (reward/withdrawal cannot look like P&L)
+// ---------------------------------------------------------------------------
+describe('v3.3 daily loss uses trading P&L, not equity or capital moves', () => {
+  const world = {};
+
+  before(async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 6 },
+      burn: { inferencePerCycleUsd: 0, dataPerCycleUsd: 0, hostingPerHourUsd: 0, committedMonthlyUsd: 0 },
+      cadence: { day: { intervalSec: 86400, timeframe: '1Min' }, swing: { intervalSec: 86400, timeframe: '1Hour' } },
+      // 0.1% of day-start equity = $5: a -$50 trading loss is fatal, a -$500 CAPITAL move is not.
+      risk: { maxDailyLossPct: 0.001 },
+    });
+    const clock = makeClock(Date.UTC(2026, 10, 21, 2, 0, 0));
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    world.env = env;
+    world.clock = clock;
+    world.automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await world.automaton.init();
+    world.internals = world.automaton._internals;
+    world.ledger = world.internals.ledger;
+    world.registry = world.internals.registry;
+    world.agents = world.registry.alive();
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    world.day0 = readJsonFile(env.paths.dayStats).agents[world.agents[0].id];
+    // A reward payout raises equity by $500 but not trading P&L -> no daily gain/loss.
+    world.ledger.transfer('__treasury__', world.agents[0].id, 500, { reason: 'reward:2026-W47', category: 'reward', at: clock.now() });
+    await world.ledger.save();
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.rewardTick = await world.automaton.tick();
+    world.day1 = readJsonFile(env.paths.dayStats).agents[world.agents[0].id];
+    // A capital WITHDRAWAL drops equity by $500 (equity-based daily loss would be -$500 = fatal at
+    // a 0.1% cap) but trading P&L is unchanged -> must NOT trigger the rule.
+    world.ledger.transfer(world.agents[0].id, '__treasury__', 500, { reason: 'capital withdrawal', at: clock.now() });
+    await world.ledger.save();
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.withdrawTick = await world.automaton.tick();
+    world.day2 = readJsonFile(env.paths.dayStats).agents[world.agents[0].id];
+    // A real -$50 trading loss IS a daily loss and must produce the daily_loss_limit verdict.
+    const loser = world.agents[1].id;
+    world.ledger.applyFill(loser, { symbol: 'AAPL', side: 'buy', qty: 10, priceUsd: 100, at: clock.now() });
+    world.ledger.applyFill(loser, { symbol: 'AAPL', side: 'sell', qty: 10, priceUsd: 95, at: clock.now() });
+    await world.ledger.save();
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.lossTick = await world.automaton.tick();
+    world.day3 = readJsonFile(env.paths.dayStats).agents[loser];
+    // The sim demo reaper executes the verdict on the next cycle from the persisted day record.
+    clock.advance(CYCLE_MS);
+    for (const agent of world.agents) world.internals.state.lastAnalysisAt.set(agent.id, clock.now());
+    world.executeTick = await world.automaton.tick();
+    world.journal = createJournal({ paths: env.paths, config: env.config });
+  });
+
+  it('a reward payout does not look like a daily gain (day P&L unchanged, trading baseline kept)', () => {
+    assert.equal(world.day0.pnlUsd, 0);
+    assert.equal(world.rewardTick.deaths.filter((death) => death.agentId === world.agents[0].id).length, 0);
+    assert.equal(world.registry.get(world.agents[0].id).status, 'alive');
+    assert.equal(world.day1.startTradingPlUsd, world.day0.startTradingPlUsd);
+    assert.equal(world.day1.pnlUsd, world.day0.pnlUsd, 'reward capital must not be counted as daily profit or loss');
+    assert.ok('startTradingPlUsd' in world.day1, 'day-stats persist the trading baseline');
+  });
+
+  it('a capital withdrawal does not look like a daily loss', () => {
+    assert.equal(world.withdrawTick.deaths.filter((death) => death.agentId === world.agents[0].id).length, 0, 'no daily_loss_limit for moving capital out');
+    assert.equal(world.registry.get(world.agents[0].id).status, 'alive');
+    assert.equal(world.day2.pnlUsd, world.day1.pnlUsd);
+    assert.equal(world.day2.startTradingPlUsd, world.day1.startTradingPlUsd);
+  });
+
+  it('a real trading loss reaches the daily-loss rule (daily_loss_limit verdict)', async () => {
+    assert.equal(round2(world.day3.pnlUsd), -50, 'the persisted day P&L is the trading loss');
+    const verdict = world.lossTick.deaths.find((death) => death.agentId === world.agents[1].id);
+    assert.ok(verdict, 'daily-loss verdict must fire on a trading loss');
+    assert.equal(verdict.cause, 'daily_loss_limit');
+    assert.equal(world.registry.get(world.agents[1].id).status, 'dead', 'the demo Reaper executed the verdict');
+    const obituaries = await world.journal.list({ limit: 5 });
+    assert.equal(obituaries.length, 1, 'one obituary');
+    assert.equal(obituaries[0].agentId, world.agents[1].id);
+    assert.equal(obituaries[0].cause, 'daily_loss_limit');
+    assert.ok(world.executeTick.deathsExecuted?.some((entry) => entry.agentId === world.agents[1].id));
+  });
+});
+

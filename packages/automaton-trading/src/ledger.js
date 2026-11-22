@@ -14,10 +14,22 @@
  * Money enters only through `grant` (genesis), `credit` (one-time capital top-up) and
  * `transfer` (internal moves); `charge` removes costs.
  *
- * Persistence is backward compatible: legacy positions {qty, avgPriceUsd, openedAt} are
- * normalised on load (and OCC symbols are recognised as options).
+ * v3.3 fair P&L (docs/FAIR-PNL-REWARDS.md §2-§3): every record tracks the CAPITAL
+ * CONTRIBUTED separately from equity, so reward payouts are capital, never trading profit:
+ *   - `capitalContributionsUsd`: base endowment + top-ups + credits + treasury transfers in,
+ *     minus capital withdrawals (treasury transfers out);
+ *   - `rewardCapitalUsd`: the subset that came from reward payouts;
+ *   - `capitalVersion`: 2 once v3.3 accounting is active (1 = legacy fallback on load);
+ *   - `capitalPendingUsd`: internal aid — declared endowment not yet funded by cash, so the
+ *     ensureAgent(endowment) + grant(endowment) genesis pair counts the basis once, not twice.
+ * Trading P&L is `equity − capitalContributionsUsd`; fills and costs never touch capital.
  *
- * Owned by mortality-core. Contract: docs/INSTRUMENTS.md + docs/CONTRACTS.md.
+ * Persistence is backward compatible: legacy positions {qty, avgPriceUsd, openedAt} are
+ * normalised on load (and OCC symbols are recognised as options), and legacy records get
+ * `capitalContributionsUsd = declaredEndowmentUsd + creditsUsd`, reward 0, version 1.
+ *
+ * Owned by mortality-core. Contract: docs/INSTRUMENTS.md + docs/CONTRACTS.md +
+ * docs/FAIR-PNL-REWARDS.md §3.
  */
 
 import path from 'node:path';
@@ -128,6 +140,17 @@ function priceLookup(prices, symbol) {
 }
 
 /**
+ * True when a contribution is a reward payout: category 'reward' or a /reward/i reason
+ * (the rewards scheduler pays `{reason:'reward:<periodKey>', category:'reward'}`).
+ * @param {string|null|undefined} category
+ * @param {string|null|undefined} reason
+ * @returns {boolean}
+ */
+function isRewardContribution(category, reason) {
+  return String(category ?? '').toLowerCase() === 'reward' || /reward/i.test(String(reason ?? ''));
+}
+
+/**
  * @param {{ paths?: object, config?: object, clock?: object }} [options]
  */
 export function createLedger({ paths, config, clock } = {}) {
@@ -155,6 +178,7 @@ export function createLedger({ paths, config, clock } = {}) {
 
   function newRecord(agentId, { endowmentUsd = 0, at } = {}) {
     const atIso = new Date(normalizeAt(at, currentClock)).toISOString();
+    const declaredEndowmentUsd = round2(Math.max(0, Number(endowmentUsd) || 0));
     return {
       agentId,
       cashUsd: 0,
@@ -167,10 +191,18 @@ export function createLedger({ paths, config, clock } = {}) {
       creditsUsd: 0,
       trades: 0,
       firstProfitAt: null,
-      declaredEndowmentUsd: round2(Math.max(0, Number(endowmentUsd) || 0)),
+      declaredEndowmentUsd,
+      // v3.3 fair capital accounting (docs/FAIR-PNL-REWARDS.md §3). A new/empty record is
+      // created capital-aware (version 2) with the declared endowment as its capital basis;
+      // `capitalPendingUsd` tracks that declared basis until the genesis grant/credit funds it,
+      // so ensureAgent(endowment) + grant(endowment) counts the same $ basis once.
+      capitalContributionsUsd: declaredEndowmentUsd,
+      rewardCapitalUsd: 0,
+      capitalVersion: 2,
+      capitalPendingUsd: declaredEndowmentUsd,
       startedAt: atIso,
       fills: [],
-      events: [{ atMs: Date.parse(atIso), kind: 'endowment-declared', amountUsd: round2(Number(endowmentUsd) || 0) }],
+      events: [{ atMs: Date.parse(atIso), kind: 'endowment-declared', amountUsd: declaredEndowmentUsd }],
       markPrices: {},
       lastUnrealizedUsd: 0,
       lastMarginDebtUsd: 0,
@@ -287,7 +319,41 @@ export function createLedger({ paths, config, clock } = {}) {
     record.lastMarginDebtUsd = round2(Number(record.lastMarginDebtUsd) || 0);
     record.lastGrossExposureUsd = round2(Number(record.lastGrossExposureUsd) || 0);
     record.lastNetExposureUsd = round2(Number(record.lastNetExposureUsd) || 0);
+    normaliseCapital(record, raw);
     return record;
+  }
+
+  /**
+   * Normalise the v3.3 capital fields (docs/FAIR-PNL-REWARDS.md §3).
+   *
+   * Legacy records (no capital fields) get the documented fallback:
+   *   capitalContributionsUsd = declaredEndowmentUsd + creditsUsd, rewardCapitalUsd = 0,
+   *   capitalVersion = 1, capitalPendingUsd = 0.
+   * Records already carrying the fields (v3.3 saves) keep them, clamped to finite/≥0/round2;
+   * `capitalPendingUsd` is only the internal declared-basis funding aid and defaults to 0, so
+   * migrated records never swallow a later grant.
+   */
+  function normaliseCapital(record, raw) {
+    const hasCapitalFields = isPlainObject(raw) && (
+      Object.prototype.hasOwnProperty.call(raw, 'capitalContributionsUsd')
+      || Object.prototype.hasOwnProperty.call(raw, 'rewardCapitalUsd')
+      || Object.prototype.hasOwnProperty.call(raw, 'capitalVersion')
+    );
+    if (!hasCapitalFields) {
+      record.capitalContributionsUsd = round2(record.declaredEndowmentUsd + record.creditsUsd);
+      record.rewardCapitalUsd = 0;
+      record.capitalVersion = 1;
+      record.capitalPendingUsd = 0;
+      return;
+    }
+    record.capitalContributionsUsd = round2(Math.max(0, Number(record.capitalContributionsUsd) || 0));
+    record.rewardCapitalUsd = round2(Math.min(
+      record.capitalContributionsUsd,
+      Math.max(0, Number(record.rewardCapitalUsd) || 0),
+    ));
+    record.capitalVersion = Number(record.capitalVersion) >= 2 ? 2 : 1;
+    record.capitalPendingUsd = round2(Math.max(0, Number(record.capitalPendingUsd) || 0));
+    record.capitalPendingUsd = Math.min(record.capitalPendingUsd, record.declaredEndowmentUsd);
   }
 
   function pruneEvents(record) {
@@ -326,6 +392,18 @@ export function createLedger({ paths, config, clock } = {}) {
         kind: 'endowment-declared',
         amountUsd: record.declaredEndowmentUsd,
       });
+      // A brand-new/empty record gets the declared endowment as its v3.3 capital basis, held as
+      // "pending" until the genesis grant/credit actually funds it (so it is counted once).
+      const empty = record.cashUsd === 0
+        && Object.keys(record.positions).length === 0
+        && record.fills.length === 0
+        && round2(Number(record.capitalContributionsUsd) || 0) === 0;
+      if (empty) {
+        record.capitalContributionsUsd = record.declaredEndowmentUsd;
+        record.rewardCapitalUsd = 0;
+        record.capitalVersion = 2;
+        record.capitalPendingUsd = record.declaredEndowmentUsd;
+      }
     }
     return clone(record);
   }
@@ -632,6 +710,97 @@ export function createLedger({ paths, config, clock } = {}) {
   // costs / transfers / capital
   // -------------------------------------------------------------------------
 
+  /** Clamped capital contributions of a record (finite, ≥0, 2dp). */
+  function capitalTotal(record) {
+    return round2(Math.max(0, Number(record?.capitalContributionsUsd) || 0));
+  }
+
+  /** Clamped reward-capital subset of a record (≤ capital, ≥0, 2dp). */
+  function rewardCapitalTotal(record) {
+    return round2(Math.min(capitalTotal(record), Math.max(0, Number(record?.rewardCapitalUsd) || 0)));
+  }
+
+  /** v3.3 capital decomposition at the record's stored marks (no mutation). */
+  function capitalDecomposition(record) {
+    const capitalContributionsUsd = capitalTotal(record);
+    const rewardCapitalUsd = rewardCapitalTotal(record);
+    const baseCapitalUsd = round2(Math.max(0, capitalContributionsUsd - rewardCapitalUsd));
+    const tradingPnlUsd = round2(equityAtStoredMarks(record) - capitalContributionsUsd);
+    const tradingPnlPct = capitalContributionsUsd > 0 ? round4(tradingPnlUsd / capitalContributionsUsd) : null;
+    return {
+      capitalContributionsUsd,
+      rewardCapitalUsd,
+      baseCapitalUsd,
+      tradingPnlUsd,
+      tradingPlUsd: tradingPnlUsd,
+      tradingPnlPct,
+      capitalVersion: Number(record?.capitalVersion) >= 2 ? 2 : 1,
+    };
+  }
+
+  /**
+   * Record a capital contribution (cash comes in elsewhere): raise capital contributions and,
+   * for reward payouts, the reward-capital subset. Never touches realized/unrealized P&L.
+   *
+   * `fundDeclaredBasis` is the internal genesis aid: the declared endowment is already counted
+   * by `ensureAgent`, so the first plain (non-reward) grant/credit consumes that pending basis
+   * instead of adding it a second time. A reward payout NEVER consumes the basis — reward money
+   * must always raise capital or it would look like trading profit.
+   *
+   * @param {object} record
+   * @param {number} amountUsd
+   * @param {{ reward?: boolean, fundDeclaredBasis?: boolean }} [options]
+   * @returns {{ addedUsd:number, rewardAddedUsd:number, capitalContributionsUsd:number }}
+   */
+  function addCapitalContribution(record, amountUsd, { reward = false, fundDeclaredBasis = false } = {}) {
+    const amount = round2(Math.max(0, Number(amountUsd) || 0));
+    const capitalBefore = capitalTotal(record);
+    let addedUsd = amount;
+    if (fundDeclaredBasis && !reward) {
+      const pendingBefore = round2(Math.max(0, Number(record.capitalPendingUsd) || 0));
+      const consumed = Math.min(pendingBefore, addedUsd);
+      if (consumed > 0) {
+        record.capitalPendingUsd = round2(pendingBefore - consumed);
+        addedUsd = round2(addedUsd - consumed);
+      }
+    }
+    const rewardAddedUsd = reward ? addedUsd : 0;
+    record.capitalContributionsUsd = round2(capitalBefore + addedUsd);
+    if (rewardAddedUsd > 0) {
+      record.rewardCapitalUsd = round2(Math.min(
+        record.capitalContributionsUsd,
+        rewardCapitalTotal(record) + rewardAddedUsd,
+      ));
+    }
+    return {
+      addedUsd,
+      rewardAddedUsd,
+      capitalContributionsUsd: record.capitalContributionsUsd,
+    };
+  }
+
+  /**
+   * Capital withdrawal (agent → treasury): reduce capital contributions, and reduce reward
+   * capital only for the part of the withdrawal that exceeds the non-reward capital. Never P&L.
+   * @returns {{ withdrawnCapitalUsd:number, capitalContributionsUsd:number }}
+   */
+  function withdrawCapital(record, amountUsd) {
+    const amount = round2(Math.max(0, Number(amountUsd) || 0));
+    const capitalBefore = capitalTotal(record);
+    const rewardBefore = rewardCapitalTotal(record);
+    const nonRewardCapital = round2(Math.max(0, capitalBefore - rewardBefore));
+    const capitalAfter = round2(Math.max(0, capitalBefore - amount));
+    const excess = round2(Math.max(0, amount - nonRewardCapital));
+    const rewardAfter = round2(Math.max(0, rewardBefore - Math.min(rewardBefore, excess)));
+    record.capitalContributionsUsd = capitalAfter;
+    record.rewardCapitalUsd = round2(Math.min(capitalAfter, rewardAfter));
+    record.capitalPendingUsd = round2(Math.min(
+      Math.max(0, Number(record.capitalPendingUsd) || 0),
+      record.capitalContributionsUsd,
+    ));
+    return { withdrawnCapitalUsd: round2(capitalBefore - capitalAfter), capitalContributionsUsd: capitalAfter };
+  }
+
   /** Attribute a cost (inference, data, hosting) to an agent and a role. */
   function charge(agentId, amountUsd, { category = 'inference', role = 'executor', ref = null, at } = {}) {
     const record = requireRecord(agentId);
@@ -661,8 +830,14 @@ export function createLedger({ paths, config, clock } = {}) {
   /**
    * Move existing cash between accounts. Both sides auto-create records so init order
    * does not matter; the source must have the cash (never go negative).
+   *
+   * v3.3 capital classification (docs/FAIR-PNL-REWARDS.md §3):
+   *   - treasury → agent: capital contribution (plus reward capital when category is
+   *     'reward' or the reason matches /reward/i) — this is the reward-payout path;
+   *   - agent → treasury: capital withdrawal (reduces capital, never P&L);
+   *   - any other direction: cash only (not capital), as before.
    */
-  function transfer(fromId, toId, amountUsd, { reason = 'transfer', at } = {}) {
+  function transfer(fromId, toId, amountUsd, { reason = 'transfer', category = null, at } = {}) {
     if (typeof fromId !== 'string' || fromId === '' || typeof toId !== 'string' || toId === '') {
       fail('CONFIG_INVALID', 'transfer requires non-empty fromId and toId', { fromId, toId });
     }
@@ -686,16 +861,48 @@ export function createLedger({ paths, config, clock } = {}) {
     const to = ensureRecord(toId, { endowmentUsd: 0, at: atMs });
     from.cashUsd = round8(from.cashUsd - amount);
     to.cashUsd = round8(to.cashUsd + amount);
-    from.events.push({ atMs, kind: 'transfer-out', amountUsd: amount, toId, reason });
-    to.events.push({ atMs, kind: 'transfer-in', amountUsd: amount, fromId, reason });
+    const fromEvent = { atMs, kind: 'transfer-out', amountUsd: amount, toId, reason };
+    const toEvent = { atMs, kind: 'transfer-in', amountUsd: amount, fromId, reason };
+    if (category !== null && category !== undefined) {
+      fromEvent.category = category;
+      toEvent.category = category;
+    }
+    if (fromId === TREASURY_ID) {
+      // treasury → agent: capital contribution; reward payouts become reward capital.
+      const reward = isRewardContribution(category, reason);
+      const contribution = addCapitalContribution(to, amount, { reward });
+      toEvent.capitalUsd = contribution.addedUsd;
+      if (contribution.rewardAddedUsd > 0) toEvent.rewardUsd = contribution.rewardAddedUsd;
+    } else if (toId === TREASURY_ID) {
+      // agent → treasury: capital withdrawal, never trading P&L.
+      const withdrawal = withdrawCapital(from, amount);
+      fromEvent.capitalUsd = -withdrawal.withdrawnCapitalUsd;
+    } else {
+      // cash only (not capital): a parent-funded child has now received the declared basis
+      // that ensureAgent counted up front, so clear that internal pending marker.
+      const pending = round2(Math.max(0, Number(to.capitalPendingUsd) || 0));
+      if (pending > 0) to.capitalPendingUsd = round2(Math.max(0, pending - amount));
+    }
+    from.events.push(fromEvent);
+    to.events.push(toEvent);
     from.updatedAt = new Date(atMs).toISOString();
     to.updatedAt = from.updatedAt;
     pruneEvents(from);
     pruneEvents(to);
+    return {
+      fromCapitalUsd: capitalTotal(from),
+      toCapitalUsd: capitalTotal(to),
+      toRewardCapitalUsd: rewardCapitalTotal(to),
+    };
   }
 
-  /** Genesis funding: creates virtual cash for an agent (the orchestrator seeds once). */
-  function grant(agentId, amountUsd, { reason = 'grant', at } = {}) {
+  /**
+   * Genesis funding: creates virtual cash for an agent (the orchestrator seeds once).
+   * The cash is a capital contribution (trading P&L is never inflated by it); a reward
+   * reason/category marks reward capital. The declared endowment that `ensureAgent` already
+   * counted is funded by the first plain grant instead of being added again.
+   */
+  function grant(agentId, amountUsd, { reason = 'grant', category = 'capital', at } = {}) {
     if (typeof agentId !== 'string' || agentId === '') {
       fail('CONFIG_INVALID', 'grant requires a non-empty agentId', { agentId });
     }
@@ -706,10 +913,24 @@ export function createLedger({ paths, config, clock } = {}) {
     const atMs = normalizeAt(at, currentClock);
     const record = ensureRecord(agentId, { endowmentUsd: 0, at: atMs });
     record.cashUsd = round8(record.cashUsd + amount);
-    record.events.push({ atMs, kind: 'grant', amountUsd: amount, reason });
+    const reward = isRewardContribution(category, reason);
+    const contribution = addCapitalContribution(record, amount, { reward, fundDeclaredBasis: true });
+    record.events.push({
+      atMs,
+      kind: 'grant',
+      amountUsd: amount,
+      reason,
+      category,
+      capitalUsd: contribution.addedUsd,
+      ...(contribution.rewardAddedUsd > 0 ? { rewardUsd: contribution.rewardAddedUsd } : {}),
+    });
     record.updatedAt = new Date(atMs).toISOString();
     pruneEvents(record);
-    return { balanceUsd: record.cashUsd };
+    return {
+      balanceUsd: record.cashUsd,
+      capitalContributionsUsd: capitalTotal(record),
+      rewardCapitalUsd: rewardCapitalTotal(record),
+    };
   }
 
   /**
@@ -728,16 +949,93 @@ export function createLedger({ paths, config, clock } = {}) {
     const record = ensureRecord(agentId, { endowmentUsd: 0, at: atMs });
     record.cashUsd = round8(record.cashUsd + amount);
     record.creditsUsd = round8((Number(record.creditsUsd) || 0) + amount);
-    record.events.push({ atMs, kind: 'credit', amountUsd: amount, category, reason });
+    const reward = isRewardContribution(category, reason);
+    const contribution = addCapitalContribution(record, amount, { reward, fundDeclaredBasis: true });
+    record.events.push({
+      atMs,
+      kind: 'credit',
+      amountUsd: amount,
+      category,
+      reason,
+      capitalUsd: contribution.addedUsd,
+      ...(contribution.rewardAddedUsd > 0 ? { rewardUsd: contribution.rewardAddedUsd } : {}),
+    });
     record.updatedAt = new Date(atMs).toISOString();
     pruneEvents(record);
-    return { balanceUsd: record.cashUsd, creditsUsd: record.creditsUsd };
+    return {
+      balanceUsd: record.cashUsd,
+      creditsUsd: record.creditsUsd,
+      capitalContributionsUsd: capitalTotal(record),
+      rewardCapitalUsd: rewardCapitalTotal(record),
+    };
+  }
+
+  /** Public capital decomposition ({capitalVersion, trading P&L} without the pct helper field). */
+  function capitalView(record) {
+    const decomposition = capitalDecomposition(record);
+    return {
+      capitalContributionsUsd: decomposition.capitalContributionsUsd,
+      rewardCapitalUsd: decomposition.rewardCapitalUsd,
+      baseCapitalUsd: decomposition.baseCapitalUsd,
+      tradingPnlUsd: decomposition.tradingPnlUsd,
+      tradingPlUsd: decomposition.tradingPlUsd,
+      capitalVersion: decomposition.capitalVersion,
+    };
+  }
+
+  /**
+   * v3.3 migration-only setter (docs/FAIR-PNL-REWARDS.md §3/§7): replace the capital basis with
+   * the exact fair decomposition (registry base endowment + lifetime reward payouts). This is a
+   * RECLASSIFICATION, not a cash movement and never P&L: the `capital-basis` event carries no
+   * cash effect. Idempotent — applying the same basis twice yields the same state.
+   *
+   * @param {string} agentId
+   * @param {{ baseCapitalUsd?: number, rewardCapitalUsd?: number, reason?: string,
+   *   at?: number|string }} [options]
+   * @returns {{ capitalContributionsUsd:number, rewardCapitalUsd:number, baseCapitalUsd:number,
+   *   tradingPnlUsd:number, tradingPlUsd:number, capitalVersion:number }}
+   */
+  function setCapitalBasis(agentId, { baseCapitalUsd = 0, rewardCapitalUsd = 0, reason = 'capital-basis', at } = {}) {
+    const record = requireRecord(agentId);
+    const base = round2(Math.max(0, Number(baseCapitalUsd) || 0));
+    const reward = round2(Math.max(0, Number(rewardCapitalUsd) || 0));
+    const capital = round2(base + reward);
+    const atMs = normalizeAt(at, currentClock);
+    record.capitalContributionsUsd = capital;
+    record.rewardCapitalUsd = round2(Math.min(capital, reward));
+    record.capitalVersion = 2;
+    record.capitalPendingUsd = 0;
+    record.events.push({
+      atMs,
+      kind: 'capital-basis',
+      amountUsd: capital,
+      rewardUsd: record.rewardCapitalUsd,
+      reason,
+    });
+    record.updatedAt = new Date(atMs).toISOString();
+    pruneEvents(record);
+    return capitalView(record);
+  }
+
+  /**
+   * Capital decomposition for status/UI, measured at the record's stored marks (like snapshot).
+   * @param {string} agentId
+   * @returns {{ capitalContributionsUsd:number, rewardCapitalUsd:number, baseCapitalUsd:number,
+   *   tradingPnlUsd:number, tradingPlUsd:number, capitalVersion:number }}
+   */
+  function capitalOf(agentId) {
+    return capitalView(requireRecord(agentId));
+  }
+
+  /** True when an agent's ledger record uses v3.3 capital accounting (capitalVersion ≥ 2). */
+  function hasCapitalAccounting(agentId) {
+    const record = typeof agentId === 'string' ? state.agents[agentId] : null;
+    return Boolean(record) && Number(record.capitalVersion) >= 2;
   }
 
   // -------------------------------------------------------------------------
   // valuation
   // -------------------------------------------------------------------------
-
   /**
    * Mark an agent at current prices and return the equity decomposition.
    * Stocks: qty * price. Options: contracts * premium * multiplier. Signed positions
@@ -776,6 +1074,14 @@ export function createLedger({ paths, config, clock } = {}) {
     record.updatedAt = currentClock.iso();
     const netPlUsd = round2(record.realizedPlUsd - record.costsUsd + roundedUnrealized);
     if (record.firstProfitAt === null && netPlUsd > 0) record.firstProfitAt = currentClock.iso();
+    // v3.3 fair P&L (docs/FAIR-PNL-REWARDS.md §3): reward payouts are capital, not profit.
+    const capitalContributionsUsd = capitalTotal(record);
+    const rewardCapitalUsd = rewardCapitalTotal(record);
+    const baseCapitalUsd = round2(Math.max(0, capitalContributionsUsd - rewardCapitalUsd));
+    const tradingPnlUsd = round2(equityUsd - capitalContributionsUsd);
+    const tradingPnlPct = capitalContributionsUsd > 0
+      ? round4(tradingPnlUsd / capitalContributionsUsd)
+      : null;
     return {
       equityUsd,
       cashUsd: record.cashUsd,
@@ -786,6 +1092,15 @@ export function createLedger({ paths, config, clock } = {}) {
       netExposureUsd: round2(netExposureUsd),
       longExposureUsd: round2(Math.max(0, netExposureUsd)),
       shortExposureUsd: round2(Math.max(0, -netExposureUsd)),
+      // v3.3 capital decomposition: trading P&L = equity − ALL contributed capital.
+      capitalContributionsUsd,
+      baseCapitalUsd,
+      rewardCapitalUsd,
+      tradingPnlUsd,
+      // Alias kept for the orchestrator/status wiring (uses the `Pl` spelling).
+      tradingPlUsd: tradingPnlUsd,
+      tradingPnlPct,
+      capitalVersion: Number(record.capitalVersion) >= 2 ? 2 : 1,
     };
   }
 
@@ -857,6 +1172,14 @@ export function createLedger({ paths, config, clock } = {}) {
       netExposureUsd += view.marketValueUsd;
     }
     const marginDebtUsd = round2(Math.max(0, -record.cashUsd));
+    // v3.3 fair P&L decomposition at the record's stored marks (safe with no positions).
+    const capitalContributionsUsd = capitalTotal(record);
+    const rewardCapitalUsd = rewardCapitalTotal(record);
+    const baseCapitalUsd = round2(Math.max(0, capitalContributionsUsd - rewardCapitalUsd));
+    const tradingPnlUsd = round2(equityAtStoredMarks(record) - capitalContributionsUsd);
+    const tradingPnlPct = capitalContributionsUsd > 0
+      ? round4(tradingPnlUsd / capitalContributionsUsd)
+      : null;
     return {
       cashUsd: record.cashUsd,
       positions,
@@ -876,6 +1199,15 @@ export function createLedger({ paths, config, clock } = {}) {
       marginDebtUsd,
       grossExposureUsd: round2(grossExposureUsd),
       netExposureUsd: round2(netExposureUsd),
+      // v3.3 capital decomposition (reward capital is contributed capital, never P&L).
+      capitalContributionsUsd,
+      baseCapitalUsd,
+      rewardCapitalUsd,
+      tradingPnlUsd,
+      // Alias kept for the orchestrator/status wiring (uses the `Pl` spelling).
+      tradingPlUsd: tradingPnlUsd,
+      tradingPnlPct,
+      capitalVersion: Number(record.capitalVersion) >= 2 ? 2 : 1,
       longShares: Object.fromEntries(
         Object.entries(record.positions)
           .filter(([, position]) => position.assetClass === 'us_equity')
@@ -991,6 +1323,10 @@ export function createLedger({ paths, config, clock } = {}) {
     equity,
     net7d,
     snapshot,
+    // v3.3 fair capital accounting (docs/FAIR-PNL-REWARDS.md §3).
+    capitalOf,
+    setCapitalBasis,
+    hasCapitalAccounting,
     roleCosts,
     history,
     groups,

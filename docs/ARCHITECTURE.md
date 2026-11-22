@@ -126,6 +126,21 @@ an equity history for the Host's loopback `GET /automaton/market` route; the con
 as a live Google-Analytics-style dashboard (KPIs, SVG charts, market tape with price flashes, basket
 and live-P&L agent rows). Contract: `docs/PORTFOLIO-ANALYTICS.md`; operations: `docs/RUNBOOK.md` §8f.
 
+### Fair capital accounting and performance rewards (v3.3)
+
+Reward payouts were previously indistinguishable from trading profit because P&L was measured as
+`equity − endowment`. v3.3 tracks **capital contributed** (base endowment, top-ups, credits and reward
+capital) separately from equity: `tradingPnl = equity − capitalContributions`, and reward transfers are
+capital contributions that leave trading P&L unchanged. The ledger persists `capitalContributionsUsd`,
+`rewardCapitalUsd` and `capitalVersion`; a one-time migration computes base capital + lifetime rewards from
+the rewards history and reclassifies historical payouts. Rankings record trading P&L baselines and archive
+the completed period, so the reward scheduler can rank **period trading return on contributed capital**
+instead of equity. Rewards are eligibility-gated (positive trading P&L, minimum trades, drawdown cap),
+ranked on trading return, budgeted at a configurable share of the treasury pool, split 50/30/20 across the
+top three, capped per agent, and paid as capital — never profit. Status, the panel and `/automaton/market`
+expose trading P&L, capital breakdown, lifetime rewards and per-agent reward history, and daily-loss
+bookkeeping uses trading P&L deltas. Contract: `docs/FAIR-PNL-REWARDS.md`; ops: `docs/RUNBOOK.md` §8g.
+
 ### Multi-instrument execution (v3.0)
 
 The population may express a strategy through more than long stock: **short stock, long calls/puts,

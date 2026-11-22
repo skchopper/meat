@@ -511,6 +511,72 @@ restricted-account warning; `GET /automaton/state` exposes it programmatically.
   payouts). Restart the Host, then press Start; the first successful tick should recover the
   treasury and the new migrations (70/30, baskets) run once on startup.
 
+## 8g. Fair P&L, capital-only performance rewards and reward history (v3.3)
+
+Contract: `docs/FAIR-PNL-REWARDS.md`.
+
+**Why:** v3.2 P&L was `equity - endowment`, so a reward payout looked like profit and compounded into the
+next reward. v3.3 separates **trading P&L** from **capital contributed**:
+
+```text
+trading P&L = total equity - capital contributed
+capital contributed = base endowment + capital top-ups + reward capital (+ credits/transfers in)
+reward capital      = lifetime reward payouts (a subset of capital contributed)
+return on capital   = trading P&L / capital contributed
+```
+
+A reward transfer raises equity, capital contributed and reward capital by the same amount; trading P&L
+and rank do not change. The panel shows total equity, trading P&L, capital contributed (of which reward
+capital), return on capital, lifetime rewards and reward history in the agent detail; the Rewards tab
+shows the rules, budget, candidates and payout history.
+
+**One-time migration (first v3.3 start):** after rewards load, every legacy ledger record without
+`capitalVersion=2` gets `baseCapitalUsd = registry endowmentUsd` and
+`rewardCapitalUsd = lifetime rewards from rewards.json history` via `ledger.setCapitalBasis`, then a
+`stateDir/capital-v33.json` marker is written. Existing W44/W45 payouts are reclassified as reward
+capital ($129.18 across 6 bots in the current live state); ids/ledgers/positions are untouched and the
+migration is idempotent. Example: GapFade META equity $106.86, capital $108.56 ($50 base + $58.56 W44
+reward) → trading P&L **-$1.70**, not +$56.86.
+
+**Recommended reward rules (implemented defaults; `config.rewards` / Settings overlay):**
+
+```json
+{
+  "enabled": true,
+  "period": "weekly",
+  "basis": "trading-performance",
+  "rankShares": [0.5, 0.3, 0.2],
+  "rewardBudgetPctOfPool": 0.10,
+  "maxPerPeriodUsd": null,
+  "maxRewardPerAgentPctOfCapital": 0.50,
+  "minTradingProfitUsd": 0.05,
+  "minTrades": 3,
+  "maxDrawdownPct": 0.20
+}
+```
+
+- Only bots with a **measured trading baseline**, positive period trading P&L above $0.05, at least 3
+  period trades and drawdown ≤20% are eligible. Bots with no baseline, losses, tiny/no trading or excess
+  drawdown are skipped.
+- Eligible bots are ranked by **period trading return on contributed capital**, tie-break by trading P&L
+  dollars. The reward budget is **10% of the available treasury pool** (optionally capped by
+  `maxPerPeriodUsd`); top 3 receive **50% / 30% / 20%** of it, each capped at **50% of that bot's
+  contributed capital**, and never above the pool or the account allocation-cap remaining.
+- Payouts are **capital contributions**, not profit: they increase the bot's trading capital and therefore
+  its order sizing (mandates scale with equity), but never its P&L/rank. Lifetime rewards and reward
+  history are tracked per bot (`rewardCapitalUsd` in the ledger; history in `rewards.json`).
+- The live profile raises `account.allocationCapPct` from 0.8 to **0.9** so the 10% pool reward budget can
+  actually reach winners while keeping a 10% account reserve. This is a deliberate risk increase; tune
+  `rewardBudgetPctOfPool`/allocation cap if you want more or less capital concentration.
+- Reward settings are editable from the panel (`set-reward-settings` new fields above). Deprecated v3.2
+  `rankPercents`/`account-cash` are accepted only for compatibility and ignored by the scheduler. The
+  payout is still virtual-only: no broker transfer/withdraw surface exists (brake D1).
+- **Day P&L / daily loss** now use trading P&L deltas, so a reward top-up never appears as a daily gain or
+  a daily loss. Off-hours/paused/stopped engine still serves the last fair P&L and reward history.
+- **First v3.3 payout:** if the completed period was ranked with pre-v3.3 equity-only baselines, it is
+  correctly skipped (`no_measured_trading_baseline`) rather than rewarded on reward-inflated equity; the
+  next period ranked with trading baselines pays normally.
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

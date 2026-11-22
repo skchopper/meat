@@ -52,7 +52,12 @@ const RESEARCH_INTERVAL_OPTIONS = Object.freeze([3600, 10800, 21600, 86400]);
 const REWARD_PERIODS = Object.freeze(['daily', 'weekly', 'monthly']);
 const REWARD_MAX_PER_PERIOD_USD = 1_000_000;
 const RESEARCH_SETTING_KEYS = Object.freeze(['mode', 'intervalSec', 'enabled', 'influence']);
-const REWARD_SETTING_KEYS = Object.freeze(['enabled', 'period', 'rankPercents', 'maxPerPeriodUsd']);
+const REWARD_SETTING_KEYS = Object.freeze([
+  'enabled', 'period', 'basis', 'rankShares', 'rewardBudgetPctOfPool', 'maxPerPeriodUsd',
+  'maxRewardPerAgentPctOfCapital', 'minTradingProfitUsd', 'minTrades', 'maxDrawdownPct',
+  // deprecated v3.2 key, accepted for API compatibility
+  'rankPercents',
+]);
 const CONTROL_BODY_LIMIT_BYTES = 8192;
 const MAX_ERROR_MESSAGE = 500;
 const SIMULATION_LIMITS = Object.freeze({ cycles: [1, 5000], population: [1, 200] });
@@ -1212,8 +1217,10 @@ function validateResearchSettings(settings) {
 }
 
 /**
- * Validate + normalize `set-reward-settings` payload.
- * @param {object} settings {enabled?, period?, rankPercents?, maxPerPeriodUsd?}
+ * Validate + normalize `set-reward-settings` payload (v3.3).
+ * @param {object} settings {enabled?, period?, basis?, rankShares?, rewardBudgetPctOfPool?,
+ *   maxPerPeriodUsd?, maxRewardPerAgentPctOfCapital?, minTradingProfitUsd?, minTrades?,
+ *   maxDrawdownPct?, rankPercents? (deprecated)}
  * @returns {object} a detached patch containing only provided keys
  */
 function validateRewardSettings(settings) {
@@ -1229,16 +1236,58 @@ function validateRewardSettings(settings) {
     }
     patch.period = settings.period;
   }
+  if (settings.basis !== undefined) {
+    if (!['trading-performance', 'account-cash'].includes(settings.basis)) {
+      throw invalidSettings('rewards.basis must be "trading-performance"');
+    }
+    patch.basis = settings.basis;
+  }
+  const numberInRange = (key, min, max) => {
+    const value = Number(settings[key]);
+    if (!Number.isFinite(value) || value < min || value > max) {
+      throw invalidSettings(`rewards.${key} must be a number between ${min} and ${max}`);
+    }
+    patch[key] = value;
+  };
+  if (settings.rankShares !== undefined) {
+    const shares = settings.rankShares;
+    if (!Array.isArray(shares) || shares.length !== 3) {
+      throw invalidSettings('rewards.rankShares must be exactly 3 numbers');
+    }
+    const normalized = [];
+    for (const value of shares) {
+      const number = Number(value);
+      if (!Number.isFinite(number) || number < 0 || number > 1) {
+        throw invalidSettings('rewards.rankShares entries must be numbers between 0 and 1');
+      }
+      normalized.push(number);
+    }
+    if (normalized.reduce((sum, value) => sum + value, 0) > 1.000001) {
+      throw invalidSettings('rewards.rankShares must sum to at most 1');
+    }
+    patch.rankShares = normalized;
+  }
+  if (settings.rewardBudgetPctOfPool !== undefined) numberInRange('rewardBudgetPctOfPool', 0, 1);
+  if (settings.maxRewardPerAgentPctOfCapital !== undefined) numberInRange('maxRewardPerAgentPctOfCapital', 0, 1);
+  if (settings.maxDrawdownPct !== undefined) numberInRange('maxDrawdownPct', 0, 1);
+  if (settings.minTradingProfitUsd !== undefined) numberInRange('minTradingProfitUsd', 0, 1_000_000);
+  if (settings.minTrades !== undefined) {
+    const value = Number(settings.minTrades);
+    if (!Number.isInteger(value) || value < 0 || value > 100_000) {
+      throw invalidSettings('rewards.minTrades must be a non-negative integer');
+    }
+    patch.minTrades = value;
+  }
   if (settings.rankPercents !== undefined) {
     const percents = settings.rankPercents;
     if (!Array.isArray(percents) || percents.length !== 3) {
-      throw invalidSettings('rewards.rankPercents must be exactly 3 numbers');
+      throw invalidSettings('rewards.rankPercents must be exactly 3 numbers (deprecated)');
     }
     const normalized = [];
     for (const value of percents) {
       const number = Number(value);
       if (!Number.isFinite(number) || number < 0 || number > 0.5) {
-        throw invalidSettings('rewards.rankPercents entries must be numbers between 0 and 0.5');
+        throw invalidSettings('rewards.rankPercents entries must be numbers between 0 and 0.5 (deprecated)');
       }
       normalized.push(number);
     }

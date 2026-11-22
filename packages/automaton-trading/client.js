@@ -46,7 +46,7 @@ window.__ModuleLoader__.load({
     const MAX_OBITUARIES = 8;
     const MODE_LABEL = { sim: 'SIM', paper: 'PAPER', live: 'LIVE' };
     const STATUS_FILTERS = ['all', 'alive', 'dead', 'condemned'];
-    const SORTABLE_KEYS = new Set(['name', 'generation', 'equityUsd', 'pnlUsd', 'runwayHours', 'dayPnlPct', 'status']);
+    const SORTABLE_KEYS = new Set(['name', 'generation', 'equityUsd', 'pnlUsd', 'rewardsUsd', 'runwayHours', 'dayPnlPct', 'status']);
     const FAMILY_LABELS = { momentum: 'Momentum', meanrev: 'MeanRev', breakout: 'Breakout', gapfade: 'GapFade' };
 
     // -----------------------------------------------------------------------
@@ -160,9 +160,9 @@ window.__ModuleLoader__.load({
       lbMonthly: 'Monthly',
       lbRank: 'Rank',
       lbName: 'Agent',
-      lbPnlPct: 'P&L %',
-      lbPnlUsd: 'P&L $',
-      lbEquity: 'Equity',
+      lbPnlPct: 'Trading P&L %',
+      lbPnlUsd: 'Trading P&L $',
+      lbEquity: 'Total equity',
       lbTrades: 'Trades',
       lbEmpty: 'no leaderboard data yet',
       lbAsOf: 'as of',
@@ -444,6 +444,61 @@ window.__ModuleLoader__.load({
       mutationTo: 'to',
       noParent: 'genesis',
       none: '—',
+      // v3.3 — fair trading P&L, capital-only rewards, reward history/rules
+      tradingPnl: 'Trading P&L',
+      pnlTradingHint: 'Trading P&L only — excludes reward capital',
+      pnlBreakdown: 'P&L breakdown',
+      totalEquity: 'Total equity',
+      capitalContributed: 'Capital contributed',
+      rewardCapital: 'Reward capital',
+      ofWhichRewardCapital: 'of which reward capital',
+      baseCapital: 'Base capital',
+      returnOnCapital: 'Return on capital',
+      lifetimeRewards: 'Lifetime rewards',
+      rewardsLifetime: 'Rewards (lifetime)',
+      rewardCount: 'Reward count',
+      lastReward: 'Last reward',
+      pnlRewardsNote: 'Rewards are trading capital, not profit — P&L counts trading only.',
+      pnlLegacyNote: 'Legacy snapshot: the engine has not reported capital accounting yet, so trading P&L falls back to equity − endowment.',
+      rewardHistory: 'Reward history',
+      rewardHistoryTotals: 'Lifetime total',
+      noRewardsYet: 'no rewards yet',
+      rewardShare: 'Share',
+      periodTradingPnl: 'Period trading P&L',
+      periodTradingReturn: 'Period return',
+      rewardRules: 'Reward rules',
+      rewardRulesExplain: 'Rules explanation',
+      rewardNoRules: 'The engine has not reported reward rules yet — showing the recommended v3.3 defaults.',
+      rewardBasis: 'Basis',
+      rewardBasisTrading: 'trading performance',
+      rewardBasisCash: 'account cash (legacy)',
+      rewardPeriod: 'Period',
+      rewardMinProfit: 'Min trading profit',
+      rewardMinTrades: 'Min trades',
+      rewardMaxDrawdown: 'Max drawdown',
+      rewardBudgetPct: 'Budget of pool',
+      rewardRankShares: 'Rank shares',
+      rewardAgentCap: 'Per-agent cap',
+      rewardPoolAvailable: 'Pool available',
+      rewardBudgetPreview: 'Next budget',
+      rewardDistributed: 'Rewards distributed',
+      rewardCandidates: 'Eligible candidates',
+      rewardCandidatesEmpty: 'no eligible candidates',
+      rewardEligible: 'eligible',
+      rewardDisabled: 'rewards disabled',
+      rewardNoBudget: 'no reward budget',
+      rewardNoBaseline: 'no measured trading baseline',
+      rewardBelowProfit: 'trading profit below minimum',
+      rewardNotPositive: 'trading return not positive',
+      rewardTooFewTrades: 'too few trades',
+      rewardDrawdown: 'drawdown over limit',
+      rewardProjected: 'Projected reward',
+      rewardOfCapital: 'of capital',
+      kpiTradingPnl: 'Trading P&L',
+      kpiRewards: 'Rewards distributed',
+      kpiLifetime: 'lifetime',
+      lbTradingNote: 'ranked on trading P&L — reward capital excluded',
+      rewardLegacyRanking: 'legacy rankings only — no trading baseline reported yet',
     };
 
     const ZH = {
@@ -553,9 +608,9 @@ window.__ModuleLoader__.load({
       lbMonthly: '每月',
       lbRank: '排名',
       lbName: '个体',
-      lbPnlPct: '盈亏 %',
-      lbPnlUsd: '盈亏 $',
-      lbEquity: '权益',
+      lbPnlPct: '交易盈亏 %',
+      lbPnlUsd: '交易盈亏 $',
+      lbEquity: '总权益',
       lbTrades: '成交',
       lbEmpty: '暂无排行榜数据',
       lbAsOf: '截至',
@@ -837,6 +892,61 @@ window.__ModuleLoader__.load({
       mutationTo: '到',
       noParent: '创世',
       none: '—',
+      // v3.3 —— 公平交易盈亏、仅资本奖励、奖励历史/规则
+      tradingPnl: '交易盈亏',
+      pnlTradingHint: '仅交易盈亏 —— 不含奖励资本',
+      pnlBreakdown: '盈亏构成',
+      totalEquity: '总权益',
+      capitalContributed: '投入资本',
+      rewardCapital: '奖励资本',
+      ofWhichRewardCapital: '其中奖励资本',
+      baseCapital: '基础资本',
+      returnOnCapital: '资本回报率',
+      lifetimeRewards: '累计奖励',
+      rewardsLifetime: '奖励（累计）',
+      rewardCount: '奖励次数',
+      lastReward: '最近奖励',
+      pnlRewardsNote: '奖励是交易资本，不是利润 —— 盈亏只统计交易结果。',
+      pnlLegacyNote: '旧版快照：引擎尚未上报资本核算，交易盈亏暂回退为 权益 − 初始资金。',
+      rewardHistory: '奖励历史',
+      rewardHistoryTotals: '累计合计',
+      noRewardsYet: '暂无奖励',
+      rewardShare: '份额',
+      periodTradingPnl: '周期交易盈亏',
+      periodTradingReturn: '周期回报',
+      rewardRules: '奖励规则',
+      rewardRulesExplain: '规则说明',
+      rewardNoRules: '引擎尚未上报奖励规则 —— 显示 v3.3 推荐默认值。',
+      rewardBasis: '依据',
+      rewardBasisTrading: '交易表现',
+      rewardBasisCash: '账户现金（旧版）',
+      rewardPeriod: '周期',
+      rewardMinProfit: '最低交易利润',
+      rewardMinTrades: '最低成交笔数',
+      rewardMaxDrawdown: '最大回撤',
+      rewardBudgetPct: '预算占资金池',
+      rewardRankShares: '名次份额',
+      rewardAgentCap: '单个体上限',
+      rewardPoolAvailable: '可用资金池',
+      rewardBudgetPreview: '下期预算',
+      rewardDistributed: '累计已发放',
+      rewardCandidates: '候选个体',
+      rewardCandidatesEmpty: '暂无合格候选',
+      rewardEligible: '合格',
+      rewardDisabled: '奖励已禁用',
+      rewardNoBudget: '无奖励预算',
+      rewardNoBaseline: '尚无交易基线',
+      rewardBelowProfit: '交易利润低于门槛',
+      rewardNotPositive: '交易回报非正',
+      rewardTooFewTrades: '成交笔数不足',
+      rewardDrawdown: '回撤超限',
+      rewardProjected: '预计奖励',
+      rewardOfCapital: '资本',
+      kpiTradingPnl: '交易盈亏',
+      kpiRewards: '累计奖励发放',
+      kpiLifetime: '累计',
+      lbTradingNote: '按交易盈亏排名 —— 不含奖励资本',
+      rewardLegacyRanking: '旧版排名 —— 尚无交易基线',
     };
 
     /** Bind the Client locale service; fall back to the bundled English dictionary. */
@@ -1404,7 +1514,11 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** History rows for the rewards card (newest first, last 8). */
+    /**
+     * Period-level payout history rows for the rewards card (newest first, last 8).
+     * v3.3 winners also carry `share` (of budget) and the period trading
+     * P&L/return that earned the payout; entries may carry `budgetUsd`/`basis`.
+     */
     function rewardHistoryRows(status) {
       const history = Array.isArray(status?.rewards?.history) ? status.rewards.history : [];
       return history.slice(0, 8).map((entry, index) => {
@@ -1414,6 +1528,8 @@ window.__ModuleLoader__.load({
           periodKey: entry?.periodKey ?? null,
           period: entry?.period ?? null,
           at: entry?.at ?? null,
+          basis: entry?.basis ?? null,
+          budgetUsd: toNumber(entry?.budgetUsd),
           totalUsd: round2(winners.reduce((total, winner) => total + (toNumber(winner?.amountUsd) ?? 0), 0)),
           winners: winners.map((winner, winnerIndex) => ({
             key: `${winner?.agentId ?? 'winner'}-${winnerIndex}`,
@@ -1421,7 +1537,10 @@ window.__ModuleLoader__.load({
             agentId: winner?.agentId ?? null,
             name: winner?.name ?? winner?.agentId ?? '—',
             percent: toNumber(winner?.percent),
+            share: firstNumber(winner?.share, winner?.percent),
             amountUsd: toNumber(winner?.amountUsd),
+            periodTradingPnlUsd: toNumber(winner?.periodTradingPnlUsd),
+            periodTradingPnlPct: toNumber(winner?.periodTradingPnlPct),
           })),
         };
       });
@@ -1452,11 +1571,16 @@ window.__ModuleLoader__.load({
           medal: MEDALS[rank] ?? null,
           agentId: entry?.agentId ?? null,
           name: entry?.name ?? entry?.agentId ?? '—',
-          pnlUsd: toNumber(entry?.pnlUsd),
-          pnlPct: toNumber(entry?.pnlPct),
+          // v3.3: rankings carry the trading fields; the legacy pnl fields are only
+          // a fallback for older engines.
+          pnlUsd: firstNumber(entry?.tradingPnlUsd, entry?.pnlUsd),
+          pnlPct: firstNumber(entry?.tradingPnlPct, entry?.pnlPct),
+          tradingPnlUsd: toNumber(entry?.tradingPnlUsd),
+          tradingPnlPct: toNumber(entry?.tradingPnlPct),
           equityUsd: toNumber(entry?.equityUsd),
           baselineEquityUsd: toNumber(entry?.baselineEquityUsd),
-          trades: toNumber(entry?.trades),
+          baselineCapitalUsd: toNumber(entry?.baselineCapitalUsd),
+          trades: firstNumber(entry?.periodTrades, entry?.trades),
           history: entry?.history ?? null,
         };
       });
@@ -1565,6 +1689,579 @@ window.__ModuleLoader__.load({
         dayPct: toNumber(raw.dayPct),
         weekPct: toNumber(raw.weekPct),
         monthPct: toNumber(raw.monthPct),
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // v3.3 fair P&L + capital-only rewards (docs/FAIR-PNL-REWARDS.md §2/§6/§8)
+    //
+    // Trading P&L = total equity − capital contributed. Reward payouts are
+    // capital contributions, never profit: they raise equity, capital
+    // contributed and reward capital together, so trading P&L is unchanged.
+    // Every helper below degrades gracefully to the v3.2 equity-based fields
+    // when an older engine has not shipped the fair accounting yet.
+    // -----------------------------------------------------------------------
+
+    /** Recommended v3.3 reward rules (docs/FAIR-PNL-REWARDS.md §5) — the fallback when
+     * `engine.rewards.rules` is not reported yet (older snapshots). */
+    const REWARD_RULE_DEFAULTS = Object.freeze({
+      enabled: true,
+      period: 'weekly',
+      basis: 'trading-performance',
+      rankShares: Object.freeze([0.5, 0.3, 0.2]),
+      rewardBudgetPctOfPool: 0.1,
+      maxPerPeriodUsd: null,
+      maxRewardPerAgentPctOfCapital: 0.5,
+      minTradingProfitUsd: 0.05,
+      minTrades: 3,
+      maxDrawdownPct: 0.2,
+    });
+    const REWARD_PERIODS = Object.freeze(['daily', 'weekly', 'monthly']);
+
+    /** First finite numeric candidate (keeps 0 falsy values). */
+    function firstNumber(...values) {
+      for (const value of values) {
+        const number = toNumber(value);
+        if (number !== null) return number;
+      }
+      return null;
+    }
+
+    /**
+     * Normalized capital accounting for one agent (`agent.capital`, v3.3 §6).
+     * Falls back to the declared endowment and the legacy equity basis so old
+     * snapshots still render; `available` is false when the engine has not
+     * reported capital accounting yet.
+     */
+    function readAgentCapital(agent) {
+      const safeAgent = plainObject(agent);
+      const capital = plainObject(safeAgent.capital);
+      const pnl = plainObject(safeAgent.pnl);
+      const equityUsd = toNumber(safeAgent.equityUsd);
+      const endowmentUsd = toNumber(safeAgent.endowmentUsd);
+      const contributedRaw = toNumber(capital.contributedUsd);
+      const capitalVersion = toNumber(capital.capitalVersion);
+      const available = contributedRaw !== null || capitalVersion !== null || toNumber(capital.baseUsd) !== null;
+      const contributedUsd = contributedRaw ?? endowmentUsd;
+      // Reward capital is a strict subset of contributed capital: only trust it from
+      // the capital/pnl accounting fields (never infer it from equity).
+      const rewardCapitalUsd = firstNumber(capital.rewardCapitalUsd, pnl.rewardsUsd);
+      const baseUsd = firstNumber(
+        capital.baseUsd,
+        contributedUsd !== null && rewardCapitalUsd !== null ? Math.max(0, round2(contributedUsd - rewardCapitalUsd)) : null,
+        available ? null : endowmentUsd,
+      );
+      const rewardSharePct = firstNumber(
+        // The engine reports the share as percent points (e.g. 74.54); accept a
+        // fraction too (0.7454) and normalize to points, fmtPct() renders both.
+        capital.rewardSharePct === undefined ? null : pctPoints(capital.rewardSharePct),
+        contributedUsd !== null && contributedUsd > 0 && rewardCapitalUsd !== null ? rewardCapitalUsd / contributedUsd * 100 : null,
+      );
+      return {
+        available,
+        legacy: !available,
+        equityUsd,
+        endowmentUsd,
+        contributedUsd,
+        baseUsd,
+        rewardCapitalUsd,
+        rewardSharePct,
+        capitalVersion,
+        rewardCapitalReported: toNumber(capital.rewardCapitalUsd) !== null,
+      };
+    }
+
+    /**
+     * Fair table/detail P&L projection for one agent (v3.3 §6/§8).
+     *
+     * Trading P&L source of truth, in order: `pnl.tradingUsd` / top-level
+     * `tradingPnlUsd` → `tradingRealizedUsd + tradingUnrealizedUsd` → equity −
+     * capital contributed → (legacy fallback) equity − endowment → `pnl.netUsd`.
+     * The pct fields are trading returns (fractions), never equity returns.
+     * Reward capital is excluded from every P&L number here.
+     *
+     * @param {object} agent status.agents[*]
+     * @returns {object} pnl view used by rows/table/detail; never throws
+     */
+    function agentPnlView(agent) {
+      const safeAgent = plainObject(agent);
+      const pnl = plainObject(safeAgent.pnl);
+      const rankings = plainObject(safeAgent.rankings);
+      const rewards = plainObject(safeAgent.rewards);
+      const capital = readAgentCapital(safeAgent);
+
+      const direct = firstNumber(pnl.tradingUsd, safeAgent.tradingPnlUsd);
+      let tradingUsd = direct;
+      let source = direct !== null ? 'trading' : 'legacy';
+      if (tradingUsd === null) {
+        const tradingRealized = toNumber(pnl.tradingRealizedUsd);
+        const tradingUnrealized = toNumber(pnl.tradingUnrealizedUsd);
+        if (tradingRealized !== null || tradingUnrealized !== null) {
+          tradingUsd = round2((tradingRealized ?? 0) + (tradingUnrealized ?? 0));
+          source = 'trading';
+        } else if (capital.available && capital.equityUsd !== null && capital.contributedUsd !== null) {
+          // Fair derivation even when the engine exposes capital but not pnl.tradingUsd.
+          tradingUsd = round2(capital.equityUsd - capital.contributedUsd);
+          source = 'trading';
+        } else if (capital.equityUsd !== null && capital.endowmentUsd !== null) {
+          // v3.2 legacy table formula (equity-based; may include reward inflation).
+          tradingUsd = round2(capital.equityUsd - capital.endowmentUsd);
+          source = 'legacy';
+        } else {
+          const legacyNet = toNumber(pnl.netUsd);
+          if (legacyNet !== null) {
+            tradingUsd = legacyNet;
+            source = 'legacy';
+          } else {
+            const legacyRealized = toNumber(pnl.realizedUsd);
+            const legacyUnrealized = toNumber(pnl.unrealizedUsd);
+            if (legacyRealized !== null || legacyUnrealized !== null) {
+              tradingUsd = round2((legacyRealized ?? 0) + (legacyUnrealized ?? 0));
+              source = 'legacy';
+            }
+          }
+        }
+      }
+
+      let tradingPct = toNumber(pnl.tradingPct);
+      if (tradingPct === null && tradingUsd !== null) {
+        const capitalBase = capital.contributedUsd;
+        if (capitalBase !== null && capitalBase > 0) tradingPct = tradingUsd / capitalBase;
+      }
+      const periodPct = (pnlKey, tradingRankKey, legacyRankKey) => firstNumber(
+        pnl[pnlKey],
+        rankings[tradingRankKey],
+        rankings[legacyRankKey],
+      );
+      const rewardsUsd = firstNumber(rewards.lifetimeUsd, pnl.rewardsUsd);
+      return {
+        tradingUsd,
+        tradingPct,
+        tradingPctPoints: tradingPct === null ? null : tradingPct * 100,
+        tradingRealizedUsd: firstNumber(pnl.tradingRealizedUsd, pnl.realizedUsd),
+        tradingUnrealizedUsd: firstNumber(pnl.tradingUnrealizedUsd, pnl.unrealizedUsd),
+        realizedUsd: firstNumber(pnl.realizedUsd, pnl.tradingRealizedUsd),
+        unrealizedUsd: firstNumber(pnl.unrealizedUsd, pnl.tradingUnrealizedUsd),
+        // Legacy alias: `netUsd` has always been the agent's net P&L view; in v3.3
+        // the engine defines it as exactly tradingUsd, so map it to the fair value.
+        netUsd: tradingUsd,
+        source,
+        legacy: source === 'legacy',
+        capitalUsd: capital.contributedUsd,
+        rewardCapitalUsd: capital.rewardCapitalUsd,
+        dayPct: periodPct('dayPct', 'tradingDayPct', 'dayPct'),
+        weekPct: periodPct('weekPct', 'tradingWeekPct', 'weekPct'),
+        monthPct: periodPct('monthPct', 'tradingMonthPct', 'monthPct'),
+        dayUsd: firstNumber(rankings.tradingDayUsd),
+        weekUsd: firstNumber(rankings.tradingWeekUsd),
+        monthUsd: firstNumber(rankings.tradingMonthUsd),
+        rewardsUsd,
+        rewardCount: toNumber(rewards.count),
+        lastRewardAt: typeof rewards.lastAt === 'string' && rewards.lastAt.length > 0 ? rewards.lastAt : null,
+      };
+    }
+
+    /**
+     * Detail-panel P&L breakdown (v3.3 §8): total equity, capital contributed,
+     * reward capital inside it, trading P&L, return on capital and lifetime rewards.
+     * `fair` is false only for legacy snapshots without capital accounting.
+     */
+    function capitalBreakdown(agent) {
+      const capital = readAgentCapital(agent);
+      const view = agentPnlView(agent);
+      return {
+        available: capital.available,
+        legacy: capital.legacy,
+        fair: view.source === 'trading' || capital.available,
+        equityUsd: capital.equityUsd,
+        contributedUsd: capital.contributedUsd,
+        baseUsd: capital.baseUsd,
+        rewardCapitalUsd: capital.rewardCapitalUsd,
+        rewardSharePct: capital.rewardSharePct,
+        capitalVersion: capital.capitalVersion,
+        tradingPnlUsd: view.tradingUsd,
+        tradingPnlPct: view.tradingPct,
+        // Return on capital is the contract formula equity-independent:
+        // tradingPnlUsd / capitalContributionsUsd (0 when capital is 0).
+        returnOnCapitalPct: capital.contributedUsd !== null && capital.contributedUsd > 0 && view.tradingUsd !== null
+          ? view.tradingUsd / capital.contributedUsd
+          : view.tradingPct,
+        rewardsLifetimeUsd: view.rewardsUsd,
+        rewardCount: view.rewardCount,
+        lastRewardAt: view.lastRewardAt,
+        pnlSource: view.source,
+      };
+    }
+
+    /**
+     * Per-agent reward history projection (agent detail, v3.3 §8).
+     * `agent.rewards.history` entry: `{period, periodKey, at, rank, amountUsd,
+     * share, periodTradingPnlUsd, periodTradingPnlPct}`. Newest first when dates
+     * are parseable; totals row and empty state are returned alongside the rows.
+     */
+    function agentRewardHistoryRows(rawRewards) {
+      const rewards = plainObject(rawRewards);
+      const history = Array.isArray(rewards.history) ? rewards.history : [];
+      const rows = history
+        .filter((entry) => entry && typeof entry === 'object')
+        .map((entry, index) => ({
+          key: `${entry.periodKey ?? 'reward'}-${index}`,
+          period: entry.period ?? null,
+          periodKey: entry.periodKey ?? null,
+          at: entry.at ?? null,
+          rank: toNumber(entry.rank),
+          amountUsd: toNumber(entry.amountUsd),
+          share: firstNumber(entry.share, entry.percent),
+          periodTradingPnlUsd: toNumber(entry.periodTradingPnlUsd),
+          periodTradingPnlPct: toNumber(entry.periodTradingPnlPct),
+        }));
+      rows.sort((left, right) => {
+        const leftMs = left.at ? Date.parse(left.at) : NaN;
+        const rightMs = right.at ? Date.parse(right.at) : NaN;
+        if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) return rightMs - leftMs;
+        return 0;
+      });
+      const totalUsd = round2(rows.reduce((total, row) => total + (row.amountUsd ?? 0), 0));
+      const lifetimeUsd = firstNumber(rewards.lifetimeUsd, rows.length > 0 ? totalUsd : null);
+      return {
+        available: rows.length > 0 || lifetimeUsd !== null,
+        empty: rows.length === 0,
+        rows,
+        totalUsd,
+        lifetimeUsd,
+        count: firstNumber(rewards.count, rows.length),
+        lastAt: rewards.lastAt ?? rows[0]?.at ?? null,
+      };
+    }
+
+    /**
+     * Fallback lifetime-reward ledger derived from the top-level rewards history
+     * (`status.rewards.history[].winners[]` + `engine.rewards.lastWinners`).
+     * Used when an older snapshot does not carry `agent.rewards` yet, and for the
+     * KPI "rewards distributed" card. Deduped by periodKey+agentId.
+     * @returns {Map<string, {history:Array<object>, lifetimeUsd:number, count:number, lastAt:string|null}>}
+     */
+    function rewardsLedgerByAgent(status) {
+      const source = plainObject(status);
+      const map = new Map();
+      const seen = new Set();
+      const push = (winner, entry) => {
+        const rawWinner = plainObject(winner);
+        const agentId = rawWinner.agentId !== undefined && rawWinner.agentId !== null ? String(rawWinner.agentId) : null;
+        if (agentId === null) return;
+        const periodKey = entry?.periodKey ?? rawWinner.periodKey ?? null;
+        const at = entry?.at ?? rawWinner.at ?? null;
+        const dedupeKey = `${periodKey ?? at ?? ''}|${agentId}|${rawWinner.rank ?? ''}`;
+        if (seen.has(dedupeKey)) return;
+        seen.add(dedupeKey);
+        const amountUsd = toNumber(rawWinner.amountUsd);
+        const record = {
+          period: entry?.period ?? rawWinner.period ?? null,
+          periodKey,
+          at,
+          rank: toNumber(rawWinner.rank),
+          amountUsd,
+          share: firstNumber(rawWinner.share, rawWinner.percent),
+          periodTradingPnlUsd: toNumber(rawWinner.periodTradingPnlUsd),
+          periodTradingPnlPct: toNumber(rawWinner.periodTradingPnlPct),
+        };
+        if (!map.has(agentId)) map.set(agentId, { history: [], lifetimeUsd: 0, count: 0, lastAt: null });
+        const bucket = map.get(agentId);
+        if (amountUsd !== null) bucket.lifetimeUsd = round2(bucket.lifetimeUsd + amountUsd);
+        bucket.count += 1;
+        bucket.history.push(record);
+        const atMs = at ? Date.parse(at) : NaN;
+        const lastMs = bucket.lastAt ? Date.parse(bucket.lastAt) : NaN;
+        if (Number.isFinite(atMs) && (!Number.isFinite(lastMs) || atMs > lastMs)) bucket.lastAt = at;
+      };
+      const history = Array.isArray(source.rewards?.history) ? source.rewards.history : [];
+      for (const entry of history) {
+        const safeEntry = plainObject(entry);
+        for (const winner of Array.isArray(safeEntry.winners) ? safeEntry.winners : []) push(winner, safeEntry);
+      }
+      const lastWinners = plainObject(source.engine?.rewards).lastWinners;
+      const rewardsState = plainObject(source.engine?.rewards);
+      for (const winner of Array.isArray(lastWinners) ? lastWinners : []) {
+        push(winner, {
+          period: rewardsState.period ?? null,
+          periodKey: plainObject(winner).periodKey ?? null,
+          at: plainObject(winner).at ?? rewardsState.lastRunAt ?? null,
+        });
+      }
+      for (const bucket of map.values()) {
+        bucket.history.sort((left, right) => {
+          const leftMs = left.at ? Date.parse(left.at) : NaN;
+          const rightMs = right.at ? Date.parse(right.at) : NaN;
+          if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) return rightMs - leftMs;
+          return 0;
+        });
+      }
+      return map;
+    }
+
+    /**
+     * Normalized v3.3 reward rules (`status.engine.rewards.rules`) with the
+     * recommended defaults as fallback (docs/FAIR-PNL-REWARDS.md §5).
+     * `reported` is false when the engine has not shipped `rules` yet; legacy
+     * `rankPercents` / `basis:'account-cash'` are accepted only as deprecated
+     * fallbacks and flagged via `legacyBasis`.
+     */
+    function rewardRuleSummary(status) {
+      const source = plainObject(status);
+      const engineRewards = plainObject(source.engine?.rewards ?? source.rewards);
+      const rawRules = plainObject(engineRewards.rules);
+      const reported = Object.keys(rawRules).length > 0;
+      const shareCandidate = Array.isArray(rawRules.rankShares)
+        ? rawRules.rankShares
+        : Array.isArray(engineRewards.rankShares)
+          ? engineRewards.rankShares
+          : engineRewards.rankPercents;
+      let rankShares = [...REWARD_RULE_DEFAULTS.rankShares];
+      if (Array.isArray(shareCandidate) && shareCandidate.length === 3) {
+        const parsed = shareCandidate.map((value) => toNumber(value));
+        if (parsed.every((value) => value !== null && value >= 0) && parsed.reduce((total, value) => total + value, 0) <= 1.000001) {
+          rankShares = parsed;
+        }
+      }
+      const legacyBasis = rawRules.basis === 'account-cash' || engineRewards.basis === 'account-cash';
+      const basis = legacyBasis ? 'account-cash' : 'trading-performance';
+      const rawPeriod = typeof rawRules.period === 'string'
+        ? rawRules.period
+        : typeof engineRewards.period === 'string' ? engineRewards.period : REWARD_RULE_DEFAULTS.period;
+      const period = REWARD_PERIODS.includes(rawPeriod) ? rawPeriod : REWARD_RULE_DEFAULTS.period;
+      const pick = (key, fallback) => {
+        const value = toNumber(rawRules[key]);
+        return value === null ? fallback : value;
+      };
+      const maxPerPeriodUsd = firstNumber(rawRules.maxPerPeriodUsd, engineRewards.maxPerPeriodUsd);
+      const poolUsd = firstNumber(engineRewards.poolUsd, source.treasury?.poolUsd);
+      const rewardBudgetPctOfPool = pick('rewardBudgetPctOfPool', REWARD_RULE_DEFAULTS.rewardBudgetPctOfPool);
+      const budgetFromPool = poolUsd === null ? null : round2(poolUsd * rewardBudgetPctOfPool);
+      let budgetUsd = firstNumber(engineRewards.budgetUsd, budgetFromPool);
+      if (budgetUsd !== null && maxPerPeriodUsd !== null) budgetUsd = Math.min(budgetUsd, maxPerPeriodUsd);
+      if (budgetUsd !== null) budgetUsd = round2(budgetUsd);
+      const capitalAccounting = plainObject(source.engine?.capitalAccounting);
+      const lifetimeTotalUsd = firstNumber(
+        engineRewards.lifetimeTotalUsd,
+        capitalAccounting.rewardsLifetimeTotalUsd,
+        source.rewards?.lifetimeTotalUsd,
+      );
+      const explain = Array.isArray(rawRules.explain)
+        ? rawRules.explain.filter((line) => typeof line === 'string' && line.trim().length > 0)
+        : [];
+      const historySource = Array.isArray(engineRewards.history)
+        ? engineRewards.history
+        : Array.isArray(source.rewards?.history) ? source.rewards.history : [];
+      return {
+        available: reported || Object.keys(engineRewards).length > 0,
+        reported,
+        legacy: !reported,
+        enabled: rawRules.enabled === false ? false : engineRewards.enabled === false ? false : true,
+        period,
+        basis,
+        legacyBasis,
+        rankShares,
+        rewardBudgetPctOfPool,
+        maxPerPeriodUsd,
+        maxRewardPerAgentPctOfCapital: pick('maxRewardPerAgentPctOfCapital', REWARD_RULE_DEFAULTS.maxRewardPerAgentPctOfCapital),
+        minTradingProfitUsd: pick('minTradingProfitUsd', REWARD_RULE_DEFAULTS.minTradingProfitUsd),
+        minTrades: pick('minTrades', REWARD_RULE_DEFAULTS.minTrades),
+        maxDrawdownPct: pick('maxDrawdownPct', REWARD_RULE_DEFAULTS.maxDrawdownPct),
+        poolUsd,
+        budgetUsd,
+        lifetimeTotalUsd,
+        explain,
+        historyCount: historySource.length,
+      };
+    }
+
+    /** Reward eligibility reason for one candidate (locale key + dynamic detail). */
+    function rewardsEligibilityReason(candidate) {
+      if (candidate.eligible) return { reasonKey: 'rewardEligible', reasonDetail: null };
+      return { reasonKey: candidate.reasonKey, reasonDetail: candidate.reasonDetail };
+    }
+
+    /**
+     * Ranked reward candidates for the current period (v3.3 §5/§8), derived from
+     * `status.rankings.periods[period]` + the resolved rules + per-agent drawdown.
+     * Eligibility (all must hold): measured trading baseline, period trading
+     * profit > min, positive period trading return, enough trades, drawdown gate.
+     * Ranking is by period trading return, tie-broken by period trading P&L.
+     */
+    function rewardsEligibility(status) {
+      const source = plainObject(status);
+      const rules = rewardRuleSummary(source);
+      const rankings = plainObject(source.rankings);
+      const periods = plainObject(rankings.periods);
+      const period = REWARD_PERIODS.includes(rules.period) ? rules.period : 'weekly';
+      const periodRows = Array.isArray(periods[period]) ? periods[period] : [];
+      const agents = Array.isArray(source.agents) ? source.agents : [];
+      const agentById = new Map();
+      for (const agent of agents) {
+        if (agent && agent.id !== undefined) agentById.set(String(agent.id), agent);
+      }
+      const disabled = rules.enabled === false;
+      const noBudget = rules.budgetUsd === null || rules.budgetUsd <= 0;
+      const candidates = periodRows.map((raw, index) => {
+        const row = plainObject(raw);
+        const agentId = row.agentId !== undefined && row.agentId !== null ? String(row.agentId) : null;
+        const agent = agentId === null ? null : agentById.get(agentId) ?? null;
+        const tradingPnlUsd = firstNumber(row.tradingPnlUsd, row.pnlUsd);
+        const tradingPnlPct = firstNumber(row.tradingPnlPct, row.pnlPct);
+        const trades = firstNumber(row.periodTrades, row.trades, agent?.tradesCount);
+        const agentCapital = plainObject(agent?.capital);
+        const drawdownPct = firstNumber(row.drawdownPct, agent?.drawdownPct);
+        const capitalUsd = firstNumber(
+          row.baselineCapitalUsd,
+          agentCapital.contributedUsd,
+          agent?.equityUsd,
+          agent?.endowmentUsd,
+        );
+        const hasTradingBaseline = toNumber(row.baselineCapitalUsd) !== null
+          || toNumber(row.baselineTradingPlUsd) !== null
+          || toNumber(row.tradingPlUsd) !== null
+          || toNumber(row.tradingPnlUsd) !== null;
+        let reasonKey = 'rewardEligible';
+        let reasonDetail = null;
+        if (disabled) {
+          reasonKey = 'rewardDisabled';
+        } else if (noBudget) {
+          reasonKey = 'rewardNoBudget';
+        } else if (tradingPnlUsd === null || !hasTradingBaseline) {
+          reasonKey = 'rewardNoBaseline';
+        } else if (tradingPnlUsd <= rules.minTradingProfitUsd) {
+          reasonKey = 'rewardBelowProfit';
+          reasonDetail = `${fmtUsd(tradingPnlUsd)} ≤ ${fmtUsd(rules.minTradingProfitUsd)}`;
+        } else if (tradingPnlPct === null || tradingPnlPct <= 0) {
+          reasonKey = 'rewardNotPositive';
+          reasonDetail = tradingPnlPct === null ? null : fmtPct(tradingPnlPct);
+        } else if (trades === null || trades < rules.minTrades) {
+          reasonKey = 'rewardTooFewTrades';
+          reasonDetail = `${fmtNum(trades ?? 0)} / ${fmtNum(rules.minTrades)}`;
+        } else if (drawdownPct !== null && drawdownPct > rules.maxDrawdownPct) {
+          reasonKey = 'rewardDrawdown';
+          reasonDetail = `${fmtPct(drawdownPct)} > ${fmtPct(rules.maxDrawdownPct)}`;
+        }
+        return {
+          key: `${agentId ?? 'candidate'}-${index}`,
+          agentId,
+          name: typeof row.name === 'string' && row.name.length > 0 ? row.name : agent?.name ?? agentId ?? '—',
+          rank: toNumber(row.rank) ?? index + 1,
+          tradingPnlUsd,
+          tradingPnlPct,
+          trades,
+          drawdownPct,
+          capitalUsd,
+          eligible: reasonKey === 'rewardEligible',
+          reasonKey,
+          reasonDetail,
+          eligibleRank: null,
+          projectedUsd: null,
+        };
+      });
+      const byPerformance = (left, right) => (
+        ((right.tradingPnlPct ?? -Infinity) - (left.tradingPnlPct ?? -Infinity))
+        || ((right.tradingPnlUsd ?? -Infinity) - (left.tradingPnlUsd ?? -Infinity))
+        || String(left.name).localeCompare(String(right.name))
+      );
+      const eligible = candidates.filter((candidate) => candidate.eligible).sort(byPerformance);
+      for (const candidate of eligible) {
+        candidate.eligibleRank = eligible.indexOf(candidate) + 1;
+        const share = rules.rankShares[candidate.eligibleRank - 1] ?? 0;
+        if (share <= 0 || rules.budgetUsd === null) continue;
+        let amountUsd = rules.budgetUsd * share;
+        if (candidate.capitalUsd !== null) {
+          amountUsd = Math.min(amountUsd, candidate.capitalUsd * rules.maxRewardPerAgentPctOfCapital);
+        }
+        candidate.projectedUsd = round2(amountUsd);
+      }
+      const ineligible = candidates.filter((candidate) => !candidate.eligible).sort(byPerformance);
+      return {
+        available: periodRows.length > 0 || rules.available,
+        rules,
+        period,
+        basis: rules.basis,
+        poolUsd: rules.poolUsd,
+        budgetUsd: rules.budgetUsd,
+        disabled,
+        eligibleCount: eligible.length,
+        candidateCount: candidates.length,
+        candidates: [...eligible, ...ineligible],
+        eligible,
+        ineligible,
+        maxRewardPerPeriodUsd: rules.maxPerPeriodUsd,
+      };
+    }
+
+    /** Build the `set-reward-settings` patch from the v3.3 form draft (new names only). */
+    function rewardSettingsPatch(draft) {
+      const raw = plainObject(draft);
+      const patch = {};
+      if (typeof raw.enabled === 'boolean') patch.enabled = raw.enabled;
+      if (REWARD_PERIODS.includes(raw.period)) patch.period = raw.period;
+      if (Array.isArray(raw.rankShares) && raw.rankShares.length === 3) {
+        const shares = raw.rankShares.map((value) => toNumber(value));
+        if (shares.every((value) => value !== null && value >= 0) && shares.reduce((total, value) => total + value, 0) <= 1.000001) {
+          patch.rankShares = shares.map((value) => Math.round(value * 10000) / 10000);
+        }
+      }
+      for (const key of ['rewardBudgetPctOfPool', 'maxRewardPerAgentPctOfCapital', 'maxDrawdownPct']) {
+        const value = toNumber(raw[key]);
+        if (value !== null && value >= 0 && value <= 1) patch[key] = Math.round(value * 10000) / 10000;
+      }
+      const minProfit = toNumber(raw.minTradingProfitUsd);
+      if (minProfit !== null && minProfit >= 0) patch.minTradingProfitUsd = round2(minProfit);
+      const minTrades = toNumber(raw.minTrades);
+      if (minTrades !== null && minTrades >= 0) patch.minTrades = Math.trunc(minTrades);
+      if (raw.maxPerPeriodUsd === null) patch.maxPerPeriodUsd = null;
+      else {
+        const maxPerPeriod = toNumber(raw.maxPerPeriodUsd);
+        if (maxPerPeriod !== null && maxPerPeriod >= 0) patch.maxPerPeriodUsd = round2(maxPerPeriod);
+      }
+      return Object.keys(patch).length > 0 ? patch : null;
+    }
+
+    /**
+     * Portfolio-level fair P&L totals: trading P&L (engine capital accounting or the
+     * sum of agent trading P&L) and lifetime rewards (engine totals, else the reward
+     * history ledger). Never derived from equity change.
+     */
+    function portfolioPnlTotals(status) {
+      const source = plainObject(status);
+      const agents = Array.isArray(source.agents) ? source.agents : [];
+      const engine = plainObject(source.engine);
+      const capitalAccounting = plainObject(engine.capitalAccounting);
+      const engineRewards = plainObject(engine.rewards);
+      const ledger = rewardsLedgerByAgent(source);
+      let tradingFromAgents = null;
+      let rewardsFromAgents = null;
+      for (const agent of agents) {
+        const view = agentPnlView(agent);
+        if (view.tradingUsd !== null) tradingFromAgents = round2((tradingFromAgents ?? 0) + view.tradingUsd);
+        const ledgerEntry = agent && agent.id !== undefined ? ledger.get(String(agent.id)) : null;
+        const rewardsUsd = firstNumber(view.rewardsUsd, ledgerEntry?.lifetimeUsd ?? null);
+        if (rewardsUsd !== null) rewardsFromAgents = round2((rewardsFromAgents ?? 0) + rewardsUsd);
+      }
+      const tradingPnlTotalUsd = firstNumber(
+        capitalAccounting.tradingPnlTotalUsd,
+        tradingFromAgents,
+      );
+      const rewardsLifetimeTotalUsd = firstNumber(
+        engineRewards.lifetimeTotalUsd,
+        capitalAccounting.rewardsLifetimeTotalUsd,
+        source.rewards?.lifetimeTotalUsd,
+        rewardsFromAgents,
+      );
+      const rewardedAgents = firstNumber(capitalAccounting.rewardedAgents)
+        ?? [...ledger.values()].filter((entry) => entry.count > 0).length;
+      return {
+        available: capitalAccounting.version === 2 || Object.keys(capitalAccounting).length > 0 || agents.length > 0,
+        capitalVersion: toNumber(capitalAccounting.version),
+        migrationMarker: capitalAccounting.migrationMarker ?? null,
+        tradingPnlTotalUsd,
+        rewardsLifetimeTotalUsd,
+        rewardPayoutCount: [...ledger.values()].reduce((total, entry) => total + entry.count, 0),
+        rewardedAgents,
       };
     }
 
@@ -2282,6 +2979,8 @@ window.__ModuleLoader__.load({
       const agents = Array.isArray(status?.agents) ? status.agents : [];
       /** Population-level endowment fallback: agent rows may omit their own endowment. */
       const populationEndowment = toNumber(status?.limits?.endowmentUsd) ?? toNumber(status?.config?.endowmentUsd);
+      /** v3.2 fallback: lifetime rewards derived from the top-level payout history. */
+      const rewardLedger = rewardsLedgerByAgent(status);
       const nameById = new Map();
       for (const agent of agents) {
         if (agent && agent.id !== undefined) nameById.set(String(agent.id), agentDisplayName(agent));
@@ -2295,10 +2994,28 @@ window.__ModuleLoader__.load({
         const agentStatus = rawStatus === 'dead' || rawStatus === 'condemned' ? rawStatus : 'alive';
         const endowment = toNumber(safeAgent.endowmentUsd) ?? populationEndowment;
         const equity = toNumber(safeAgent.equityUsd);
-        const pnlUsd = equity !== null && endowment !== null
-          ? round2(equity - endowment)
-          : toNumber(safeAgent.netPlUsd);
-        const pnlPct = pnlUsd !== null && endowment !== null && endowment > 0 ? (pnlUsd / endowment) * 100 : null;
+        // v3.3 fair accounting: `agent.rewards` wins; otherwise fall back to the
+        // top-level payout history so the lifetime-rewards column still works.
+        const rawRewards = plainObject(safeAgent.rewards);
+        const ledgerRewards = rewardLedger.get(id) ?? null;
+        const mergedRewards = {
+          ...(ledgerRewards ?? {}),
+          ...rawRewards,
+          lifetimeUsd: firstNumber(rawRewards.lifetimeUsd, ledgerRewards?.lifetimeUsd, plainObject(safeAgent.pnl).rewardsUsd),
+          count: firstNumber(rawRewards.count, ledgerRewards?.count),
+          lastAt: rawRewards.lastAt ?? ledgerRewards?.lastAt ?? null,
+          history: Array.isArray(rawRewards.history) && rawRewards.history.length > 0
+            ? rawRewards.history
+            : (ledgerRewards?.history ?? []),
+        };
+        const agentForPnl = endowment === safeAgent.endowmentUsd
+          ? { ...safeAgent, rewards: mergedRewards }
+          : { ...safeAgent, rewards: mergedRewards, endowmentUsd: endowment };
+        const pnlView = agentPnlView(agentForPnl);
+        const capital = capitalBreakdown(agentForPnl);
+        const rewardHistory = agentRewardHistoryRows(mergedRewards);
+        const pnlUsd = pnlView.tradingUsd;
+        const pnlPct = pnlView.tradingPct === null ? null : pnlView.tradingPct * 100;
         const positions = buildHoldingsRows(safeAgent.positions);
         const instrumentPositions = positionRows(safeAgent.positions);
         const exposure = positionSummary(instrumentPositions, safeAgent);
@@ -2312,7 +3029,7 @@ window.__ModuleLoader__.load({
         const research = mapResearchBriefing(safeAgent.research);
         const transactions = agentTransactionRows(safeAgent.orders);
         const plan = agentPlanMapping(safeAgent.plan);
-        const pnl = agentPnlMapping(safeAgent.pnl);
+        const pnl = pnlView;
         const rankBadges = agentRankingBadges(safeAgent.rankings);
         const strategy = agentStrategyMapping(safeAgent);
         const policy = botAgentPolicyMapping(safeAgent.policy);
@@ -2355,11 +3072,22 @@ window.__ModuleLoader__.load({
           cashUsd: toNumber(safeAgent.cashUsd),
           positionsValueUsd: toNumber(safeAgent.positionsValueUsd),
           endowmentUsd: endowment,
+          // v3.3: the P&L columns are Trading P&L (reward capital excluded);
+          // total equity above stays a separate, equity-only label.
           pnlUsd,
           pnlPct,
-          realizedPlUsd: toNumber(safeAgent.realizedPlUsd),
-          unrealizedPlUsd: toNumber(safeAgent.unrealizedPlUsd),
-          dayPnlPct: toNumber(safeAgent.dayPnlPct),
+          tradingPnlUsd: pnlView.tradingUsd,
+          tradingPnlPct: pnlView.tradingPct,
+          pnlSource: pnlView.source,
+          rewardsUsd: firstNumber(pnlView.rewardsUsd, rewardHistory.lifetimeUsd),
+          rewardCount: firstNumber(pnlView.rewardCount, rewardHistory.count),
+          lastRewardAt: pnlView.lastRewardAt ?? rewardHistory.lastAt,
+          capital,
+          capitalBreakdown: capital,
+          rewardHistory,
+          realizedPlUsd: firstNumber(pnlView.realizedUsd, safeAgent.realizedPlUsd),
+          unrealizedPlUsd: firstNumber(pnlView.unrealizedUsd, safeAgent.unrealizedPlUsd),
+          dayPnlPct: pnlView.dayPct,
           net7dUsd: toNumber(safeAgent.net7dUsd),
           drawdownPct: toNumber(safeAgent.drawdownPct),
           runwayHours: toNumber(safeAgent.runwayHours),
@@ -2457,6 +3185,9 @@ window.__ModuleLoader__.load({
         at: status?.at ?? null,
         research: researchStatusSummary(status),
         rewards: engine.rewards ?? null,
+        rewardRules: rewardRuleSummary(status),
+        capitalAccounting: plainObject(engine.capitalAccounting),
+        pnlTotals: portfolioPnlTotals(status),
         rankings: status?.rankings ?? null,
         strategyMix: status?.strategyMix ?? null,
         engineAgents: botAgentEngineStatus(engine.agents ?? status?.engine?.agents),
@@ -2702,12 +3433,28 @@ window.__ModuleLoader__.load({
       const status = plainObject(stateStatus);
       if (Object.keys(status).length === 0) return [];
       const summary = summarize(status);
+      const totals = summary.pnlTotals ?? portfolioPnlTotals(status);
       const market = plainObject(marketView);
       const portfolio = plainObject(market.portfolio);
       const liveEquity = toNumber(portfolio.equityUsd);
       const equity = liveEquity ?? summary.equityUsd;
-      const dayPnlUsd = toNumber(portfolio.dayPnlUsd);
-      const dayPnlPct = toNumber(portfolio.dayPnlPct);
+      // v3.3: the day KPI is trading P&L. Prefer the engine's trading fields; the
+      // live market view's `dayPnlUsd` is only a backward-compatible fallback.
+      let dayPnlUsd = firstNumber(portfolio.tradingDayPnlUsd, portfolio.dayPnlUsd);
+      let dayPnlPct = firstNumber(portfolio.tradingDayPnlPct, portfolio.dayPnlPct);
+      if (dayPnlUsd === null) {
+        // State-only fallback: sum the day leaderboard's trading P&L (never an equity delta).
+        const dailyRows = Array.isArray(plainObject(status.rankings?.periods).daily)
+          ? status.rankings.periods.daily
+          : [];
+        const measured = dailyRows.filter((row) => toNumber(row?.tradingPnlUsd) !== null);
+        if (measured.length > 0) {
+          const totalUsd = measured.reduce((total, row) => total + (toNumber(row.tradingPnlUsd) ?? 0), 0);
+          const totalCapital = measured.reduce((total, row) => total + (toNumber(row.baselineCapitalUsd) ?? 0), 0);
+          dayPnlUsd = round2(totalUsd);
+          if (totalCapital > 0) dayPnlPct = totalUsd / totalCapital;
+        }
+      }
       const cashUsd = toNumber(portfolio.cashUsd) ?? summary.cashUsd;
       const buyingPowerUsd = toNumber(portfolio.buyingPowerUsd) ?? summary.buyingPowerUsd;
       const grossExposureUsd = toNumber(portfolio.grossExposureUsd);
@@ -2717,30 +3464,44 @@ window.__ModuleLoader__.load({
       const agents = Array.isArray(status.agents) ? status.agents : [];
       const aliveAgents = agents.filter((agent) => String(agent?.status ?? 'alive').toLowerCase() === 'alive');
       const winners = aliveAgents.filter((agent) => {
-        const pnl = toNumber(agent?.dayPnlPct) ?? toNumber(agent?.pnlPct);
+        const pnl = firstNumber(agent?.pnl?.dayPct, agent?.rankings?.tradingDayPct, agent?.dayPnlPct, agent?.pnlPct);
         return pnl !== null && pnl > 0;
       }).length;
       const winRatePct = aliveAgents.length > 0 ? (winners / aliveAgents.length) * 100 : null;
       const tradesToday = toNumber(lastCycle?.orders) ?? agents.reduce((total, agent) => total + (toNumber(agent?.tradesCount) ?? 0), 0);
       const treasury = summary.treasury ?? {};
+      const tradingLifetimeUsd = totals.tradingPnlTotalUsd;
+      const rewardsLifetimeUsd = totals.rewardsLifetimeTotalUsd;
       return [
         {
           key: 'equity',
-          labelKey: 'kpiEquity',
+          // Total equity is a portfolio-size label only — never "P&L" (reward capital
+          // moves it, so an equity delta is not a profit/loss).
+          labelKey: 'totalEquity',
           value: fmtUsd(equity),
-          deltaUsd: dayPnlUsd,
-          deltaPct: dayPnlPct,
-          direction: changeDirection(dayPnlUsd ?? dayPnlPct),
+          direction: 'flat',
           detailKey: 'kpiEquityDetail',
           detail: summary.mode,
           live: liveEquity !== null,
         },
         {
+          key: 'tradingPnl',
+          labelKey: 'kpiTradingPnl',
+          value: fmtSignedUsd(tradingLifetimeUsd),
+          direction: changeDirection(tradingLifetimeUsd),
+        },
+        {
           key: 'dayPnl',
           labelKey: 'kpiDayPnl',
           value: `${dayPnlUsd === null ? '—' : fmtSignedUsd(dayPnlUsd)}${dayPnlPct === null ? '' : ` (${fmtPct(dayPnlPct)})`}`,
-          deltaPct: dayPnlPct,
           direction: changeDirection(dayPnlUsd ?? dayPnlPct),
+        },
+        {
+          key: 'rewards',
+          labelKey: 'kpiRewards',
+          value: fmtUsd(rewardsLifetimeUsd),
+          detail: totals.rewardedAgents > 0 ? `${fmtNum(totals.rewardedAgents)}` : null,
+          direction: 'flat',
         },
         {
           key: 'cashBp',
@@ -2840,14 +3601,20 @@ window.__ModuleLoader__.load({
           .filter((symbol) => symbol.length > 0);
         const primary = symbols[0] ?? null;
         const livePositions = Array.isArray(live?.positions) ? live.positions.length : null;
+        // Live equity is total equity (includes reward capital); the live day P&L
+        // comes from the trading day return, never from an equity change.
         const liveEquityUsd = toNumber(live?.equityUsd);
-        const liveDayPnlPct = toNumber(live?.dayPnlPct);
+        const liveDayPnlPct = firstNumber(live?.tradingDayPct, live?.dayPnlPct);
+        const liveDayPnlUsd = firstNumber(live?.tradingDayPnlUsd, live?.dayPnlUsd);
+        const liveTradingPnlUsd = firstNumber(live?.tradingPnlUsd);
         const stance = typeof live?.stance === 'string' ? live.stance : row.policy?.stance ?? null;
         return {
           ...row,
           live: live !== null,
           liveEquityUsd,
           liveDayPnlPct,
+          liveDayPnlUsd,
+          liveTradingPnlUsd,
           livePositions,
           stance,
           stanceBadge: stance ? stanceBadge(stance) : null,
@@ -3926,42 +4693,106 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    /** Rewards settings + live payout preview + last winners/history. */
+    /** Periodic reward history table (period key, date, budget, winners, total). */
+    function RewardPayoutHistory({ t, historyRows }) {
+      if (historyRows.length === 0) return h('p', { className: 'atm-empty', key: 'no-history' }, t('rewardsNoHistory'));
+      const lifetime = round2(historyRows.reduce((total, entry) => total + (entry.totalUsd ?? 0), 0));
+      return h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
+        h('thead', { key: 'head' }, h('tr', null, [
+          h('th', { key: 'period' }, t('rewardsPeriod')),
+          h('th', { key: 'key' }, 'key'),
+          h('th', { key: 'at' }, t('time')),
+          h('th', { key: 'budget' }, t('rewardBudgetPreview')),
+          h('th', { key: 'total' }, t('rewardsTotal')),
+          h('th', { key: 'winners' }, t('rewardsLastWinners')),
+        ])),
+        h('tbody', { key: 'body' }, historyRows.map((entry) => h('tr', { key: entry.key }, [
+          h('td', { key: 'period' }, entry.period ?? '—'),
+          h('td', { key: 'key', className: 'atm-mono' }, entry.periodKey ?? '—'),
+          h('td', { key: 'at', className: 'atm-muted', title: fmtDateTime(entry.at) }, fmtAgo(entry.at)),
+          h('td', { key: 'budget', className: 'atm-mono' }, fmtUsd(entry.budgetUsd)),
+          h('td', { key: 'total', className: 'atm-mono' }, fmtUsd(entry.totalUsd)),
+          h('td', { key: 'winners' }, entry.winners.map((winner) => `${MEDALS[winner.rank] ?? ''}${winner.name}:${fmtUsd(winner.amountUsd)}`).join(' · ')),
+        ]))),
+        h('tfoot', { key: 'foot' }, h('tr', null, [
+          h('td', { key: 'label', colSpan: 4, className: 'atm-muted' }, t('rewardHistoryTotals')),
+          h('td', { key: 'lifetime', className: 'atm-mono' }, fmtUsd(lifetime)),
+          h('td', { key: 'spacer' }),
+        ])),
+      ]));
+    }
+
+    /**
+     * v3.3 reward settings (docs/FAIR-PNL-REWARDS.md §5): only the new rule names
+     * are sent (`rankShares`, `rewardBudgetPctOfPool`, `maxRewardPerAgentPctOfCapital`,
+     * `minTradingProfitUsd`, `minTrades`, `maxDrawdownPct`) — never the deprecated
+     * `rankPercents` / account-cash settings.
+     */
     function RewardsControl({ t, rewards, history, controlState, runControl }) {
-      const state = rewardsControlState(rewards);
-      const [enabled, setEnabled] = React.useState(state.enabled);
-      const [period, setPeriod] = React.useState(state.period);
-      const [first, setFirst] = React.useState(String(Math.round(state.rankPercents[0] * 100)));
-      const [second, setSecond] = React.useState(String(Math.round(state.rankPercents[1] * 100)));
-      const [third, setThird] = React.useState(String(Math.round(state.rankPercents[2] * 100)));
-      const [maxPerPeriod, setMaxPerPeriod] = React.useState(state.maxPerPeriodUsd === null ? '' : String(state.maxPerPeriodUsd));
+      const rules = rewardRuleSummary({ engine: { rewards } });
+      const controlStateView = rewardsControlState(rewards);
+      const [enabled, setEnabled] = React.useState(rules.enabled);
+      const [period, setPeriod] = React.useState(rules.period);
+      const [first, setFirst] = React.useState(String(Math.round(rules.rankShares[0] * 100)));
+      const [second, setSecond] = React.useState(String(Math.round(rules.rankShares[1] * 100)));
+      const [third, setThird] = React.useState(String(Math.round(rules.rankShares[2] * 100)));
+      const [budgetPct, setBudgetPct] = React.useState(String(Math.round(rules.rewardBudgetPctOfPool * 100)));
+      const [maxPerPeriod, setMaxPerPeriod] = React.useState(rules.maxPerPeriodUsd === null ? '' : String(rules.maxPerPeriodUsd));
+      const [agentCapPct, setAgentCapPct] = React.useState(String(Math.round(rules.maxRewardPerAgentPctOfCapital * 100)));
+      const [minProfit, setMinProfit] = React.useState(String(rules.minTradingProfitUsd));
+      const [minTrades, setMinTrades] = React.useState(String(rules.minTrades));
+      const [maxDrawdownPct, setMaxDrawdownPct] = React.useState(String(Math.round(rules.maxDrawdownPct * 100)));
       React.useEffect(() => {
-        setEnabled(state.enabled);
-        setPeriod(state.period);
-        setFirst(String(Math.round(state.rankPercents[0] * 100)));
-        setSecond(String(Math.round(state.rankPercents[1] * 100)));
-        setThird(String(Math.round(state.rankPercents[2] * 100)));
-        setMaxPerPeriod(state.maxPerPeriodUsd === null ? '' : String(state.maxPerPeriodUsd));
-      }, [state.enabled, state.period, state.rankPercents.join(','), state.maxPerPeriodUsd]);
+        setEnabled(rules.enabled);
+        setPeriod(rules.period);
+        setFirst(String(Math.round(rules.rankShares[0] * 100)));
+        setSecond(String(Math.round(rules.rankShares[1] * 100)));
+        setThird(String(Math.round(rules.rankShares[2] * 100)));
+        setBudgetPct(String(Math.round(rules.rewardBudgetPctOfPool * 100)));
+        setMaxPerPeriod(rules.maxPerPeriodUsd === null ? '' : String(rules.maxPerPeriodUsd));
+        setAgentCapPct(String(Math.round(rules.maxRewardPerAgentPctOfCapital * 100)));
+        setMinProfit(String(rules.minTradingProfitUsd));
+        setMinTrades(String(rules.minTrades));
+        setMaxDrawdownPct(String(Math.round(rules.maxDrawdownPct * 100)));
+      }, [
+        rules.enabled,
+        rules.period,
+        rules.rankShares.join(','),
+        rules.rewardBudgetPctOfPool,
+        rules.maxPerPeriodUsd,
+        rules.maxRewardPerAgentPctOfCapital,
+        rules.minTradingProfitUsd,
+        rules.minTrades,
+        rules.maxDrawdownPct,
+      ]);
 
       const parsePercent = (value) => {
         const number = toNumber(value);
         return number === null ? 0 : number / 100;
       };
-      const percents = [parsePercent(first), parsePercent(second), parsePercent(third)];
-      const preview = rewardsPreview(rewards, percents);
+      const shares = [parsePercent(first), parsePercent(second), parsePercent(third)];
+      const budgetFromPool = rules.poolUsd === null ? null : round2(rules.poolUsd * parsePercent(budgetPct));
+      const maxValue = toNumber(maxPerPeriod);
+      const budgetPreview = budgetFromPool !== null && maxValue !== null ? round2(Math.min(budgetFromPool, maxValue)) : budgetFromPool;
       const pending = controlState.pending === 'set-reward-settings';
       const related = controlState.action === 'set-reward-settings';
       const winners = lastWinnerRows(rewards);
       const historyRows = rewardHistoryRows({ rewards: { history } });
       const apply = () => {
-        const maxValue = maxPerPeriod.trim() === '' ? null : Number(maxPerPeriod);
-        runControl({
-          action: 'set-reward-settings',
-          settings: { enabled, period, rankPercents: percents, maxPerPeriodUsd: maxValue },
+        const patch = rewardSettingsPatch({
+          enabled,
+          period,
+          rankShares: shares,
+          rewardBudgetPctOfPool: parsePercent(budgetPct),
+          maxPerPeriodUsd: maxPerPeriod.trim() === '' ? null : Number(maxPerPeriod),
+          maxRewardPerAgentPctOfCapital: parsePercent(agentCapPct),
+          minTradingProfitUsd: toNumber(minProfit),
+          minTrades: toNumber(minTrades),
+          maxDrawdownPct: parsePercent(maxDrawdownPct),
         });
+        if (!patch) return;
+        runControl({ action: 'set-reward-settings', settings: patch });
       };
-      const capLabel = (key) => t(key === 'pool' ? 'rewardsPoolCap' : key === 'allocation' ? 'rewardsAllocationCap' : 'rewardsMaxCap');
 
       return h('div', { className: 'atm-card-block' }, [
         h('h4', { className: 'atm-block-title', key: 'title' }, t('rewards')),
@@ -3979,13 +4810,30 @@ window.__ModuleLoader__.load({
             onClick: () => setPeriod(value),
           }, value === 'daily' ? t('rewardsDaily') : value === 'weekly' ? t('rewardsWeekly') : t('rewardsMonthly')))),
         ]),
-        h('div', { className: 'atm-form-row', key: 'percents' }, [
+        h('div', { className: 'atm-preview', key: 'bases' }, [
+          h('span', { key: 'pool', className: 'atm-preview-row' }, `${t('rewardPoolAvailable')} ${fmtUsd(rules.poolUsd)} · ${t('rewardBudgetPreview')} ${fmtUsd(budgetPreview)} · ${t('rewardDistributed')} ${fmtUsd(rules.lifetimeTotalUsd)}`),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'shares' }, [
           h('label', { className: 'atm-field', key: 'p1' }, `${t('rewardsFirst')} %`,
-            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: first, onChange: (event) => setFirst(event.target.value) })),
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: first, onChange: (event) => setFirst(event.target.value) })),
           h('label', { className: 'atm-field', key: 'p2' }, `${t('rewardsSecond')} %`,
-            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: second, onChange: (event) => setSecond(event.target.value) })),
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: second, onChange: (event) => setSecond(event.target.value) })),
           h('label', { className: 'atm-field', key: 'p3' }, `${t('rewardsThird')} %`,
-            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: third, onChange: (event) => setThird(event.target.value) })),
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: third, onChange: (event) => setThird(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'budgetPct' }, `${t('rewardBudgetPct')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: budgetPct, onChange: (event) => setBudgetPct(event.target.value) })),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'rules' }, [
+          h('label', { className: 'atm-field', key: 'cap' }, `${t('rewardAgentCap')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: agentCapPct, onChange: (event) => setAgentCapPct(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'minProfit' }, t('rewardMinProfit'),
+            h('input', { className: 'atm-num', type: 'number', min: 0, step: '0.01', value: minProfit, onChange: (event) => setMinProfit(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'minTrades' }, t('rewardMinTrades'),
+            h('input', { className: 'atm-num', type: 'number', min: 0, step: 1, value: minTrades, onChange: (event) => setMinTrades(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'drawdown' }, `${t('rewardMaxDrawdown')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 100, step: 1, value: maxDrawdownPct, onChange: (event) => setMaxDrawdownPct(event.target.value) })),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'maxrow' }, [
           h('label', { className: 'atm-field', key: 'max' }, t('rewardsMax'),
             h('input', {
               className: 'atm-num',
@@ -3998,21 +4846,15 @@ window.__ModuleLoader__.load({
             })),
         ]),
         h('div', { className: 'atm-preview', key: 'preview' }, [
-          h('span', { key: 'bases', className: 'atm-preview-row' },
-            `${t('rewardsCash')} ${fmtUsd(preview.accountCashUsd)} · ${t('rewardsPool')} ${fmtUsd(preview.poolUsd)} · ${t('rewardsCapRemaining')} ${fmtUsd(preview.allocationCapRemainingUsd)}`),
           h('span', { key: 'amounts', className: 'atm-preview-row' },
-            preview.rankPercents.map((percent, index) => {
-              const amount = preview.amounts[index];
-              return h('span', { key: `amount-${index}` }, `${t(index === 0 ? 'rewardsFirst' : index === 1 ? 'rewardsSecond' : 'rewardsThird')} ${Math.round(percent * 100)}% ≈ `, h('span', { className: 'atm-pill-amount' }, fmtUsd(amount)), '  ');
-            })),
-          h('span', { key: 'total', className: 'atm-preview-row' },
-            `${t('rewardsTotal')} ${fmtUsd(preview.totalUsd)}`,
-            preview.capped ? ` · ${t('rewardsCappedBy')} ${capLabel(preview.cappedBy)}` : ''),
+            shares.map((percent, index) => h('span', { key: `amount-${index}` },
+              `${t(index === 0 ? 'rewardsFirst' : index === 1 ? 'rewardsSecond' : 'rewardsThird')} ${Math.round(percent * 100)}% ≈ `,
+              h('span', { className: 'atm-pill-amount' }, fmtUsd(budgetPreview === null ? null : round2(budgetPreview * percent))), '  '))),
           h('span', { key: 'boundary', className: 'atm-muted' }, t('rewardsPayBoundary')),
         ]),
         h('div', { className: 'atm-form-row', key: 'status' }, [
-          h('span', { key: 'last', className: 'atm-muted' }, `${t('rewardsLastRun')} ${fmtAgo(state.lastRunAt)}`),
-          h('span', { key: 'next', className: 'atm-muted' }, `${t('rewardsNextRun')} ${fmtAgo(state.nextRunAt)}`),
+          h('span', { key: 'last', className: 'atm-muted' }, `${t('rewardsLastRun')} ${fmtAgo(controlStateView.lastRunAt)}`),
+          h('span', { key: 'next', className: 'atm-muted' }, `${t('rewardsNextRun')} ${fmtAgo(controlStateView.nextRunAt)}`),
         ]),
         h('div', { className: 'atm-form-row', key: 'actions' }, [
           h('button', {
@@ -4037,31 +4879,99 @@ window.__ModuleLoader__.load({
               `${MEDALS[winner.rank] ?? `#${winner.rank ?? '—'}`} ${winner.name} · ${fmtUsd(winner.amountUsd)}`))),
           ])
           : null,
-        historyRows.length > 0
-          ? h('div', { className: 'atm-plan-block', key: 'history' }, [
-            h('span', { className: 'atm-plan-label', key: 'label' }, t('rewardsHistory')),
-            h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
-              h('thead', { key: 'head' }, h('tr', null, [
-                h('th', { key: 'period' }, t('rewardsPeriod')),
-                h('th', { key: 'key' }, 'key'),
-                h('th', { key: 'at' }, t('time')),
-                h('th', { key: 'total' }, t('rewardsTotal')),
-                h('th', { key: 'winners' }, t('rewardsLastWinners')),
-              ])),
-              h('tbody', { key: 'body' }, historyRows.map((entry) => h('tr', { key: entry.key }, [
-                h('td', { key: 'period' }, entry.period ?? '—'),
-                h('td', { key: 'key', className: 'atm-mono' }, entry.periodKey ?? '—'),
-                h('td', { key: 'at', className: 'atm-muted' }, fmtAgo(entry.at)),
-                h('td', { key: 'total', className: 'atm-mono' }, fmtUsd(entry.totalUsd)),
-                h('td', { key: 'winners' }, entry.winners.map((winner) => `${MEDALS[winner.rank] ?? ''}${winner.name}:${fmtUsd(winner.amountUsd)}`).join(' · ')),
-              ]))),
-            ])),
-          ])
-          : h('p', { className: 'atm-empty', key: 'no-history' }, t('rewardsNoHistory')),
+        h('div', { className: 'atm-plan-block', key: 'history' }, [
+          h('span', { className: 'atm-plan-label', key: 'label' }, t('rewardsHistory')),
+          h(RewardPayoutHistory, { key: 'table', t, historyRows }),
+        ]),
       ]);
     }
 
-    /** Daily / weekly / monthly leaderboards from status.rankings. */
+    /** Reward rules summary card (basis, thresholds, budget, rank shares, caps). */
+    function RewardRulesPanel({ t, status }) {
+      const rules = rewardRuleSummary(status);
+      const periodLabel = (period) => (period === 'daily' ? t('rewardsDaily') : period === 'monthly' ? t('rewardsMonthly') : t('rewardsWeekly'));
+      const items = [
+        { key: 'basis', label: t('rewardBasis'), value: rules.basis === 'account-cash' ? t('rewardBasisCash') : t('rewardBasisTrading') },
+        { key: 'period', label: t('rewardPeriod'), value: periodLabel(rules.period) },
+        { key: 'budget', label: t('rewardBudgetPct'), value: `${fmtPct(rules.rewardBudgetPctOfPool)} ${t('rewardsPool')}` },
+        {
+          key: 'shares',
+          label: t('rewardRankShares'),
+          value: rules.rankShares.map((share, index) => `${t(index === 0 ? 'rewardsFirst' : index === 1 ? 'rewardsSecond' : 'rewardsThird')} ${Math.round(share * 100)}%`).join(' / '),
+        },
+        { key: 'cap', label: t('rewardAgentCap'), value: `${fmtPct(rules.maxRewardPerAgentPctOfCapital)} ${t('rewardOfCapital')}` },
+        { key: 'minProfit', label: t('rewardMinProfit'), value: fmtUsd(rules.minTradingProfitUsd) },
+        { key: 'minTrades', label: t('rewardMinTrades'), value: fmtNum(rules.minTrades) },
+        { key: 'drawdown', label: t('rewardMaxDrawdown'), value: fmtPct(rules.maxDrawdownPct) },
+        { key: 'max', label: t('rewardsMax'), value: rules.maxPerPeriodUsd === null ? t('rewardsNoMax') : fmtUsd(rules.maxPerPeriodUsd) },
+        { key: 'pool', label: t('rewardPoolAvailable'), value: fmtUsd(rules.poolUsd) },
+        { key: 'budgetUsd', label: t('rewardBudgetPreview'), value: fmtUsd(rules.budgetUsd) },
+        { key: 'lifetime', label: t('rewardDistributed'), value: fmtUsd(rules.lifetimeTotalUsd) },
+      ];
+      return h('div', { className: 'atm-card-block' }, [
+        h('h4', { className: 'atm-block-title', key: 'title' }, t('rewardRules'),
+          rules.basis === 'account-cash' ? h('span', { key: 'legacy', className: 'atm-warn' }, ` ${t('rewardBasisCash')}`) : null),
+        rules.reported
+          ? null
+          : h('p', { className: 'atm-warn', key: 'legacy-note' }, t('rewardNoRules')),
+        h(DetailKv, { key: 'kv', items }),
+        rules.explain.length > 0
+          ? h('div', { className: 'atm-plan-block', key: 'explain' }, [
+            h('span', { className: 'atm-plan-label', key: 'label' }, t('rewardRulesExplain')),
+            h('ul', { className: 'atm-plan-list', key: 'list' }, rules.explain.map((line, index) => h('li', { key: `explain-${index}`, className: 'atm-muted' }, line))),
+          ])
+          : null,
+      ]);
+    }
+
+    /**
+     * Ranked eligible candidates for the current reward period, with the exact
+     * eligibility reason for everyone excluded and the projected payout for the
+     * top ranks (budget share, capped by per-agent capital).
+     */
+    function RewardCandidatesPanel({ t, status, onSelect }) {
+      const view = rewardsEligibility(status);
+      const rows = view.candidates.slice(0, 12);
+      return h('div', { className: 'atm-card-block' }, [
+        h('h4', { className: 'atm-block-title', key: 'title' }, t('rewardCandidates'),
+          h('span', { key: 'meta', className: 'atm-muted' }, ` ${t(view.basis === 'account-cash' ? 'rewardBasisCash' : 'rewardBasisTrading')} · ${t('rewardBudgetPreview')} ${fmtUsd(view.budgetUsd)}`)),
+        rows.length === 0
+          ? h('p', { className: 'atm-empty', key: 'empty' }, view.disabled ? t('rewardDisabled') : t('rewardCandidatesEmpty'))
+          : h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
+            h('thead', { key: 'head' }, h('tr', null, [
+              h('th', { key: 'rank' }, t('lbRank')),
+              h('th', { key: 'name' }, t('lbName')),
+              h('th', { key: 'ret' }, t('lbPnlPct')),
+              h('th', { key: 'usd' }, t('lbPnlUsd')),
+              h('th', { key: 'trades' }, t('lbTrades')),
+              h('th', { key: 'dd' }, t('rewardMaxDrawdown')),
+              h('th', { key: 'reason' }, t('statusLabel')),
+              h('th', { key: 'projected' }, t('rewardProjected')),
+            ])),
+            h('tbody', { key: 'body' }, rows.map((row) => h('tr', {
+              key: row.key,
+              'data-eligible': row.eligible ? 'true' : 'false',
+              'data-clickable': row.agentId ? 'true' : undefined,
+              onClick: () => {
+                if (row.agentId && onSelect) onSelect(row.agentId);
+              },
+            }, [
+              h('td', { key: 'rank', className: 'atm-mono' }, row.eligible ? `${MEDALS[row.eligibleRank] ?? ''}${MEDALS[row.eligibleRank] ? ' ' : ''}#${row.eligibleRank}` : '—'),
+              h('td', { key: 'name', title: row.agentId ?? '' }, row.name),
+              h('td', { key: 'ret', className: `atm-mono ${(row.tradingPnlPct ?? 0) > 0 ? 'atm-pos' : (row.tradingPnlPct ?? 0) < 0 ? 'atm-neg' : ''}` }, fmtPct(row.tradingPnlPct)),
+              h('td', { key: 'usd', className: `atm-mono ${(row.tradingPnlUsd ?? 0) > 0 ? 'atm-pos' : (row.tradingPnlUsd ?? 0) < 0 ? 'atm-neg' : ''}` }, fmtSignedUsd(row.tradingPnlUsd)),
+              h('td', { key: 'trades', className: 'atm-mono' }, fmtNum(row.trades)),
+              h('td', { key: 'dd', className: 'atm-mono' }, fmtPct(row.drawdownPct)),
+              h('td', { key: 'reason', className: row.eligible ? 'atm-pos' : 'atm-muted', title: row.reasonDetail ?? '' },
+                `${row.eligible ? '✓' : '✗'} ${t(row.reasonKey)}${row.reasonDetail ? ` · ${row.reasonDetail}` : ''}`),
+              h('td', { key: 'projected', className: 'atm-mono' }, row.projectedUsd === null ? '—' : fmtUsd(row.projectedUsd)),
+            ]))),
+          ])),
+        view.disabled ? h('p', { className: 'atm-empty', key: 'disabled' }, t('rewardDisabled')) : null,
+      ]);
+    }
+
+    /** Daily / weekly / monthly leaderboards from status.rankings (trading P&L). */
     function Leaderboards({ t, rankings, onSelect }) {
       const periods = leaderboardPeriods({ rankings });
       const [tab, setTab] = React.useState('daily');
@@ -4069,6 +4979,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'atm-card-block' }, [
         h('h4', { className: 'atm-block-title', key: 'title' }, t('leaderboards'),
           h('span', { key: 'asof', className: 'atm-muted' }, `${t('lbAsOf')} ${fmtAgo(periods.asOf)}`)),
+        h('p', { className: 'atm-note', key: 'trading-note' }, t('lbTradingNote')),
         h('div', { className: 'atm-seg', key: 'tabs' }, ['daily', 'weekly', 'monthly'].map((value) => h('button', {
           key: value,
           type: 'button',
@@ -4502,8 +5413,9 @@ window.__ModuleLoader__.load({
       { key: 'genome', labelKey: 'genome', sortable: false },
       { key: 'trading', labelKey: 'trading', sortable: false },
       { key: 'research', labelKey: 'research', sortable: false },
-      { key: 'equityUsd', labelKey: 'equity', sortable: true },
-      { key: 'pnlUsd', labelKey: 'pnl', sortable: true },
+      { key: 'equityUsd', labelKey: 'totalEquity', sortable: true },
+      { key: 'pnlUsd', labelKey: 'tradingPnl', sortable: true, hintKey: 'pnlTradingHint' },
+      { key: 'rewardsUsd', labelKey: 'rewardsLifetime', sortable: true, hintKey: 'pnlRewardsNote' },
       { key: 'dayPnlPct', labelKey: 'dayPnl', sortable: true },
       { key: 'trend', labelKey: 'trend', sortable: false },
       { key: 'runwayHours', labelKey: 'runway', sortable: true },
@@ -4579,7 +5491,7 @@ window.__ModuleLoader__.load({
                 className: column.sortable ? 'atm-sortable' : undefined,
                 'data-sorted': column.sortable && sortKey === column.key ? 'true' : undefined,
                 style: column.width ? { width: column.width } : undefined,
-                title: column.sortable ? 'sort' : undefined,
+                title: column.hintKey ? t(column.hintKey) : column.sortable ? 'sort' : undefined,
                 onClick: column.sortable ? () => onSort(column.key) : undefined,
               }, `${column.labelKey ? t(column.labelKey) : column.label}${column.sortable && sortKey === column.key ? (direction === 'asc' ? ' ↑' : ' ↓') : ''}`)))),
               h('tbody', { key: 'body' }, visible.map((row) => h('tr', {
@@ -4621,14 +5533,21 @@ window.__ModuleLoader__.load({
                   row.tradingDiffers ? h('span', { key: 'diff', className: 'atm-warn', title: t('specDiffers') }, ' ≠') : null,
                 ]),
                 h('td', { key: 'research', title: row.research?.summary ?? '' }, h(ResearchBadge, { t, row })),
-                h('td', { key: 'equity', className: 'atm-mono' }, fmtUsd(row.liveEquityUsd ?? row.equityUsd)),
+                h('td', { key: 'equity', className: 'atm-mono', title: t('totalEquity') }, fmtUsd(row.liveEquityUsd ?? row.equityUsd)),
                 h('td', {
                   key: 'pnl',
-                  className: `atm-mono ${row.pnlUsd === null ? '' : row.pnlUsd > 0 ? 'atm-pos' : row.pnlUsd < 0 ? 'atm-neg' : ''}`,
-                }, `${fmtSignedUsd(row.pnlUsd)}${row.pnlPct === null ? '' : ` (${fmtPercentPoints(row.pnlPct)})`}`),
+                  className: `atm-mono ${row.tradingPnlUsd === null ? '' : row.tradingPnlUsd > 0 ? 'atm-pos' : row.tradingPnlUsd < 0 ? 'atm-neg' : ''}`,
+                  title: `${t('pnlTradingHint')}${row.pnlSource === 'legacy' ? ` · ${t('pnlLegacyNote')}` : ''}`,
+                }, `${fmtSignedUsd(row.tradingPnlUsd)}${row.tradingPnlPct === null ? '' : ` (${fmtPct(row.tradingPnlPct)})`}`),
+                h('td', {
+                  key: 'rewards',
+                  className: 'atm-mono atm-pos',
+                  title: t('pnlRewardsNote'),
+                }, fmtUsd(row.rewardsUsd)),
                 h('td', {
                   key: 'day',
                   className: `atm-mono ${((row.liveDayPnlPct ?? row.dayPnlPct) ?? 0) > 0 ? 'atm-pos' : ((row.liveDayPnlPct ?? row.dayPnlPct) ?? 0) < 0 ? 'atm-neg' : ''}`,
+                  title: row.liveDayPnlUsd === null || row.liveDayPnlUsd === undefined ? '' : fmtSignedUsd(row.liveDayPnlUsd),
                 }, fmtPct(row.liveDayPnlPct ?? row.dayPnlPct)),
                 h('td', { key: 'trend' }, h(Sparkline, { values: row.sparkline, direction: row.liveDirection ?? 'flat', width: 64, height: 18 })),
                 h('td', { key: 'runway' }, h(RunwayCell, { row })),
@@ -4743,6 +5662,98 @@ window.__ModuleLoader__.load({
       ])));
     }
 
+    /**
+     * v3.3 fair-P&L card (docs/FAIR-PNL-REWARDS.md §8): total equity, capital
+     * contributed, reward capital inside it, trading P&L, return on capital and
+     * lifetime rewards — with the explicit "rewards are capital, not profit" note.
+     */
+    function PnlBreakdownCard({ t, row }) {
+      const breakdown = row.capitalBreakdown ?? capitalBreakdown(row ?? {});
+      const items = [
+        { key: 'equity', label: t('totalEquity'), value: fmtUsd(breakdown.equityUsd) },
+        { key: 'capital', label: t('capitalContributed'), value: fmtUsd(breakdown.contributedUsd) },
+        {
+          key: 'rewardCapital',
+          label: t('ofWhichRewardCapital'),
+          value: breakdown.rewardCapitalUsd === null
+            ? null
+            : `${fmtUsd(breakdown.rewardCapitalUsd)}${breakdown.rewardSharePct === null ? '' : ` (${fmtPct(breakdown.rewardSharePct)})`}`,
+        },
+        { key: 'base', label: t('baseCapital'), value: fmtUsd(breakdown.baseUsd) },
+        {
+          key: 'trading',
+          label: t('tradingPnl'),
+          value: `${fmtSignedUsd(breakdown.tradingPnlUsd)}${breakdown.tradingPnlPct === null ? '' : ` (${fmtPct(breakdown.tradingPnlPct)})`}`,
+        },
+        { key: 'roc', label: t('returnOnCapital'), value: fmtPct(breakdown.returnOnCapitalPct) },
+        { key: 'rewards', label: t('lifetimeRewards'), value: fmtUsd(breakdown.rewardsLifetimeUsd) },
+        { key: 'count', label: t('rewardCount'), value: breakdown.rewardCount === null ? null : fmtNum(breakdown.rewardCount) },
+        {
+          key: 'last',
+          label: t('lastReward'),
+          value: breakdown.lastRewardAt ? fmtAgo(breakdown.lastRewardAt) : t('none'),
+        },
+      ];
+      return h('div', { key: 'pnl-breakdown' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, t('pnlBreakdown')),
+        h(DetailKv, { key: 'kv', items }),
+        breakdown.fair === false
+          ? h('p', { className: 'atm-warn', key: 'legacy' }, t('pnlLegacyNote'))
+          : null,
+        h('p', { className: 'atm-note', key: 'note' }, t('pnlRewardsNote')),
+      ]);
+    }
+
+    /**
+     * v3.3 per-agent reward-history table (docs/FAIR-PNL-REWARDS.md §8):
+     * period key, date, rank, reward USD, budget share and the period trading
+     * P&L/return that earned it, with an empty state and a lifetime totals row.
+     */
+    function RewardHistorySection({ t, row }) {
+      const history = row.rewardHistory ?? agentRewardHistoryRows(null);
+      const rows = Array.isArray(history.rows) ? history.rows : [];
+      return h('div', { key: 'reward-history' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('rewardHistory')} · ${fmtUsd(history.totalUsd)}`),
+        rows.length === 0
+          ? h('p', { className: 'atm-empty', key: 'empty' }, t('noRewardsYet'))
+          : h('div', { className: 'atm-table-wrap', key: 'wrap' }, h('table', { className: 'atm-detail-table' }, [
+            h('thead', { key: 'head' }, h('tr', null, [
+              h('th', { key: 'period' }, t('rewardsPeriod')),
+              h('th', { key: 'date' }, t('time')),
+              h('th', { key: 'rank' }, t('lbRank')),
+              h('th', { key: 'amount' }, t('amount')),
+              h('th', { key: 'share' }, t('rewardShare')),
+              h('th', { key: 'pnl' }, t('periodTradingPnl')),
+              h('th', { key: 'ret' }, t('periodTradingReturn')),
+            ])),
+            h('tbody', { key: 'body' }, rows.map((entry) => h('tr', { key: entry.key }, [
+              h('td', { key: 'period', className: 'atm-mono', title: entry.periodKey ?? '' }, entry.periodKey ?? entry.period ?? '—'),
+              h('td', { key: 'date', className: 'atm-muted', title: fmtDateTime(entry.at) }, fmtAgo(entry.at)),
+              h('td', { key: 'rank', className: 'atm-mono' }, entry.rank === null ? '—' : `${MEDALS[entry.rank] ?? ''}${MEDALS[entry.rank] ? ' ' : ''}#${entry.rank}`),
+              h('td', { key: 'amount', className: 'atm-mono' }, fmtUsd(entry.amountUsd)),
+              h('td', { key: 'share', className: 'atm-mono' }, entry.share === null ? '—' : fmtPct(entry.share)),
+              h('td', {
+                key: 'pnl',
+                className: `atm-mono ${(entry.periodTradingPnlUsd ?? 0) > 0 ? 'atm-pos' : (entry.periodTradingPnlUsd ?? 0) < 0 ? 'atm-neg' : ''}`,
+              }, fmtSignedUsd(entry.periodTradingPnlUsd)),
+              h('td', {
+                key: 'ret',
+                className: `atm-mono ${(entry.periodTradingPnlPct ?? 0) > 0 ? 'atm-pos' : (entry.periodTradingPnlPct ?? 0) < 0 ? 'atm-neg' : ''}`,
+              }, fmtPct(entry.periodTradingPnlPct)),
+            ]))),
+            rows.length > 0
+              ? h('tfoot', { key: 'foot' }, h('tr', null, [
+                h('td', { key: 'label', colSpan: 3, className: 'atm-muted' }, t('rewardHistoryTotals')),
+                h('td', { key: 'total', className: 'atm-mono' }, fmtUsd(history.totalUsd)),
+                h('td', { key: 's1' }),
+                h('td', { key: 's2' }),
+                h('td', { key: 's3' }),
+              ]))
+              : null,
+          ])),
+      ]);
+    }
+
     function AgentDetail({ t, row, researchStatus, onClose }) {
       React.useEffect(() => {
         const onKeyDown = (event) => {
@@ -4768,7 +5779,13 @@ window.__ModuleLoader__.load({
         { key: 'endowment', label: t('endowment'), value: fmtUsd(row.endowmentUsd) },
         { key: 'cash', label: t('cash'), value: fmtUsd(row.cashUsd) },
         { key: 'posval', label: t('positionsValue'), value: fmtUsd(row.positionsValueUsd) },
-        { key: 'equity', label: t('equity'), value: fmtUsd(row.equityUsd) },
+        { key: 'equity', label: t('totalEquity'), value: fmtUsd(row.equityUsd) },
+        {
+          key: 'tradingPnl',
+          label: t('tradingPnl'),
+          value: `${fmtSignedUsd(row.tradingPnlUsd)}${row.tradingPnlPct === null ? '' : ` (${fmtPct(row.tradingPnlPct)})`}`,
+        },
+        { key: 'rewardsLifetime', label: t('lifetimeRewards'), value: fmtUsd(row.rewardsUsd) },
         { key: 'day', label: t('dayPnlTitle'), value: fmtPct(row.dayPnlPct) },
         { key: 'net7d', label: t('net7dTitle'), value: fmtSignedUsd(row.net7dUsd) },
         { key: 'realized', label: t('realized'), value: fmtSignedUsd(row.realizedPlUsd) },
@@ -4780,7 +5797,7 @@ window.__ModuleLoader__.load({
           ? [
             { key: 'weekPct', label: t('rankWeek'), value: fmtPct(row.pnl.weekPct) },
             { key: 'monthPct', label: t('rankMonth'), value: fmtPct(row.pnl.monthPct) },
-            { key: 'netPnl', label: t('pnl'), value: fmtSignedUsd(row.pnl.netUsd) },
+            { key: 'netPnl', label: t('tradingPnl'), value: fmtSignedUsd(row.pnl.netUsd) },
           ]
           : []),
         ...(row.grossExposureUsd !== null && row.grossExposureUsd !== undefined
@@ -4819,10 +5836,12 @@ window.__ModuleLoader__.load({
           }, '×'),
         ]),
         h(DetailKv, { key: 'meta', items: metaItems }),
+        h(PnlBreakdownCard, { key: 'pnl-breakdown', t, row }),
         deathInfo.length > 0 ? h('div', { key: 'death' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, t('tradingState')),
           h(DetailKv, { key: 'kv', items: deathInfo }),
         ]) : null,
+        h(RewardHistorySection, { key: 'reward-history', t, row }),
         h(StrategyPlanSection, { key: 'plan', t, plan: row.plan }),
         h(BotAgentSection, { key: 'bot-agent', t, policy: row.policy }),
         h(InstrumentPlaybookSection, { key: 'instrument-playbook', t, playbook: row.playbook }),
@@ -5273,6 +6292,10 @@ window.__ModuleLoader__.load({
       ]);
       const data = snapshot.data ?? {};
       const rewardsTab = h('div', { className: 'atm-tab-panel', key: 'rewards' }, [
+        // v3.3: rules + budget + ranked trading-performance candidates first, then
+        // the settings card, payout history and trading-P&L leaderboards.
+        h(RewardRulesPanel, { key: 'rules', t, status: data }),
+        h(RewardCandidatesPanel, { key: 'candidates', t, status: data, onSelect: selectAgent }),
         h(RewardsControl, {
           key: 'rewards',
           t,
@@ -5516,6 +6539,18 @@ window.__ModuleLoader__.load({
         rewardsPreview,
         rewardHistoryRows,
         lastWinnerRows,
+        // v3.3 fair P&L + capital-only rewards helpers
+        agentPnlView,
+        capitalBreakdown,
+        agentRewardHistoryRows,
+        rewardsLedgerByAgent,
+        rewardRuleSummary,
+        rewardsEligibility,
+        rewardsEligibilityReason,
+        rewardSettingsPatch,
+        portfolioPnlTotals,
+        REWARD_RULE_DEFAULTS,
+        REWARD_PERIODS,
         leaderboardPeriods,
         leaderboardRows: (status, period) => leaderboardPeriods(status)[['daily', 'weekly', 'monthly'].includes(period) ? period : 'daily'],
         agentPlanMapping,
@@ -5569,6 +6604,7 @@ window.__ModuleLoader__.load({
         MAIN_SLOT,
         SETTINGS_SLOT,
         SORTABLE_KEYS,
+        TABLE_COLUMNS,
       },
     };
   },
