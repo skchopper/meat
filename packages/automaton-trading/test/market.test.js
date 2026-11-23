@@ -98,6 +98,14 @@ function expectSyncCode(fn, code) {
   });
 }
 
+/** Float-tolerant equality for multiplier-scaled parameter values. */
+function assertClose(actual, expected, tolerance = 1e-9, message = '') {
+  assert.ok(
+    Math.abs(Number(actual) - Number(expected)) <= tolerance,
+    `${message ? `${message}: ` : ''}expected ${expected}, got ${actual}`,
+  );
+}
+
 /** Bars that end with a breakout above the prior range (family=breakout enter signal). */
 function breakoutBars({ count = 31, flatPrice = 100 } = {}) {
   const bars = [];
@@ -1241,6 +1249,133 @@ test('builder: genome parameters start the spec and are clamped into bounds', ()
   assert.equal(spec.params.sessionFilter, 'any');
 });
 
+test('builder: aggression profiles scale params before the bounds clamp (balanced unchanged)', () => {
+  const clock = createClock({ now: () => T0 });
+  const config = testConfig();
+  const builder = createBuilder({ config, clock });
+  const hypothesis = makeHypothesis(); // specsHint: entryZ 1.2, stopPct .02, targetPct .05, hold 10, size .2
+  const compile = (genome) => builder.compile({ hypothesis, agentId: 'atm-1', cycleBudgetUsd: 0.08, genome });
+
+  const legacy = compile(undefined).spec;
+  const baseline = compile({ sessionFilter: 'any' }).spec;
+  const balanced = compile({ aggression: 'balanced' }).spec;
+  const aggressive = compile({ aggression: 'aggressive' }).spec;
+  const conservative = compile({ aggression: 'conservative' }).spec;
+
+  // No aggression / balanced multipliers of 1 => byte-compatible params and the SAME specId.
+  assert.deepEqual(baseline.params, legacy.params);
+  assert.deepEqual(balanced.params, legacy.params);
+  assert.equal(balanced.specId, legacy.specId, 'balanced must keep the legacy deterministic specId');
+  assert.equal(balanced.profile.aggression, 'balanced');
+  for (const key of ['entryZMultiplier', 'sizePctMultiplier', 'stopPctMultiplier', 'targetPctMultiplier', 'maxHoldBarsMultiplier']) {
+    assert.equal(balanced.profile[key], 1, `balanced.${key} must be 1`);
+  }
+  assert.equal(legacy.profile, undefined, 'no genome aggression => no profile field (legacy spec shape)');
+
+  // Aggressive: lower entryZ/hold, larger size, tighter stop, larger target.
+  assertClose(aggressive.params.entryZ, 1.2 * 0.7, 1e-12, 'aggressive entryZ');
+  assertClose(aggressive.params.sizePct, 0.2 * 1.35, 1e-12, 'aggressive sizePct');
+  assertClose(aggressive.params.stopPct, 0.02 * 0.8, 1e-12, 'aggressive stopPct');
+  assertClose(aggressive.params.targetPct, 0.05 * 1.2, 1e-12, 'aggressive targetPct');
+  assert.equal(aggressive.params.maxHoldBars, 8, '10 * 0.75 rounded to an integer bar count');
+  assert.ok(aggressive.params.entryZ < baseline.params.entryZ);
+  assert.ok(aggressive.params.maxHoldBars < baseline.params.maxHoldBars);
+  assert.ok(aggressive.params.sizePct > baseline.params.sizePct);
+  assert.ok(aggressive.params.stopPct < baseline.params.stopPct);
+  assert.ok(aggressive.params.targetPct > baseline.params.targetPct);
+  assert.equal(aggressive.profile.aggression, 'aggressive');
+  assert.equal(aggressive.profile.entryZMultiplier, 0.7);
+  // unmultiplied params ride through untouched
+  assert.equal(aggressive.params.lookback, baseline.params.lookback);
+  assert.equal(aggressive.params.exitZ, baseline.params.exitZ);
+  assert.notEqual(aggressive.specId, baseline.specId, 'profile-scaled params change the deterministic id');
+
+  // Conservative: higher entry bar, smaller size, smaller target; stop/hold unchanged.
+  assertClose(conservative.params.entryZ, 1.2 * 1.15, 1e-12, 'conservative entryZ');
+  assertClose(conservative.params.sizePct, 0.2 * 0.8, 1e-12, 'conservative sizePct');
+  assertClose(conservative.params.stopPct, 0.02, 1e-12, 'conservative stopPct');
+  assertClose(conservative.params.targetPct, 0.05 * 0.9, 1e-12, 'conservative targetPct');
+  assert.equal(conservative.params.maxHoldBars, 10);
+  assert.ok(conservative.params.entryZ > baseline.params.entryZ);
+  assert.ok(conservative.params.sizePct < baseline.params.sizePct);
+
+  // Every scaled value is inside the hard bounds, and identity stays the hypothesis's.
+  for (const spec of [aggressive, conservative, balanced, legacy]) {
+    for (const [name, bound] of Object.entries(PARAM_BOUNDS)) {
+      const value = spec.params[name];
+      assert.ok(value >= bound.min && value <= bound.max, `${name}=${value} outside [${bound.min}, ${bound.max}]`);
+      if (bound.integer) assert.ok(Number.isInteger(value), `${name} must be an integer`);
+    }
+    assert.equal(spec.symbol, 'AAPL');
+    assert.equal(spec.family, 'momentum');
+  }
+
+  // Unknown aggression names fall back to no multipliers (defensive: never guess a profile).
+  const unknown = compile({ aggression: 'reckless' }).spec;
+  assert.deepEqual(unknown.params, legacy.params);
+  assert.equal(unknown.profile, undefined);
+
+  // Compiling twice with the same profile is deterministic.
+  assert.deepEqual(compile({ aggression: 'aggressive' }), compile({ aggression: 'aggressive' }));
+});
+
+test('builder: aggression multipliers apply to clamped bounds and config overrides win per key', () => {
+  const clock = createClock({ now: () => T0 });
+  const config = testConfig();
+  const builder = createBuilder({ config, clock });
+  const compileWith = (builderInstance, hypothesis, genome) => builderInstance
+    .compile({ hypothesis, agentId: 'atm-1', cycleBudgetUsd: 0.08, genome })
+    .spec;
+
+  // Clamp runs AFTER the multiplier: values pushed past the bound are clamped, not left scaled.
+  const maxed = compileWith(builder, makeHypothesis(), {
+    aggression: 'aggressive',
+    lookback: 999,
+    entryZ: 3,
+    exitZ: -5,
+    stopPct: 0.06,
+    targetPct: 0.12,
+    maxHoldBars: 48,
+    sizePct: 0.4,
+  });
+  assertClose(maxed.params.entryZ, 2.1, 1e-12); // 3 * 0.7 (inside the 3.0 max)
+  assert.equal(maxed.params.sizePct, PARAM_BOUNDS.sizePct.max); // 0.4 * 1.35 -> clamped
+  assertClose(maxed.params.stopPct, 0.048, 1e-12); // 0.06 * 0.8
+  assertClose(maxed.params.targetPct, PARAM_BOUNDS.targetPct.max, 1e-12); // 0.12 * 1.2 -> clamped
+  assert.equal(maxed.params.maxHoldBars, 36); // 48 * 0.75
+  assert.equal(maxed.params.lookback, PARAM_BOUNDS.lookback.max, 'lookback is not profiled, only clamped');
+
+  // Multipliers apply to family defaults too (hypothesis without specsHint).
+  const bare = makeHypothesis();
+  delete bare.specsHint;
+  const bareAggressive = compileWith(builder, bare, { aggression: 'aggressive' });
+  assertClose(bareAggressive.params.entryZ, 1.0 * 0.7, 1e-12);
+  assertClose(bareAggressive.params.sizePct, 0.2 * 1.35, 1e-12);
+  assertClose(bareAggressive.params.stopPct, 0.02 * 0.8, 1e-12);
+  assertClose(bareAggressive.params.targetPct, 0.04 * 1.2, 1e-12);
+  assert.equal(bareAggressive.params.maxHoldBars, 9); // 12 * 0.75
+
+  // Config overrides win per key; missing keys fall back to the contract defaults.
+  const overriddenConfig = testConfig();
+  overriddenConfig.aggression.profiles.aggressive = { entryZMultiplier: 0.5 };
+  const overridden = compileWith(createBuilder({ config: overriddenConfig, clock }), makeHypothesis(), { aggression: 'aggressive' });
+  assertClose(overridden.params.entryZ, 1.2 * 0.5, 1e-12);
+  assertClose(overridden.params.sizePct, 0.2 * 1.35, 1e-12, 'missing config key uses the contract default');
+  assert.equal(overridden.params.maxHoldBars, 8);
+
+  // A config layer without aggression at all still applies the contract defaults (defensive).
+  const legacyConfig = testConfig();
+  delete legacyConfig.aggression;
+  const fallbackBuilder = createBuilder({ config: legacyConfig, clock });
+  const fallback = compileWith(fallbackBuilder, makeHypothesis(), { aggression: 'aggressive' });
+  assertClose(fallback.params.entryZ, 1.2 * 0.7, 1e-12);
+  assertClose(fallback.params.sizePct, 0.2 * 1.35, 1e-12);
+  // ...and no aggression genome on a legacy config keeps v3.3 behaviour exactly.
+  const legacyNoProfile = compileWith(fallbackBuilder, makeHypothesis(), undefined);
+  const defaultBuilderNoProfile = compileWith(createBuilder({ config: testConfig(), clock }), makeHypothesis(), undefined);
+  assert.deepEqual(legacyNoProfile.params, defaultBuilderNoProfile.params);
+});
+
 // ===========================================================================
 // executor
 // ===========================================================================
@@ -1913,6 +2048,220 @@ test('executor × bot-agent policy: brakes always run first for policy-sized ord
   assert.equal(denied.brakes.calls.length, 1, 'the policy-sized order reached the brake wall first');
   // the brake decision saw the shrunken notional, not the raw size
   assert.ok(denied.brakes.calls[0].order.notionalUsd < 400);
+});
+
+// ===========================================================================
+// executor × v3.4 aggression profile (docs/AGGRESSIVE-GROWTH.md §2)
+// ===========================================================================
+
+/** The resolved aggressive profile the orchestrator passes to executor.run(). */
+const AGGRESSIVE_PROFILE = Object.freeze({ aggression: 'aggressive', policySizeFloor: 0.8, respectStandDown: false });
+
+test('executor × aggression profile: floor sizes cautious/trade entries; balanced/conservative unchanged', async () => {
+  // Baseline: the bot's own cautious 0.2 multiplier is binding without a profile.
+  const cautious = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+  });
+  assertClose(cautious.orders[0].qty, 80 / 110.1, 0.001, 'cautious baseline qty');
+  assert.deepEqual(cautious.actions.find((action) => action.type === 'entry').policy, {
+    stance: 'cautious',
+    sizeMultiplier: 0.2,
+    applied: 'size',
+  });
+
+  // Aggressive floor: max(0.2, 0.8) = 0.8 -> 320 notional instead of 80.
+  const flooredHarness = executorHarness({ configOverrides: AGENTS_ON });
+  const floored = await runHarness(flooredHarness, {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assertClose(floored.orders[0].qty, 320 / 110.1, 0.001, 'floored qty');
+  assert.equal(floored.denied.length, 0);
+  assert.ok(Math.abs(flooredHarness.brakes.calls[0].order.notionalUsd - 320) < 1, 'brake wall sees the floored notional first');
+  const flooredEntry = floored.actions.find((action) => action.type === 'entry');
+  assert.equal(flooredEntry.policy.profile, 'aggressive');
+  assert.equal(flooredEntry.policy.stance, 'cautious');
+  assert.equal(flooredEntry.policy.policyFloor, 0.8);
+  assert.equal(flooredEntry.policy.effectiveSizeMultiplier, 0.8);
+
+  // trade stance with a smaller multiplier is also raised to the floor.
+  const tradeFloored = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'trade', sizeMultiplier: 0.5 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assertClose(tradeFloored.orders[0].qty, 320 / 110.1, 0.001);
+
+  // The floor never grows a bot above its own 1x factor: trade @1.0 stays at the baseline size.
+  const tradeFull = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'trade', sizeMultiplier: 1 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assertClose(tradeFull.orders[0].qty, 400 / 110.1, 0.001);
+  assert.equal(tradeFull.actions.find((action) => action.type === 'entry').policy.effectiveSizeMultiplier, 1);
+
+  // No resolved policy stance => profile floor has nothing to raise; legacy sizing unchanged.
+  const noPolicy = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), { profile: AGGRESSIVE_PROFILE });
+  assertClose(noPolicy.orders[0].qty, 400 / 110.1, 0.001);
+  assert.equal(noPolicy.actions.find((action) => action.type === 'entry').policy, undefined);
+
+  // Balanced (floor 0, respectStandDown true) and conservative are exactly the legacy behaviour.
+  for (const aggression of ['balanced', 'conservative']) {
+    const legacyLike = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+      policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+      profile: { aggression, policySizeFloor: 0, respectStandDown: true },
+    });
+    assertClose(legacyLike.orders[0].qty, 80 / 110.1, 0.001, `${aggression} size`);
+    assert.deepEqual(legacyLike.actions.find((action) => action.type === 'entry').policy, {
+      stance: 'cautious',
+      sizeMultiplier: 0.2,
+      applied: 'size',
+    }, `${aggression} must keep the legacy policy effect shape`);
+  }
+
+  // The orchestrator's resolved-profile shape uses `name`; it is accepted as an alias.
+  const nameShape = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+    profile: { name: 'aggressive', policySizeFloor: 0.8, respectStandDown: false },
+  });
+  assertClose(nameShape.orders[0].qty, 320 / 110.1, 0.001);
+});
+
+test('executor × aggression profile: respectStandDown:false converts stand_down into a floored cautious entry', async () => {
+  // Aggressive profile: entries proceed despite the bot's own stand_down, at the floor.
+  const convertedHarness = executorHarness({ configOverrides: AGENTS_ON });
+  const converted = await runHarness(convertedHarness, {
+    policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.4 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(converted.orders.length, 1, JSON.stringify(converted.denied));
+  assert.equal(converted.denied.length, 0);
+  assert.equal(convertedHarness.broker.submitted.length, 1);
+  assert.ok(!converted.actions.some((action) => action.reason === 'agent_stand_down'), 'no stand-down skip after conversion');
+  assertClose(converted.orders[0].qty, 320 / 110.1, 0.001);
+  const entry = converted.actions.find((action) => action.type === 'entry');
+  assert.equal(entry.policy.stance, 'cautious', 'effective stance is cautious');
+  assert.equal(entry.policy.converted, true);
+  assert.equal(entry.policy.convertedFrom, 'stand_down');
+  assert.equal(entry.policy.sizeMultiplier, 0.4, 'the bot original multiplier is still visible');
+
+  // respectStandDown true (and the absent field) keeps the legacy block exactly.
+  for (const profile of [
+    { aggression: 'balanced', policySizeFloor: 0, respectStandDown: true },
+    { aggression: 'aggressive', policySizeFloor: 0.8 }, // absent => block (legacy default)
+  ]) {
+    const blocked = executorHarness({ configOverrides: AGENTS_ON });
+    const result = await runHarness(blocked, {
+      policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.4 }),
+      profile,
+    });
+    assert.equal(result.orders.length, 0, `${profile.aggression}: stand_down must block`);
+    assert.equal(result.denied.length, 0, 'a stance skip is not a brake denial');
+    assert.equal(blocked.brakes.calls.length, 0, 'no order is intended, so the wall is not reached');
+    assert.equal(blocked.broker.submitted.length, 0);
+    const skipped = result.actions.find((action) => action.reason === 'agent_stand_down');
+    assert.ok(skipped, `${profile.aggression}: stand-down skip recorded`);
+    assert.equal(skipped.policy.stance, 'stand_down');
+  }
+
+  // Exit safety is untouched: a converted stand-down bot still exits a stopped position.
+  const openedAt = new Date(T0 - 2 * HOUR_MS).toISOString();
+  const stopped = executorHarness({
+    configOverrides: AGENTS_ON,
+    positions: { AAPL: { qty: 10, avgPriceUsd: 100, openedAt } },
+    quotes: { AAPL: { bid: 89.9, ask: 90.1, last: 90, ts: T0 } },
+  });
+  const stoppedResult = await runHarness(stopped, {
+    policy: makePolicy({ stance: 'stand_down' }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(stoppedResult.orders.length, 1, 'the profile never blocks a risk-reducing exit');
+  assert.equal(stoppedResult.actions.find((action) => action.type === 'exit').reason, 'stop');
+  assert.equal(stopped.broker.submitted[0].side, 'sell');
+});
+
+test('executor × aggression profile: research ALERT/risk vetoes still block a converted stand-down entry', async () => {
+  const harness = () => executorHarness({ configOverrides: AGENTS_ON });
+  const runConverted = (h, research) => runHarness(h, {
+    policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.4 }),
+    profile: AGGRESSIVE_PROFILE,
+    research,
+  });
+
+  for (const briefing of [
+    makeBriefing({ verdict: 'ALERT', sentiment: -0.8 }),
+    makeBriefing({ verdict: 'HOLD', sentiment: -0.8 }), // strong negative sentiment veto
+  ]) {
+    const wall = harness();
+    const vetoed = await runConverted(wall, briefing);
+    assert.equal(vetoed.orders.length, 0, 'research veto must still win');
+    assert.equal(wall.broker.submitted.length, 0);
+    assert.equal(wall.brakes.calls.length, 0);
+    assert.ok(vetoed.actions.some((action) => action.reason === 'research_veto'), 'veto recorded as an advisory skip');
+  }
+
+  // A calm briefing allows the converted entry, with the research size factor still applied.
+  const calm = await runConverted(harness(), makeBriefing({ verdict: 'HOLD', sentiment: 0.4, confidence: 0.8 }));
+  assert.equal(calm.orders.length, 1);
+  assertClose(calm.orders[0].qty, (320 * 0.9) / 110.1, 0.001, 'research 0.9 factor multiplies the floored size');
+});
+
+test('executor × aggression profile: brakes still deny and portfolio/mandate caps remain ceilings', async () => {
+  // A brake DENY wins over the aggressive floor + stand-down conversion.
+  const denied = executorHarness({
+    configOverrides: AGENTS_ON,
+    brakesHandler: () => ({ decision: 'DENY', code: 'MARKET_CLOSED', rule: 'D3', reason: 'closed' }),
+  });
+  const deniedResult = await runHarness(denied, {
+    policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.2 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(deniedResult.orders.length, 0);
+  assert.equal(denied.broker.submitted.length, 0);
+  assert.equal(deniedResult.denied[0].code, 'MARKET_CLOSED');
+  assert.equal(denied.brakes.calls.length, 1, 'the floored order reached the brake wall first');
+  assert.ok(Math.abs(denied.brakes.calls[0].order.notionalUsd - 320) < 1);
+
+  // The mandate notional ceiling still binds the floored size.
+  const mandate = executorHarness({
+    configOverrides: AGENTS_ON,
+    mandate: baseMandate({ maxOrderNotionalUsd: 100 }),
+  });
+  const mandateResult = await runHarness(mandate, {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(mandateResult.orders.length, 1);
+  assertClose(mandateResult.orders[0].qty, 100 / 110.1, 0.001, 'mandate cap, not the 320 floor cap');
+  assert.ok(mandate.brakes.calls[0].order.notionalUsd <= 100.5);
+
+  // Portfolio caps (the orchestrator passes the profile's limits here) remain ceilings.
+  const openCap = portfolioHarness({
+    symbols: ['AAPL', 'MSFT', 'NVDA'],
+    spots: { AAPL: 110, MSFT: 210, NVDA: 310 },
+    portfolio: { maxOpenPositions: 1, maxOrdersPerCycle: 5 },
+  });
+  const openCapResult = await runPortfolio(openCap, {
+    policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.2 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(openCapResult.orders.length, 1, 'maxOpenPositions is still the ceiling');
+  assert.equal(openCap.broker.submitted.length, 1);
+  const openSkips = openCapResult.actions.filter((action) => action.type === 'skip' && action.reason === 'max_open_positions');
+  assert.equal(openSkips.length, 2);
+  assert.equal(openSkips[0].maxOpenPositions, 1);
+  assert.ok(!openCapResult.actions.some((action) => action.reason === 'agent_stand_down'), 'conversion applies across the basket');
+
+  const orderCap = portfolioHarness({
+    symbols: ['AAPL', 'MSFT', 'NVDA'],
+    spots: { AAPL: 110, MSFT: 210, NVDA: 310 },
+    portfolio: { maxOpenPositions: 5, maxOrdersPerCycle: 2 },
+  });
+  const orderCapResult = await runPortfolio(orderCap, {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.2 }),
+    profile: AGGRESSIVE_PROFILE,
+  });
+  assert.equal(orderCapResult.orders.length, 2, 'the profile-sized order cap is shared by the run');
+  assert.ok(orderCapResult.actions.some((action) => action.type === 'skip' && action.reason === 'max_orders_per_cycle'));
 });
 
 test('executor: describe() exposes the per-bot agent policy gate', () => {

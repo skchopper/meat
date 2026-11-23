@@ -26,6 +26,7 @@ obituary the living read.
 | Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop and the research/reward settings actions) |
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
 | Fair P&L + rewards (v3.3) | **Trading P&L = equity − capital contributed**: reward payouts are capital, never profit. Trading P&L + lifetime Rewards columns, P&L breakdown (capital contributed / reward capital / return on capital) and per-agent reward history, a Rewards tab with the trading-performance rules, ranked eligible candidates with reasons, payout history, and trading-P&L leaderboards. Authoritative contract: `docs/FAIR-PNL-REWARDS.md` |
+| Return target + growth cohort (v3.4) | **Annual return target 50%** card/pill: annualized trading return, target progress/pace vs the required daily pace, trading P&L since the one-time baseline and account equity — explicitly *target, not guarantee*, never an order override, never blended with reward capital. Fixed **aggression cohort** (Aggressive / Balanced / Conservative): table badges, profile filter + sort, cohort counts, and a per-agent profile block (basket sizes, max open positions, orders/cycle, entry-Z/size/stop/target/max-hold multipliers, policy size floor, stand-down policy) plus activity stats; aggressive capital top-ups render as contributed capital. Authoritative contract: `docs/AGGRESSIVE-GROWTH.md` |
 | Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), v3.3 winner rewards (period + trading-performance rules: min profit/trades/drawdown, 10% of pool budget, 50/30/20 rank shares, 50% per-agent capital cap + max per period) and daily/weekly/monthly trading-P&L leaderboards, all applied through loopback-only control actions |
 | Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, trading day/week/month P&L, P&L breakdown and reward history |
 | Strategy taxonomy | Per-bot **strategy type** + **estimated trading interval** columns, category tabs (All / Swing · mid-long / Day · intraday with counts) and category-coloured chips |
@@ -59,6 +60,11 @@ P&L), day trading %, a runway bar, treasury state, alive/dead/condemned status p
 and a positions/trades count. Equity and P&L are always separate columns: equity can rise
 when reward capital is paid in while trading P&L does not.
 
+Since v3.4 each row also carries a **growth-cohort badge** — `Aggressive`, `Balanced` or
+`Conservative` — with profile filter chips, cohort counts (`Aggressive 12 · Balanced 13 ·
+Conservative 5`) and an **Aggression** column that sorts by cohort rank (aggressive first,
+legacy unknown last). Filtering composes with the category tabs, status chips and search.
+
 Above the table, **category tabs** filter the population by strategy class:
 `All (n) / Swing · mid-long (n) / Day · intraday (n)` — counts come from
 `status.strategyMix` (falling back to the agent rows), and they compose with the
@@ -74,6 +80,13 @@ stacked below on narrow ones; `Esc` or the × closes it):
   base capital, trading P&L ($ and capital return), return on capital, lifetime rewards,
   reward count and last-reward date, with the explicit note *"Rewards are trading capital,
   not profit — P&L counts trading only."*;
+- **Aggression profile** (v3.4): the cohort badge plus the profile limits that shape the
+  deterministic executor — basket size (day/swing), max open positions (day/swing), orders
+  per cycle, entry-Z / size / stop / target / max-hold multipliers, policy size floor and
+  the stand-down policy (*respects stand-down* vs *cautious at size floor*) — followed by
+  this agent's activity stats (orders today, trades, open positions). Aggressive agents
+  also show the explicit note that their v3.4 capital top-up is **contributed capital, not
+  P&L and not rewards**;
 - **Reward history** (v3.3): the agent's reward payouts newest-first — period key, date,
   rank, reward USD, share of the period budget, the period trading P&L/return that earned
   it — plus a lifetime totals row ("no rewards yet" empty state);
@@ -244,16 +257,18 @@ dependencies) while every existing control and detail view stays available:
 - **Live market tape** — symbol, last, change $/%, bid/ask and sparkline; up/down rows
   flash green/red on a price change, stale quotes are marked, and a closed market shows
   “market closed · last close”.
-- **Agents** — search, sort, status/category filters; basket, strategy type, stance
-  badges, **live total equity**, **live day trading P&L** (`tradingDayPct` when the engine
-  reports it), Trading P&L, Rewards and sparkline; clicking a row opens the existing
-  detail drawer (holdings/transactions/plan/bot-agent/research/playbook/rankings/P&L
-  breakdown/reward history) and the selection persists across polling.
-- **Tabs** — Overview (KPIs, charts, watchlist, agents), Agents, Markets (full tape +
-  instruments/last-cycle diagnostics), Research (coverage + cadence control), Rewards
-  (reward-rule summary, current pool/budget, ranked trading-performance candidates with
-  eligibility reasons, settings card, payout history, trading-P&L leaderboards) and
-  Settings (operator controls, Reaper row, diagnostics).
+- **Agents** — search, sort, status/category/profile filters; **aggression badge** and
+  cohort counts, basket, strategy type, stance badges, **live total equity**, **live day
+  trading P&L** (`tradingDayPct` when the engine reports it), Trading P&L, Rewards and
+  sparkline; clicking a row opens the existing detail drawer (holdings/transactions/plan/
+  bot-agent/aggression profile/activity/research/playbook/rankings/P&L breakdown/reward
+  history) and the selection persists across polling.
+- **Tabs** — Overview (**annual return target card**, KPIs, charts, watchlist, agents),
+  Agents, Markets (full tape + instruments/last-cycle diagnostics), Research (coverage +
+  cadence control), Rewards (reward-rule summary, current pool/budget, ranked
+  trading-performance candidates with eligibility reasons, settings card, payout history,
+  trading-P&L leaderboards) and Settings (operator controls, Reaper row, target/cohort
+  stats, diagnostics).
 - **Polling** — `GET /automaton/state` every **5 s** and `GET /automaton/market` every
   **2 s** while the tab is visible; the pause toggle stops both, a hidden tab pauses
   polling, manual refresh pulls both immediately, and timers/subscriptions are cleaned up.
@@ -265,7 +280,11 @@ dependencies) while every existing control and detail view stays available:
   `marketSession`, `liveViewMapping`, `changeDirection` / `marketChangePctText`; v3.3 adds
   `agentPnlView`, `capitalBreakdown`, `agentRewardHistoryRows`, `rewardsLedgerByAgent`,
   `rewardRuleSummary`, `rewardsEligibility`, `rewardSettingsPatch`, `portfolioPnlTotals`,
-  `rewardHistoryRows` and `TABLE_COLUMNS` / `SORTABLE_KEYS`.
+  `rewardHistoryRows` and `TABLE_COLUMNS` / `SORTABLE_KEYS`; v3.4 adds `performanceView`,
+  `targetProgress`, `aggressionBadge`, `normalizeAggression`, `aggressionProfileView`,
+  `agentAggressionView`, `agentActivityView`, `profileCounts`, `activityView`,
+  `filterRowsByAggression`, `fmtRatioPct` and the `AGGRESSION_*` /
+  `DEFAULT_TARGET_ANNUAL_RETURN_PCT` constants.
 
 `GET /automaton/market` is loopback-only, GET/HEAD only, redacted (never secrets), and
 delegates to `engine.marketView()`. A missing/failing engine view returns
@@ -349,6 +368,90 @@ fallback (`pnlSource: 'legacy'`, warning in the P&L breakdown), derives the life
 column from the top-level payout history, and shows the recommended v3.3 rules with a
 "rules not reported yet" note instead of breaking. Once the engine migration
 (`capital-v33.json`) has run, the same panel renders fair trading P&L automatically.
+
+### Annual return target and aggressive growth cohort (v3.4)
+
+> Authoritative contract: [`docs/AGGRESSIVE-GROWTH.md`](../../docs/AGGRESSIVE-GROWTH.md).
+> In one sentence: **50%/yr is an ambitious target, not a guarantee — the dashboard reports
+> the measured trading pace, and a dedicated aggressive cohort takes more (valid) setups
+> inside the same 18 hard brakes; it never sizes up just because the target is behind.**
+
+**Annual return target card** (top of the Overview KPI area, plus a compact pill in the
+header on every tab and a settings-page stat card):
+
+| Field | Meaning in the UI |
+|---|---|
+| Target | `targetAnnualReturnPct` (default `0.50` → **50%**), labelled *target, not guarantee*. |
+| Annualized trading return | `annualizedReturnPct = tradingPnlSinceBaselineUsd / baselineAccountEquityUsd × 365 / daysElapsed` (a fraction; shown as %/yr). **`—` with a "short history (< 1 day)" note** when fewer than 24 h have elapsed — the UI never fabricates an annualization. |
+| Target progress / pace | progress = annualized / target; pace = trading P&L since baseline ÷ the cumulative trading P&L required to be on target for the elapsed days. Both render as a progress bar (pace marker + 100% target marker) with an *on pace* / *behind pace* / *no measured baseline yet* label. |
+| Required daily pace | `requiredDailyReturnPct = (1 + target)^(1/365) − 1` (default ≈ `0.111%/day`), so the pace is explicit rather than implied. |
+| Trading P&L since baseline | `tradingPnlSinceBaselineUsd` (falls back to total trading P&L − baseline trading P&L). |
+| Account equity / capital base | `accountEquityUsd`, `accountCapitalBase`; the baseline date is shown as an age (*"baseline set 22d ago"*). |
+| Caveat | Every card/pill carries **"Target, not guarantee"**; the card note states the target never increases risk, never overrides the 18 brakes or the account risk caps, and that trading P&L only is counted (aggressive top-ups are contributed capital). |
+
+The target is **informational only**: no engine/UI path increases order size, relaxes a
+brake, or overrides an operator action because the target is behind. Reward capital is
+never folded into the target math — the trading totals come from the fair v3.3 accounting.
+
+**Aggression cohort visibility**
+
+- **Badges**: `Aggressive` / `Balanced` / `Conservative` in the agent table's **Aggression**
+  column, in the detail header, and in the profile block. Legacy rows with no
+  `agent.aggression` render a neutral `—` badge instead of guessing.
+- **Filter + sort**: profile filter chips (All profiles / Aggressive (n) / Balanced (n) /
+  Conservative (n)) compose with the category tabs, alive/dead chips and free-text search;
+  the Aggression column sorts by cohort rank (aggressive → conservative, unknown rows last).
+- **Cohort counts**: `engine.aggression.counts` render in the table header strip and the
+  header/settings stats (`Aggressive 12 · Balanced 13 · Conservative 5`), with the enabled
+  state and capital multiplier available from the same payload.
+- **Profile limits (agent detail)**: basket size (day/swing), max open positions
+  (day/swing), orders per cycle, entry-Z / size / stop / target / max-hold multipliers,
+  policy size floor and stand-down policy (aggressive uses
+  `policySizeFloor` and converts a `stand_down` stance to cautious at the floor; balanced /
+  conservative respect stand-down). These are display-only ceilings — the executor enforces
+  them and all 18 brakes still apply.
+- **Activity stats (agent detail)**: orders today, trades, open positions per agent, plus
+  engine-level `engine.activity` (orders today, trades since start, executions/orders in the
+  last cycle, active profiles, halt reasons) rendered as the Markets-tab diagnostics line
+  and a Settings stat card.
+- **Aggressive capital** is **contributed capital**: the one-time v3.4 top-up is a ledger
+  capital contribution (`reason: 'v3.4 aggressive capital allocation'`), so it appears
+  inside *Capital contributed* in the v3.3 P&L breakdown and is explicitly excluded from
+  Trading P&L and from rewards. If an engine exposes `capital.aggressiveCapitalUsd` the
+  detail block labels the top-up amount; otherwise the note explains the classification.
+
+**Status fields consumed** (`GET /automaton/state`):
+
+- `engine.performance` (also accepted top-level as `performance`):
+  `{enabled, targetAnnualReturnPct, requiredDailyReturnPct, baselineAt,
+  baselineAccountEquityUsd, baselineTradingPnlUsd, daysElapsed,
+  tradingPnlSinceBaselineUsd, annualizedReturnPct, targetProgressPct, onTrack,
+  accountEquityUsd, accountCapitalBase, tradingPnlTotalUsd}`. `annualizedReturnPct` is a
+  fraction; **`targetProgressPct` is sent by the engine as percent points
+  (`100` = on target)** and the UI normalizes it to a fraction (both units are accepted,
+  cross-checked against the measured annualized ratio, so a small value like `3` means 3%
+  rather than 300%). `onTrack` is informational only.
+- `engine.aggression`: `{enabled, aggressivePct, balancedPct, capitalMultiplier,
+  profiles:{aggressive,balanced,conservative}, counts:{aggressive,balanced,conservative}}`.
+- `engine.activity`: `{ordersToday, tradesTotal, positionsTotal, lastCycleExecutions,
+  lastCycleOrders, activeProfiles, haltReasons, halted}` — `activeProfiles` is a counts
+  object from the engine (an array of profile names is also accepted).
+- Per agent: `aggression` (`'aggressive'|'balanced'|'conservative'`), `aggressionProfile`
+  (the limits above), `activity {ordersToday, trades, positions}`; `capital` may add
+  `aggressiveCapitalUsd`.
+
+**Legacy fallback**: snapshots without the v3.4 fields still render — the target card shows
+the default **50%** target with `—` annualized return/progress and the explicit
+`performanceLegacyNote`, table rows show a neutral badge (no profile filter chips), the
+detail block says the engine has not reported profile limits yet, and all v3.3 fair-P&L /
+rewards / leaderboard / research tabs are unchanged.
+
+**Caveat (must stay true)**: 50%/yr is an ambition, not a promise. Long-only paper trading
+with position caps may not reach it; v3.4 increases opportunity and capital efficiency for
+the aggressive cohort (`capitalMultiplier` 1.35, larger baskets, lower entry-Z, larger
+size) while keeping every hard brake, the account risk caps, the paper/live gates and the
+external Reaper exactly as before. There is no "target mode", no size-up-on-lag and no
+unlimited aggression slider in the dashboard.
 
 ### Research sidecar — isolated hourly analyst
 
@@ -438,6 +541,10 @@ adds:
   sections described above (trading day/week/month returns when `agent.pnl` is present).
   Legacy snapshots without the v3.3 fields fall back to the equity-based values with an
   explicit warning.
+- **Aggression profile + activity** (v3.4): the cohort badge and its limits (baskets, max
+  open positions, orders/cycle, multipliers, policy size floor, stand-down policy) followed
+  by orders today / trades / open positions — see *Annual return target and aggressive
+  growth cohort (v3.4)*.
 
 ### `POST /automaton/control`
 
@@ -659,6 +766,14 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
   contributed and reward capital by the same amount and **never touches trading P&L or
   reward ranking**; `sum(agent equity) + pool` stays constant so reconciliation is
   unaffected. The panel has no "pay now" action.
+- **The annual return target is an ambition, not a guarantee.** The dashboard reports the
+  measured annualized trading return, target progress and required daily pace, but no tool,
+  control action or dashboard surface can increase risk to chase the target: aggression is
+  a fixed cohort profile whose limits are ceilings only, every order still passes the 18
+  hard brakes and the account risk caps, and the target is never an order override.
+  Reward payouts and v3.4 aggressive capital top-ups are capital contributions and are
+  excluded from every P&L number; the 50%/yr figure carries the explicit
+  *"target, not guarantee"* label.
 - **Kill switch:** `automaton_emergency_stop` (tool or control panel) writes
   `<stateDir>/KILL_SWITCH`; every order and cycle is denied while the file exists, and
   the panel's red indicator follows the marker file itself (not a possibly-stale engine
@@ -705,7 +820,8 @@ rewards/leaderboards/plan/transactions/strategy-type/bot-agent-policy/instrument
 playbook/last-cycle/capability/market-tape/KPI/equity-chart/strategy-mix/live-view mapping,
 plus the v3.3 `agentPnlView`/`capitalBreakdown`/`agentRewardHistoryRows`/
 `rewardsLedgerByAgent`/`rewardRuleSummary`/`rewardsEligibility`/`rewardSettingsPatch`/
-`portfolioPnlTotals` fair-P&L helpers, are pure functions exported as `helpers` for
-tests), `locale/{en,zh}.json` (plugin metadata), `icon.svg`, `test/plugin.test.js`,
-`src/**` (engine implemented by the core project).
+`portfolioPnlTotals` fair-P&L helpers and the v3.4 `performanceView`/`targetProgress`/
+`aggressionBadge`/`profileCounts`/`activityView` helpers, are pure functions exported as
+`helpers` for tests), `locale/{en,zh}.json` (plugin metadata), `icon.svg`,
+`test/plugin.test.js`, `src/**` (engine implemented by the core project).
 

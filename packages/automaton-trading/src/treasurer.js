@@ -331,6 +331,7 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
   function degradedTick(at, atMs, errors) {
     const aliveCount = registry.population();
     const pool = ledger.pool();
+    const costsSinceAnchorUsd = round2(Number(ledger.costsSinceAnchor()) || 0);
     return {
       at,
       mode: config.mode,
@@ -344,7 +345,13 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       populationCapRemaining: Math.max(0, registry.cap - aliveCount),
       allocatedUsd: pool.allocatedUsd,
       poolUsd: pool.poolUsd,
-      reconciliation: { ok: false, deltaUsd: 0, toleranceUsd: 0 },
+      reconciliation: {
+        ok: false,
+        deltaUsd: 0,
+        toleranceUsd: 0,
+        costsSinceAnchorUsd,
+        virtualTotalUsd: round2(pool.allocatedUsd + pool.poolUsd + costsSinceAnchorUsd),
+      },
       mandates: {},
       agentViews: [],
       verdicts: [],
@@ -454,7 +461,12 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       }
     }
 
-    // Reconciliation: sum(virtual equity) + treasury pool vs broker account equity.
+    // Reconciliation: sum(virtual equity) + treasury pool + virtual costs since the anchor
+    // vs broker account equity. Metabolism costs are simulated operating expenses the paper
+    // broker account NEVER pays, so they explain — and only they explain — a drift that would
+    // otherwise halt the engine forever (v3.4, docs/AGGRESSIVE-GROWTH.md §0). The allowance is
+    // symmetric: a real unbooked fill still shows as ±delta beyond tolerance. It never mints
+    // agent capital and never moves cash.
     let allocatedAll = 0;
     for (const agent of allAgents) {
       if (agent.id === TREASURY_ID) continue;
@@ -467,8 +479,10 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
     }
     allocatedAll = round2(allocatedAll);
     const poolInfo = ledger.pool();
+    const costsSinceAnchorUsd = round2(Number(ledger.costsSinceAnchor()) || 0);
     const accountEquityUsd = round2(Number(account.equityUsd) || 0);
-    const deltaUsd = round2(accountEquityUsd - (allocatedAll + poolInfo.poolUsd));
+    const expectedVirtualUsd = round2(allocatedAll + poolInfo.poolUsd + costsSinceAnchorUsd);
+    const deltaUsd = round2(accountEquityUsd - expectedVirtualUsd);
     const toleranceUsd = round2(
       Number(config.account?.reconciliationTolerancePct ?? 0.02) * Math.max(1, accountEquityUsd),
     );
@@ -476,6 +490,8 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       ok: Math.abs(deltaUsd) <= toleranceUsd + EPSILON,
       deltaUsd,
       toleranceUsd,
+      costsSinceAnchorUsd,
+      virtualTotalUsd: expectedVirtualUsd,
     };
 
     // System-level halts: new orders are blocked, exits stay available.
@@ -680,8 +696,10 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
     }
     allocatedUsd = round2(allocatedUsd);
     const pool = ledger.pool();
+    const costsSinceAnchorUsd = round2(Number(ledger.costsSinceAnchor()) || 0);
     const accountEquityUsd = round2(Number(account.equityUsd) || 0);
-    const deltaUsd = round2(accountEquityUsd - (allocatedUsd + pool.poolUsd));
+    const virtualTotalUsd = round2(allocatedUsd + pool.poolUsd + costsSinceAnchorUsd);
+    const deltaUsd = round2(accountEquityUsd - virtualTotalUsd);
     const toleranceUsd = round2(
       Number(config.account?.reconciliationTolerancePct ?? 0.02) * Math.max(1, accountEquityUsd),
     );
@@ -691,6 +709,8 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       toleranceUsd,
       allocatedUsd,
       poolUsd: pool.poolUsd,
+      costsSinceAnchorUsd,
+      virtualTotalUsd,
       accountEquityUsd,
       at,
     };

@@ -142,6 +142,65 @@ export function defaultConfig() {
       maxOpenPositionsSwing: 3,
       maxOrdersPerCycle: 2,
     },
+    // v3.4 aggressive growth cohort (docs/AGGRESSIVE-GROWTH.md). Opt-in in code defaults so older
+    // configs/tests retain the v3.3 balanced behavior; the live profile enables it explicitly.
+    // When enabled, 40% of the population gets larger baskets/positions/orders, lower entry bars,
+    // bigger sizing and a policy size floor; 45% balanced; the rest conservative.
+    aggression: {
+      enabled: false,
+      aggressivePct: 0.4,
+      balancedPct: 0.45,
+      capitalMultiplier: 1.35,
+      profiles: {
+        aggressive: {
+          basketSizeDay: 6,
+          basketSizeSwing: 4,
+          maxOpenPositionsDay: 8,
+          maxOpenPositionsSwing: 5,
+          maxOrdersPerCycle: 4,
+          entryZMultiplier: 0.7,
+          sizePctMultiplier: 1.35,
+          stopPctMultiplier: 0.8,
+          targetPctMultiplier: 1.2,
+          maxHoldBarsMultiplier: 0.75,
+          policySizeFloor: 0.8,
+          respectStandDown: false,
+        },
+        balanced: {
+          basketSizeDay: 4,
+          basketSizeSwing: 3,
+          maxOpenPositionsDay: 5,
+          maxOpenPositionsSwing: 3,
+          maxOrdersPerCycle: 2,
+          entryZMultiplier: 1,
+          sizePctMultiplier: 1,
+          stopPctMultiplier: 1,
+          targetPctMultiplier: 1,
+          maxHoldBarsMultiplier: 1,
+          policySizeFloor: 0,
+          respectStandDown: true,
+        },
+        conservative: {
+          basketSizeDay: 3,
+          basketSizeSwing: 2,
+          maxOpenPositionsDay: 3,
+          maxOpenPositionsSwing: 2,
+          maxOrdersPerCycle: 1,
+          entryZMultiplier: 1.15,
+          sizePctMultiplier: 0.8,
+          stopPctMultiplier: 1,
+          targetPctMultiplier: 0.9,
+          maxHoldBarsMultiplier: 1,
+          policySizeFloor: 0,
+          respectStandDown: true,
+        },
+      },
+    },
+    // v3.4 return target (informational: displayed pace, never an order/risk override).
+    targets: {
+      enabled: true,
+      annualReturnPct: 0.5,
+    },
     // Per-bot agent brain (docs/BOT-AGENTS.md): each bot reviews its own strategy in an isolated
     // context on its cadence and writes a policy the executor consumes.
     agents: {
@@ -516,6 +575,42 @@ export function validateConfig(config) {
     assertNumber(rewards.maxPerPeriodUsd, 'rewards.maxPerPeriodUsd', { min: 0, max: 1_000_000 });
   }
 
+  // v3.4 aggressive growth profiles: percentages are population shares, profile values are
+  // execution ceilings/ceilings only and are re-checked by the brakes.
+  const aggression = config.aggression;
+  if (!aggression || typeof aggression !== 'object') fail('CONFIG_INVALID', 'aggression config object is required');
+  if (typeof aggression.enabled !== 'boolean') fail('CONFIG_INVALID', 'aggression.enabled must be boolean');
+  assertPct(aggression.aggressivePct, 'aggression.aggressivePct');
+  assertPct(aggression.balancedPct, 'aggression.balancedPct');
+  if (Number(aggression.aggressivePct) + Number(aggression.balancedPct) > 1.000001) {
+    fail('CONFIG_INVALID', 'aggression.aggressivePct + balancedPct must be at most 1');
+  }
+  assertNumber(aggression.capitalMultiplier, 'aggression.capitalMultiplier', { min: 0.5, max: 5 });
+  const AGGRESSION_PROFILES = ['aggressive', 'balanced', 'conservative'];
+  if (!aggression.profiles || typeof aggression.profiles !== 'object') {
+    fail('CONFIG_INVALID', 'aggression.profiles is required');
+  }
+  for (const name of AGGRESSION_PROFILES) {
+    const profile = aggression.profiles[name];
+    if (!profile || typeof profile !== 'object') fail('CONFIG_INVALID', `aggression.profiles.${name} is required`);
+    for (const key of ['basketSizeDay', 'basketSizeSwing', 'maxOpenPositionsDay', 'maxOpenPositionsSwing', 'maxOrdersPerCycle']) {
+      assertNumber(profile[key], `aggression.profiles.${name}.${key}`, { min: 1, max: 100 });
+      if (!Number.isInteger(Number(profile[key]))) fail('CONFIG_INVALID', `aggression.profiles.${name}.${key} must be an integer`);
+    }
+    for (const key of ['entryZMultiplier', 'sizePctMultiplier', 'stopPctMultiplier', 'targetPctMultiplier', 'maxHoldBarsMultiplier']) {
+      assertNumber(profile[key], `aggression.profiles.${name}.${key}`, { min: 0.1, max: 5 });
+    }
+    assertPct(profile.policySizeFloor, `aggression.profiles.${name}.policySizeFloor`);
+    if (typeof profile.respectStandDown !== 'boolean') {
+      fail('CONFIG_INVALID', `aggression.profiles.${name}.respectStandDown must be boolean`);
+    }
+  }
+
+  const targets = config.targets;
+  if (!targets || typeof targets !== 'object') fail('CONFIG_INVALID', 'targets config object is required');
+  if (typeof targets.enabled !== 'boolean') fail('CONFIG_INVALID', 'targets.enabled must be boolean');
+  assertNumber(targets.annualReturnPct, 'targets.annualReturnPct', { min: 0, max: 5 });
+
   // Per-tier execution cadence (optional; null keeps the single-cycle legacy behaviour).
   if (config.cadence !== null && config.cadence !== undefined) {
     if (typeof config.cadence !== 'object') fail('CONFIG_INVALID', 'cadence must be an object or null');
@@ -780,6 +875,8 @@ export function configSummary(config) {
     cadence: config.cadence,
     strategyMix: config.strategyMix,
     portfolio: config.portfolio,
+    aggression: config.aggression,
+    targets: config.targets,
     instruments: {
       enabled: config.instruments.enabled,
       allowMargin: config.instruments.allowMargin,

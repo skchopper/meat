@@ -21,13 +21,13 @@
     "childEndowmentUsd": 25
   },
   "risk": {
-    "maxPositionPct": 0.5,
-    "maxOpenPositions": 6,
+    "maxPositionPct": 0.6,
+    "maxOpenPositions": 10,
     "maxSpreadBps": 100,
-    "maxDailyOrders": 20,
+    "maxDailyOrders": 40,
     "maxDailyLossPct": 0.2,
     "maxOrderPctOfEquity": 0.5,
-    "maxOrderNotionalUsd": 40,
+    "maxOrderNotionalUsd": 60,
     "minOrderNotionalUsd": 1,
     "allowShort": true,
     "allowMargin": true,
@@ -37,7 +37,7 @@
       "09:35",
       "15:50"
     ],
-    "maxOrdersPerCycle": 2,
+    "maxOrdersPerCycle": 4,
     "maxBuildSpendPct": 0.4
   },
   "data": {
@@ -85,7 +85,7 @@
   },
   "agents": {
     "enabled": true,
-    "reviewIntervalDaySec": 300,
+    "reviewIntervalDaySec": 240,
     "reviewIntervalSwingSec": 3600,
     "maxReviewsPerCycle": 4,
     "costPerReviewUsd": 0.001,
@@ -142,6 +142,16 @@
     "maxDrawdownPct": 0.2
   },
   "account": {
-    "allocationCapPct": 0.9
+    "allocationCapPct": 0.92
+  },
+  "aggression": {
+    "enabled": true,
+    "aggressivePct": 0.4,
+    "balancedPct": 0.45,
+    "capitalMultiplier": 1.35
+  },
+  "targets": {
+    "enabled": true,
+    "annualReturnPct": 0.5
   }
 }

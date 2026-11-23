@@ -29,7 +29,7 @@ import {
 } from './util.js';
 import { createJournal } from './journal.js';
 import { createRegistry } from './registry.js';
-import { createLedger } from './ledger.js';
+import { createLedger, TREASURY_ID } from './ledger.js';
 import { createBrakes } from './brakes.js';
 import { createTreasurer } from './treasurer.js';
 import { createReplicator } from './replicator.js';
@@ -89,7 +89,8 @@ function genesisGenome(config, index) {
   const family = targetFamilyForIndex(index, Math.max(1, Number(config.population?.initial) || 30), dayPct);
   const tier = tierForFamily(family);
   const symbol = symbols[index % symbols.length];
-  const basket = basketForAgent(config, index, tier, symbol);
+  const aggression = aggressionForGenesisIndex(config, index);
+  const basket = basketForAgent(config, index, tier, symbol, aggression);
   const round = (value, digits) => {
     const factor = 10 ** digits;
     return Math.round(value * factor) / factor;
@@ -99,6 +100,8 @@ function genesisGenome(config, index) {
     symbol,
     symbols: basket,
     family,
+    // v3.4 aggressive growth cohort (docs/AGGRESSIVE-GROWTH.md); inherited by replication.
+    aggression,
     lookback: GENOME_LOOKBACKS[Math.floor(rng() * GENOME_LOOKBACKS.length)],
     entryZ: round(0.8 + rng() * 1.4, 2),
     exitZ: round(0.1 + rng() * 0.7, 2),
@@ -117,13 +120,14 @@ function genesisGenome(config, index) {
  * The primary symbol stays first; the rest rotate through the configured universe so baskets
  * overlap but every bot covers its own combination.
  */
-function basketForAgent(config, index, tier, primary = null) {
+function basketForAgent(config, index, tier, primary = null, profileName = null) {
   const symbols = (Array.isArray(config.symbols) ? config.symbols : []).map((symbol) => String(symbol).toUpperCase());
   if (symbols.length === 0) return primary ? [primary] : [];
+  const profile = resolveAggressionProfile(config, profileName);
   const portfolio = config.portfolio ?? {};
   const requested = tier === 'day'
-    ? Number(portfolio.basketSizeDay) || 4
-    : Number(portfolio.basketSizeSwing) || 3;
+    ? (config.aggression?.enabled === true ? Number(profile.basketSizeDay) : Number(portfolio.basketSizeDay)) || 4
+    : (config.aggression?.enabled === true ? Number(profile.basketSizeSwing) : Number(portfolio.basketSizeSwing)) || 3;
   const size = Math.max(1, Math.min(symbols.length, Math.trunc(requested)));
   // Co-prime stride + a per-lap offset so bots with the same primary symbol still get distinct
   // baskets (30 bots, 14 symbols -> 26 unique combinations under index*3; this yields all unique).
@@ -137,6 +141,82 @@ function basketForAgent(config, index, tier, primary = null) {
     if (!basket.includes(symbol)) basket.push(symbol);
   }
   return basket;
+}
+
+/** v3.4: profiles are ordered most→least aggressive; unknown/missing names fall back to balanced. */
+const AGGRESSION_PROFILE_NAMES = ['aggressive', 'balanced', 'conservative'];
+
+/** Merge a named aggression profile with balanced defaults (usable even if v3.4 config is absent). */
+function resolveAggressionProfile(config, name) {
+  const profiles = config?.aggression?.profiles ?? {};
+  const fallback = profiles.balanced ?? {
+    basketSizeDay: 4,
+    basketSizeSwing: 3,
+    maxOpenPositionsDay: 5,
+    maxOpenPositionsSwing: 3,
+    maxOrdersPerCycle: 2,
+    entryZMultiplier: 1,
+    sizePctMultiplier: 1,
+    stopPctMultiplier: 1,
+    targetPctMultiplier: 1,
+    maxHoldBarsMultiplier: 1,
+    policySizeFloor: 0,
+    respectStandDown: true,
+  };
+  const selected = AGGRESSION_PROFILE_NAMES.includes(name) && profiles[name] ? profiles[name] : fallback;
+  return { ...fallback, ...selected, name: AGGRESSION_PROFILE_NAMES.includes(name) ? name : 'balanced' };
+}
+
+/** Deterministic profile counts: aggressive round, conservative round, balanced takes the rest. */
+function aggressionCounts(config, total) {
+  const count = Math.max(0, Math.trunc(Number(total) || 0));
+  if (config?.aggression?.enabled !== true || count === 0) {
+    return { aggressive: 0, balanced: count, conservative: 0 };
+  }
+  const aggressivePct = Number(config.aggression.aggressivePct ?? 0.4);
+  const balancedPct = Number(config.aggression.balancedPct ?? 0.45);
+  const aggressive = Math.max(0, Math.min(count, Math.round(count * aggressivePct)));
+  const conservative = Math.max(0, Math.min(
+    count - aggressive,
+    Math.round(count * (1 - aggressivePct - balancedPct) + 1e-9),
+  ));
+  return { aggressive, balanced: count - aggressive - conservative, conservative };
+}
+
+/**
+ * Assign profiles day-bots-first so the aggressive/turnover cohort is mostly intraday. Deterministic
+ * for a given population/tier order; returns a Map(agentIdOrIndex -> profileName) for callers.
+ */
+function assignAggressionProfiles(config, entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const counts = aggressionCounts(config, list.length);
+  const order = [...list].sort((a, b) => {
+    const aDay = (a.tier ?? 'swing') === 'day' ? 0 : 1;
+    const bDay = (b.tier ?? 'swing') === 'day' ? 0 : 1;
+    if (aDay !== bDay) return aDay - bDay;
+    return String(a.id ?? a.index ?? '').localeCompare(String(b.id ?? b.index ?? ''));
+  });
+  const assignments = new Map();
+  order.forEach((entry, index) => {
+    let profile = 'conservative';
+    if (index < counts.aggressive) profile = 'aggressive';
+    else if (index < counts.aggressive + counts.balanced) profile = 'balanced';
+    assignments.set(entry.id ?? entry.index, profile);
+  });
+  return assignments;
+}
+
+/** Profile for a genesis index: derive tiers from the target family mix and assign day-first. */
+function aggressionForGenesisIndex(config, index) {
+  const total = Math.max(1, Number(config.population?.initial) || 30);
+  const dayPct = Number(config.strategyMix?.dayPct ?? 0.5);
+  const entries = [];
+  for (let i = 0; i < total; i += 1) {
+    const family = targetFamilyForIndex(i, total, dayPct);
+    entries.push({ index: i, tier: tierForFamily(family) });
+  }
+  const assignments = assignAggressionProfiles(config, entries);
+  return assignments.get(index) ?? 'balanced';
 }
 
 /** Last close (or last/ask fallback) per symbol, used for marking positions. */
@@ -636,7 +716,7 @@ export async function createAutomaton(options = {}) {
       const primary = config.symbols.includes(currentPrimary) ? currentPrimary : config.symbols[index % config.symbols.length];
       // Re-derive the basket size for the agent's NEW tier; otherwise a swing→day migration would
       // leave a 3-symbol basket on a day bot (and vice versa) when the baskets marker already exists.
-      const symbols = basketForAgent(config, index, tier, primary);
+      const symbols = basketForAgent(config, index, tier, primary, agent?.genome?.aggression);
       const genome = { ...(agent.genome ?? {}), family: target, symbol: primary, symbols };
       const patch = { genome, symbols, tier, specId: null, specIds: {} };
       try {
@@ -672,7 +752,7 @@ export async function createAutomaton(options = {}) {
       const tier = agent.tier === 'day' ? 'day' : tierForFamily(agent?.genome?.family);
       const currentPrimary = String(agent?.genome?.symbol ?? '').toUpperCase();
       const primary = config.symbols.includes(currentPrimary) ? currentPrimary : config.symbols[index % config.symbols.length];
-      const symbols = basketForAgent(config, index, tier, primary);
+      const symbols = basketForAgent(config, index, tier, primary, agent?.genome?.aggression);
       const genome = { ...(agent.genome ?? {}), symbol: primary, symbols };
       try {
         // eslint-disable-next-line no-await-in-loop
@@ -836,6 +916,193 @@ export async function createAutomaton(options = {}) {
     }
   }
 
+  /** v3.4 profile counts for a set of agent rows (exposed in status). */
+  function aggressionCountsForAgents(agents) {
+    const counts = { aggressive: 0, balanced: 0, conservative: 0 };
+    for (const agent of agents ?? []) {
+      const name = AGGRESSION_PROFILE_NAMES.includes(agent?.genome?.aggression) ? agent.genome.aggression : 'balanced';
+      counts[name] += 1;
+    }
+    return counts;
+  }
+
+  /**
+   * v3.4: deterministic day-first aggression profiles (docs/AGGRESSIVE-GROWTH.md §1). Flat agents
+   * get the profile's basket size and lose their old cached spec so the builder recompiles with the
+   * profile multipliers; agents holding a position keep their opening spec/basket for safe exits.
+   */
+  async function assignAggressionProfilesV34() {
+    const marker = path.join(paths.stateDir, 'aggression-v34.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 1 && already?.skipped !== true) return;
+    if (config.aggression?.enabled !== true) {
+      // Do NOT persist a skipped marker: the operator must be able to enable the cohort later.
+      return;
+    }
+    const alive = registry.alive();
+    if (!alive.length) return;
+    const entries = alive.map((agent, index) => ({ id: agent.id, tier: agent.tier === 'swing' ? 'swing' : 'day', index }));
+    const assignments = assignAggressionProfiles(config, entries);
+    let changed = 0;
+    let changedProfiles = 0;
+    for (const agent of alive) {
+      const aggression = assignments.get(agent.id) ?? 'balanced';
+      const tier = agent.tier === 'swing' ? 'swing' : 'day';
+      const previous = AGGRESSION_PROFILE_NAMES.includes(agent?.genome?.aggression) ? agent.genome.aggression : null;
+      const held = (() => {
+        try {
+          return Object.keys(ledger.snapshot(agent.id)?.positions ?? {}).length > 0;
+        } catch {
+          return false;
+        }
+      })();
+      const primary = String(agent?.genome?.symbol ?? '').toUpperCase();
+      // Basket sizes follow the profile even for bots holding positions: exits are managed from the
+      // book/spec, not restricted by the entry basket. Existing opening specs are kept separately.
+      const basket = basketForAgent(config, alive.indexOf(agent), tier, primary, aggression);
+      const genome = {
+        ...(agent.genome ?? {}),
+        aggression,
+        symbol: primary && config.symbols.includes(primary) ? primary : (basket[0] ?? primary),
+        symbols: basket,
+      };
+      const patch = { genome, symbols: basket };
+      if (!held) {
+        patch.specId = null;
+        patch.specIds = {};
+      }
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await registry.update(agent.id, patch);
+        changed += 1;
+      } catch {
+        /* immutable/dead records are skipped */
+      }
+      if (previous !== aggression) changedProfiles += 1;
+    }
+    await registry.save();
+    await writeJsonAtomic(marker, {
+      version: 1,
+      at: new Date(clock.now()).toISOString(),
+      changed,
+      profiles: aggressionCountsForAgents(registry.alive()),
+    });
+    log.info('aggression profiles assigned', { changed, profiles: aggressionCountsForAgents(registry.alive()) });
+  }
+
+  /**
+   * v3.4 aggressive capital: fund each aggressive bot toward endowment * capitalMultiplier from the
+   * treasury pool only, within the allocation cap; recorded as capital, never P&L/reward. One-time.
+   */
+  async function allocateAggressiveCapitalV34(accountEquityUsd) {
+    const marker = path.join(paths.stateDir, 'aggression-capital-v34.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 1 && already?.skipped !== true) return;
+    if (config.aggression?.enabled !== true) return;
+    const targetCapital = round2(Math.max(0, Number(config.endowmentUsd) || 0) * Number(config.aggression.capitalMultiplier ?? 1));
+    if (!(targetCapital > 0)) return;
+    if (typeof ledger.transfer !== 'function' || typeof ledger.anchorToBrokerEquity !== 'function') return;
+    const accountEquity = Math.max(0, Number(accountEquityUsd) || 0);
+    if (!(accountEquity > 0)) return;
+    if (typeof ledger.isAnchored === 'function' && !ledger.isAnchored()) {
+      try {
+        ledger.anchorToBrokerEquity(accountEquity);
+      } catch {
+        /* no pool => no top-up */
+      }
+    }
+    const cap = accountEquity * Number(config.account?.allocationCapPct ?? 0.8);
+    const pool = typeof ledger.pool === 'function' ? ledger.pool() : { poolUsd: 0, allocatedUsd: 0 };
+    const deficits = registry.alive()
+      .filter((agent) => (agent?.genome?.aggression ?? 'balanced') === 'aggressive')
+      .map((agent) => ({ agent, deficit: round2(targetCapital - (Number(agent.endowmentUsd) || 0)) }))
+      .filter((entry) => entry.deficit > 0.009);
+    if (!deficits.length) {
+      await writeJsonAtomic(marker, { version: 1, at: new Date(clock.now()).toISOString(), migrated: 0, targetCapitalUsd: targetCapital });
+      return;
+    }
+    const desired = round2(deficits.reduce((sum, entry) => sum + entry.deficit, 0));
+    const available = round2(Math.max(0, Math.min(
+      Number(pool.poolUsd) || 0,
+      cap - (Number(pool.allocatedUsd) || 0),
+    )));
+    const budget = round2(Math.min(desired, available));
+    if (!(budget > 0)) {
+      log.warn('aggressive capital allocation skipped: no pool/allocation headroom', { desired, available });
+      await writeJsonAtomic(marker, { version: 1, at: new Date(clock.now()).toISOString(), migrated: 0, targetCapitalUsd: targetCapital, skipped: true, reason: 'no_pool_or_cap' });
+      return;
+    }
+    const scale = budget / desired;
+    let credited = 0;
+    let changed = 0;
+    const allocations = {};
+    for (const { agent, deficit } of deficits) {
+      const amount = round2(deficit * scale);
+      if (!(amount > 0)) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        ledger.transfer(TREASURY_ID, agent.id, amount, {
+          reason: 'v3.4 aggressive capital allocation',
+          at: clock.now(),
+        });
+        // v3.4: expose the top-up explicitly on the agent status (contributed capital only).
+        const aggressionCapitalUsd = round2((Number(agent.genome?.aggressionCapitalUsd) || 0) + amount);
+        // eslint-disable-next-line no-await-in-loop
+        await registry.update(agent.id, {
+          endowmentUsd: round2((Number(agent.endowmentUsd) || 0) + amount),
+          genome: { ...(agent.genome ?? {}), aggressionCapitalUsd },
+        });
+        credited = round2(credited + amount);
+        changed += 1;
+        allocations[agent.id] = aggressionCapitalUsd;
+      } catch (error) {
+        log.warn('aggressive capital top-up failed', { agentId: agent.id, error: String(error?.message ?? error) });
+      }
+    }
+    if (changed > 0) await ledger.save();
+    await registry.save();
+    await writeJsonAtomic(marker, {
+      version: 1,
+      at: new Date(clock.now()).toISOString(),
+      migrated: changed,
+      targetCapitalUsd: targetCapital,
+      creditedUsd: credited,
+      allocations,
+    });
+    log.info('aggressive capital allocated from pool', { agents: changed, creditedUsd: credited, targetCapitalUsd: targetCapital });
+  }
+
+  /** v3.4 one-time performance baseline for the annual-return target (informational only). */
+  async function ensurePerformanceBaselineV34(accountEquityUsd) {
+    const marker = path.join(paths.stateDir, 'growth-v34.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 1) return;
+    let tradingPnlUsd = 0;
+    let accountCapitalBase = 0;
+    for (const agent of registry.all()) {
+      try {
+        const book = ledger.snapshot(agent.id);
+        tradingPnlUsd += Number(book?.tradingPnlUsd) || 0;
+        accountCapitalBase += Number(book?.capitalContributionsUsd) || 0;
+      } catch {
+        /* ignore */
+      }
+    }
+    const pool = typeof ledger.pool === 'function' ? ledger.pool() : { poolUsd: 0 };
+    await writeJsonAtomic(marker, {
+      version: 1,
+      at: new Date(clock.now()).toISOString(),
+      baselineAccountEquityUsd: round2(Number(accountEquityUsd) || 0),
+      baselineTradingPnlUsd: round2(tradingPnlUsd),
+      accountCapitalBase: round2(accountCapitalBase + (Number(pool.poolUsd) || 0)),
+      targetAnnualReturnPct: Number(config.targets?.annualReturnPct ?? 0.5),
+    });
+    log.info('growth performance baseline recorded', {
+      baselineAccountEquityUsd: round2(Number(accountEquityUsd) || 0),
+      baselineTradingPnlUsd: round2(tradingPnlUsd),
+    });
+  }
+
   async function init() {
     if (state.initialized) return;
     await ensureDir(paths.stateDir);
@@ -868,7 +1135,10 @@ export async function createAutomaton(options = {}) {
     await rebalanceStrategyMix();
     await introduceAffordableSymbols();
     await assignBasketsV32();
+    await assignAggressionProfilesV34();
     await capitalizePopulation(Number(account?.equityUsd) || 0);
+    await allocateAggressiveCapitalV34(Number(account?.equityUsd) || 0);
+    await ensurePerformanceBaselineV34(Number(account?.equityUsd) || 0);
     await alignSpecsToGenomes();
     state.initialized = true;
     const snapshot = await buildSnapshot({ account, treasury: null, halted: false, haltReasons: [] });
@@ -1229,12 +1499,34 @@ export async function createAutomaton(options = {}) {
           tier,
           riskOnly,
         });
-        const portfolioLimits = {
-          maxOpenPositions: tier === 'day'
-            ? Number(config.portfolio?.maxOpenPositionsDay) || 5
-            : Number(config.portfolio?.maxOpenPositionsSwing) || 3,
-          maxOrdersPerCycle: Number(config.portfolio?.maxOrdersPerCycle) || 2,
-        };
+        const aggressionActive = config.aggression?.enabled === true;
+        const aggressionName = aggressionActive && AGGRESSION_PROFILE_NAMES.includes(agent?.genome?.aggression)
+          ? agent.genome.aggression
+          : 'balanced';
+        const aggressionProfile = resolveAggressionProfile(config, aggressionName);
+        const portfolioLimits = aggressionActive
+          ? {
+              maxOpenPositions: tier === 'day'
+                ? Number(aggressionProfile.maxOpenPositionsDay) || Number(config.portfolio?.maxOpenPositionsDay) || 5
+                : Number(aggressionProfile.maxOpenPositionsSwing) || Number(config.portfolio?.maxOpenPositionsSwing) || 3,
+              maxOrdersPerCycle: Number(aggressionProfile.maxOrdersPerCycle)
+                || Number(config.portfolio?.maxOrdersPerCycle)
+                || 2,
+            }
+          : {
+              // v3.3 compatibility when the v3.4 cohort is disabled: honour operator portfolio limits.
+              maxOpenPositions: tier === 'day'
+                ? Number(config.portfolio?.maxOpenPositionsDay) || 5
+                : Number(config.portfolio?.maxOpenPositionsSwing) || 3,
+              maxOrdersPerCycle: Number(config.portfolio?.maxOrdersPerCycle) || 2,
+            };
+        const executorProfile = aggressionActive
+          ? {
+              aggression: aggressionName,
+              policySizeFloor: Number(aggressionProfile.policySizeFloor) || 0,
+              respectStandDown: aggressionProfile.respectStandDown !== false,
+            }
+          : { aggression: 'balanced', policySizeFloor: 0, respectStandDown: true };
         try {
           const result = await executor.run({
             agent,
@@ -1243,6 +1535,7 @@ export async function createAutomaton(options = {}) {
             spec: primary,
             specs,
             portfolio: portfolioLimits,
+            profile: executorProfile,
             mandate,
             quotes,
             // One market read per cycle per timeframe lane: the whole population shares it.
@@ -1266,6 +1559,7 @@ export async function createAutomaton(options = {}) {
             specId: primary.specId,
             specs: specs.length,
             basket: basketSymbols(agent),
+            aggression: aggressionName,
             tier,
             riskOnly,
             actions: result?.actions?.length ?? 0,
@@ -1815,6 +2109,11 @@ export async function createAutomaton(options = {}) {
       const rankingDay = rankingMaps.daily.get(agent.id) ?? null;
       const rankingWeek = rankingMaps.weekly.get(agent.id) ?? null;
       const rankingMonth = rankingMaps.monthly.get(agent.id) ?? null;
+      const aggressionName = AGGRESSION_PROFILE_NAMES.includes(agent?.genome?.aggression)
+        ? agent.genome.aggression
+        : 'balanced';
+      const aggressionProfile = resolveAggressionProfile(config, aggressionName);
+      const dayStat = state.dayStats.agents[agent.id] ?? null;
       return {
         id: agent.id,
         name: agent.name ?? agent.id,
@@ -1862,10 +2161,34 @@ export async function createAutomaton(options = {}) {
         // v3.3 fair capital decomposition + trading-only P&L (reward capital is NOT profit).
         tradingPnlUsd,
         tradingPnlPct,
+        // v3.4 aggressive growth profile + activity (docs/AGGRESSIVE-GROWTH.md).
+        aggression: aggressionName,
+        aggressionProfile: {
+          name: aggressionName,
+          basketSizeDay: aggressionProfile.basketSizeDay,
+          basketSizeSwing: aggressionProfile.basketSizeSwing,
+          maxOpenPositionsDay: aggressionProfile.maxOpenPositionsDay,
+          maxOpenPositionsSwing: aggressionProfile.maxOpenPositionsSwing,
+          maxOrdersPerCycle: aggressionProfile.maxOrdersPerCycle,
+          entryZMultiplier: aggressionProfile.entryZMultiplier,
+          sizePctMultiplier: aggressionProfile.sizePctMultiplier,
+          stopPctMultiplier: aggressionProfile.stopPctMultiplier,
+          targetPctMultiplier: aggressionProfile.targetPctMultiplier,
+          maxHoldBarsMultiplier: aggressionProfile.maxHoldBarsMultiplier,
+          policySizeFloor: aggressionProfile.policySizeFloor,
+          respectStandDown: aggressionProfile.respectStandDown,
+        },
+        activity: {
+          ordersToday: Number(dayStat?.ordersCount) || 0,
+          trades: Number(book?.trades) || 0,
+          positions: positions.length,
+        },
         capital: {
           contributedUsd: capitalContributionsUsd,
           baseUsd: baseCapitalUsd,
           rewardCapitalUsd,
+          // v3.4: portion of contributed capital that came from the aggressive top-up (never P&L).
+          aggressiveCapitalUsd: round2(Number(agent?.genome?.aggressionCapitalUsd) || 0),
           rewardSharePct: capitalContributionsUsd > 0
             ? Math.round((rewardCapitalUsd / capitalContributionsUsd) * 10000) / 100
             : 0,
@@ -1999,6 +2322,67 @@ export async function createAutomaton(options = {}) {
       tradingPnlTotalUsd: round2(agents.reduce((sum, agent) => sum + (Number(agent.tradingPnlUsd) || 0), 0)),
       rewardsLifetimeTotalUsd: round2(agents.reduce((sum, agent) => sum + (Number(agent.rewards?.lifetimeUsd) || 0), 0)),
     };
+    // v3.4 annual-return target progress (informational; never drives order sizing).
+    const growthBaseline = await readJson(path.join(paths.stateDir, 'growth-v34.json'), null);
+    const targetAnnualReturnPct = Number(config.targets?.annualReturnPct ?? 0.5);
+    const requiredDailyReturnPct = Math.pow(1 + targetAnnualReturnPct, 1 / 365) - 1;
+    const tradingPnlTotalUsd = capitalAccounting.tradingPnlTotalUsd;
+    const accountCapitalBase = round2(
+      agents.reduce((sum, agent) => sum + (Number(agent.capital?.contributedUsd) || 0), 0)
+      + (Number(ledgerPool?.poolUsd) || 0),
+    );
+    const accountEquityUsd = Number(account?.equityUsd) || 0;
+    const baselineAtMs = Date.parse(growthBaseline?.at ?? '');
+    const daysElapsed = Number.isFinite(baselineAtMs)
+      ? Math.max(0, (clock.now() - baselineAtMs) / 86_400_000)
+      : null;
+    const baselineTradingPnlUsd = Number(growthBaseline?.baselineTradingPnlUsd) || 0;
+    const baselineAccountEquityUsd = Number(growthBaseline?.baselineAccountEquityUsd) || 0;
+    const tradingPnlSinceBaselineUsd = round2(tradingPnlTotalUsd - baselineTradingPnlUsd);
+    const annualizedReturnPct = daysElapsed !== null && daysElapsed >= 1 && baselineAccountEquityUsd > 0
+      ? (tradingPnlSinceBaselineUsd / baselineAccountEquityUsd) * (365 / daysElapsed)
+      : null;
+    const performance = {
+      enabled: config.targets?.enabled !== false,
+      targetAnnualReturnPct,
+      requiredDailyReturnPct,
+      baselineAt: growthBaseline?.at ?? null,
+      baselineAccountEquityUsd: growthBaseline?.baselineAccountEquityUsd ?? null,
+      baselineTradingPnlUsd: growthBaseline?.baselineTradingPnlUsd ?? null,
+      daysElapsed: daysElapsed === null ? null : Math.round(daysElapsed * 10000) / 10000,
+      tradingPnlSinceBaselineUsd,
+      annualizedReturnPct: annualizedReturnPct === null ? null : Math.round(annualizedReturnPct * 1000000) / 1000000,
+      // Percent of the annual target achieved by the current annualized pace (100 = on target).
+      targetProgressPct: annualizedReturnPct === null || !(targetAnnualReturnPct > 0)
+        ? null
+        : Math.round((annualizedReturnPct / targetAnnualReturnPct) * 10000) / 100,
+      onTrack: annualizedReturnPct === null ? null : annualizedReturnPct >= targetAnnualReturnPct,
+      accountEquityUsd: round2(accountEquityUsd),
+      accountCapitalBase,
+      tradingPnlTotalUsd,
+    };
+    const profileCounts = aggressionCountsForAgents(agents);
+    const aggression = {
+      enabled: config.aggression?.enabled === true,
+      aggressivePct: config.aggression?.aggressivePct ?? 0,
+      balancedPct: config.aggression?.balancedPct ?? 0,
+      capitalMultiplier: config.aggression?.capitalMultiplier ?? 1,
+      profiles: config.aggression?.profiles ?? {},
+      counts: profileCounts,
+    };
+    const lastTrace = state.lastTrace;
+    const activity = {
+      ordersToday: agents.reduce((sum, agent) => sum + (Number(agent.activity?.ordersToday) || 0), 0),
+      tradesTotal: agents.reduce((sum, agent) => sum + (Number(agent.activity?.trades) || 0), 0),
+      positionsTotal: agents.reduce((sum, agent) => sum + (Number(agent.activity?.positions) || 0), 0),
+      lastCycleExecutions: Array.isArray(lastTrace?.executions) ? lastTrace.executions.length : 0,
+      lastCycleOrders: Array.isArray(lastTrace?.executions)
+        ? lastTrace.executions.reduce((sum, execution) => sum + (Number(execution.orders) || 0), 0)
+        : 0,
+      activeProfiles: profileCounts,
+      haltReasons: haltReasons ?? [],
+      halted: Boolean(halted),
+    };
     return {
       at: new Date(clock.now()).toISOString(),
       mode: config.mode,
@@ -2012,6 +2396,9 @@ export async function createAutomaton(options = {}) {
         liveArmed: liveArmed(config),
         rewards: rewardsView,
         capitalAccounting,
+        performance,
+        aggression,
+        activity,
         research: {
           ...researcher.schedule(),
           configurable: {
@@ -2138,6 +2525,9 @@ export async function createAutomaton(options = {}) {
       },
       agents,
       strategyMix: strategyMixView,
+      performance,
+      aggression,
+      activity,
       rankings: rankingsView,
       rewards: rewardsView,
       obituaries: obituaryStats,

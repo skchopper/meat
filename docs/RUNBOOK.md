@@ -577,6 +577,62 @@ reward) → trading P&L **-$1.70**, not +$56.86.
   correctly skipped (`no_measured_trading_baseline`) rather than rewarded on reward-inflated equity; the
   next period ranked with trading baselines pays normally.
 
+## 8h. Why activity stalled and the v3.4 aggressive growth mode / 50% target
+
+**Root cause found (v3.4):** the paper engine was halted from 2026-11-17 with
+`reconciliation_mismatch`; every tick showed `executions: 0, orders: 0`. The reconciliation delta
+($50.39) exactly matched **$50.64 of cumulative virtual metabolism costs** (hosting/inference/data/
+research/agent reviews). Those costs are virtual only and the broker paper account never paid them, so
+the one-time anchor at 2026-10-24 left the virtual total below broker equity with no allowance. v3.4 adds
+`costsSinceAnchor` to the reconciliation expectation:
+
+```
+expected virtual total = allocated equity + treasury pool + virtual costs since anchor
+```
+
+Genuine unbooked-fill mismatches (positive or negative) beyond tolerance still halt; no agent cash or
+capital is minted. The external Reaper is unaffected. After the Host restart the first successful tick
+should show `halted: false`, `reconciliation.deltaUsd` inside tolerance (with
+`reconciliation.costsSinceAnchorUsd` ≈$50.7), and executions/orders resume with the 23 open positions
+managed normally.
+
+**Aggressive growth cohort (v3.4, live config):**
+
+```json
+"aggression": { "enabled": true, "aggressivePct": 0.40, "balancedPct": 0.45, "capitalMultiplier": 1.35 },
+"targets": { "enabled": true, "annualReturnPct": 0.50 },
+"risk": { "maxOpenPositions": 10, "maxOrderNotionalUsd": 60, "maxDailyOrders": 40,
+          "maxPositionPct": 0.6, "maxOrdersPerCycle": 4 },
+"account": { "allocationCapPct": 0.92 }
+```
+
+- Profiles are day-first: at 30 agents **12 aggressive** (all day), **13 balanced**, **5 conservative**.
+  Aggressive bots get basket 6/4 symbols, max open 8/5, 4 orders/cycle, lower entryZ (×0.7), larger size
+  (×1.35), tighter stops (×0.8), larger targets (×1.2), shorter holds (×0.75), and a 0.8 policy-size
+  floor with stand-down conversion (unless a research ALERT/risk veto fires). Balanced/conservative keep
+  or reduce v3.3 behavior. All profiles remain under the 18 brakes, cash/order/margin/options caps.
+- **Aggressive capital:** one-time top-up from the treasury pool toward 1.35× the base endowment, only
+  within the allocation cap; recorded as **contributed capital**, never P&L or reward. Live headroom at
+  0.92 is ~$261 and the top-up is ~$210; the pool falls to ~$160, so weekly reward capital shrinks until
+  winners rebuild it. This is the intended trade of reward pool for larger growth capital.
+- **Annual target:** `engine.performance` shows target 50%/yr, required daily pace (~0.111%/day),
+  annualized trading return since the v3.4 baseline, progress (100 = on target), and on-track flag.
+  The panel shows this in the header/KPI and Settings. **It is a target, not a guarantee.** Annualized
+  figures are hidden until at least one full day has elapsed; first-day/mark-to-market noise is not
+  meaningful. The target never increases order size automatically — aggression is a fixed cohort/config
+  and every risk cap still applies.
+- **Tuning:** raise `aggression.aggressivePct`/`capitalMultiplier` or reduce `entryZMultiplier` for more
+  turnover; raise `rewardBudgetPctOfPool` later when the pool refills; raise `account.allocationCapPct`
+  only if you accept more capital deployed. Lowering cash/order/position caps is the first place to cut
+  risk if drawdowns exceed tolerance. 50%/year with long-only paper and the current caps is ambitious;
+  more aggression increases both opportunity and loss/drawdown risk.
+- **What to check after the restart:** `engine.aggression.counts`
+  `{aggressive:12,balanced:13,conservative:5}`, aggressive `endowmentUsd` ≈$67.5 (plus any reward
+  capital), `aggression-v34.json`/`aggression-capital-v34.json`/`growth-v34.json` present, the halted
+  flag false, and `engine.activity.lastCycleOrders`/`ordersToday` rising. If reconciliation still reports
+  a mismatch, compare `deltaUsd` with `costsSinceAnchorUsd` and check for unbooked fills before raising
+  tolerances.
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

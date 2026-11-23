@@ -60,6 +60,10 @@ const SYSTEM_PROMPT = [
   'call (only if the bot owns 100+ shares), or a defined-risk vertical spread. Use the instrument',
   'that best fits the setup and is affordable in the provided INSTRUMENT CONTEXT; prefer options or',
   'short stock when they materially improve the risk/reward, otherwise stock or "auto".',
+  'Follow the bot\'s AGGRESSION profile: an aggressive growth bot should prefer taking valid setups,',
+  'size up within the stated risk limits, and only stand_down for a material risk alert in its own',
+  'briefing; balanced bots stay selective; conservative bots prioritize capital preservation. The',
+  'deterministic executor still enforces hard risk caps and brakes.',
   'Return ONE strict JSON object and nothing else:',
   '{"stance":"trade"|"cautious"|"stand_down",',
   ' "sizeMultiplier": number 0.2..1 (fraction of normal entry size; never above 1),',
@@ -306,6 +310,13 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     })();
     const sections = [
       `BOT: ${agent.name ?? agent.id} (id ${agent.id}, generation ${agent.generation ?? 0}, tier ${agent.tier ?? type.category})`,
+      `AGGRESSION: ${String(agent?.genome?.aggression ?? 'balanced').toUpperCase()} — ${
+        agent?.genome?.aggression === 'aggressive'
+          ? 'growth mandate: prefer valid setups and size up within risk limits; stand_down only for a material risk alert.'
+          : agent?.genome?.aggression === 'conservative'
+            ? 'capital-preservation mandate: be selective and keep size small.'
+            : 'selective mandate: take good setups, avoid forcing trades.'
+      }`,
       `BASKET: ${JSON.stringify(basket)} (the executor trades every symbol in this basket where its signal fires; you set the policy for the whole basket)`,
       `STRATEGY: ${type.typeLabel} managing ${basket.join(', ') || 'n/a'} (family ${agent?.genome?.family ?? 'unknown'})`,
       `GENOME: ${JSON.stringify(agent?.genome ?? {})}`,

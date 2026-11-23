@@ -46,8 +46,24 @@ window.__ModuleLoader__.load({
     const MAX_OBITUARIES = 8;
     const MODE_LABEL = { sim: 'SIM', paper: 'PAPER', live: 'LIVE' };
     const STATUS_FILTERS = ['all', 'alive', 'dead', 'condemned'];
-    const SORTABLE_KEYS = new Set(['name', 'generation', 'equityUsd', 'pnlUsd', 'rewardsUsd', 'runwayHours', 'dayPnlPct', 'status']);
+    const SORTABLE_KEYS = new Set(['name', 'aggression', 'generation', 'equityUsd', 'pnlUsd', 'rewardsUsd', 'runwayHours', 'dayPnlPct', 'status']);
     const FAMILY_LABELS = { momentum: 'Momentum', meanrev: 'MeanRev', breakout: 'Breakout', gapfade: 'GapFade' };
+    // v3.4 (docs/AGGRESSIVE-GROWTH.md §1/§3): three fixed aggression profiles and the
+    // 50%/yr return target. Profile order is also the deterministic cohort sort order.
+    const AGGRESSION_KEYS = ['aggressive', 'balanced', 'conservative'];
+    const AGGRESSION_RANK = Object.freeze({ aggressive: 0, balanced: 1, conservative: 2 });
+    const AGGRESSION_LABEL_KEYS = Object.freeze({
+      aggressive: 'aggressionAggressive',
+      balanced: 'aggressionBalanced',
+      conservative: 'aggressionConservative',
+    });
+    const AGGRESSION_SHORT_LABEL_KEYS = Object.freeze({
+      aggressive: 'aggressionShortAggressive',
+      balanced: 'aggressionShortBalanced',
+      conservative: 'aggressionShortConservative',
+    });
+    const DEFAULT_TARGET_ANNUAL_RETURN_PCT = 0.5;
+    const DAYS_PER_YEAR = 365;
 
     // -----------------------------------------------------------------------
     // locale (inline dictionaries; EN is the fallback)
@@ -499,6 +515,72 @@ window.__ModuleLoader__.load({
       kpiLifetime: 'lifetime',
       lbTradingNote: 'ranked on trading P&L — reward capital excluded',
       rewardLegacyRanking: 'legacy rankings only — no trading baseline reported yet',
+      // v3.4 — annual return target + aggressive growth cohort (docs/AGGRESSIVE-GROWTH.md §5)
+      annualTarget: 'Annual return target',
+      annualTargetSub: 'on account capital',
+      annualTargetNotGuarantee: 'Target, not guarantee',
+      annualTargetDailyPace: 'Required daily pace',
+      annualTargetHint: 'The 50%/yr target is an ambition, not a promise: it never increases risk and never overrides the 18 hard brakes or the account risk caps. Trading P&L only — aggressive capital top-ups are contributed capital, never profit.',
+      annualizedTradingReturn: 'Annualized trading return',
+      annualizedShortHistory: 'short history (< 1 day)',
+      targetProgressLabel: 'Target progress',
+      targetProgressShort: 'progress',
+      targetPaceLabel: 'Pace vs target',
+      targetOnTrack: 'on pace',
+      targetBehind: 'behind pace',
+      targetUnknown: 'no measured baseline yet',
+      tradingPnlSinceBaseline: 'Trading P&L since baseline',
+      accountCapitalBase: 'Account capital base',
+      tradingPnlTotalLabel: 'Trading P&L total',
+      baselineEquity: 'Baseline equity',
+      baselineAtLabel: 'Baseline set',
+      daysElapsedLabel: 'Days elapsed',
+      requiredTradingPnl: 'Required P&L to be on pace',
+      performanceLegacyNote: 'Legacy snapshot: the engine has not reported the v3.4 return target yet — showing the default 50% target with no annualized return.',
+      aggression: 'Aggression',
+      aggressionTableHint: 'Growth cohort profile — profile limits are ceilings only; all 18 brakes still apply',
+      aggressionAggressive: 'Aggressive',
+      aggressionBalanced: 'Balanced',
+      aggressionConservative: 'Conservative',
+      aggressionShortAggressive: 'A',
+      aggressionShortBalanced: 'B',
+      aggressionShortConservative: 'C',
+      aggressionUnknown: '—',
+      aggressionCohort: 'Aggression cohort',
+      aggressionCohortHint: 'fixed growth cohort: aggressive / balanced / conservative',
+      aggressionFilterAll: 'All profiles',
+      aggressionProfileTitle: 'Aggression profile',
+      aggressionLimits: 'Profile limits',
+      aggressionNoLimits: 'The engine has not reported aggression profile limits yet.',
+      aggressionBasketDay: 'Basket (day)',
+      aggressionBasketSwing: 'Basket (swing)',
+      aggressionMaxOpenDay: 'Max open (day)',
+      aggressionMaxOpenSwing: 'Max open (swing)',
+      aggressionMaxOrdersPerCycle: 'Orders / cycle',
+      aggressionEntryZMultiplier: 'Entry-Z multiplier',
+      aggressionSizePctMultiplier: 'Size multiplier',
+      aggressionStopPctMultiplier: 'Stop multiplier',
+      aggressionTargetPctMultiplier: 'Target multiplier',
+      aggressionMaxHoldBarsMultiplier: 'Max-hold multiplier',
+      aggressionPolicySizeFloor: 'Policy size floor',
+      aggressionRespectStandDown: 'Stand-down policy',
+      aggressionStandDownRespected: 'respects stand-down',
+      aggressionStandDownBypass: 'cautious at size floor',
+      aggressionCapitalMultiplier: 'Aggressive capital multiplier',
+      aggressionCapitalNote: 'Aggressive cohort top-ups are contributed capital, not P&L and not rewards.',
+      aggressionCapitalContributed: 'Aggressive capital (contributed)',
+      aggressionActivity: 'Agent activity',
+      aggressionActivityOrdersToday: 'Orders today',
+      aggressionActivityTrades: 'Trades',
+      aggressionActivityPositions: 'Open positions',
+      aggressionActivityActive: 'Active profiles',
+      aggressionActivityExecutions: 'Executions (last cycle)',
+      aggressionActivityOrders: 'Orders (last cycle)',
+      aggressionActivityTradesTotal: 'Trades since start',
+      aggressionActivityHaltReasons: 'Halt reasons',
+      engineActivity: 'Trading activity',
+      aggressionDisabled: 'aggression profiles disabled',
+      aggressionNone: 'none',
     };
 
     const ZH = {
@@ -947,6 +1029,72 @@ window.__ModuleLoader__.load({
       kpiLifetime: '累计',
       lbTradingNote: '按交易盈亏排名 —— 不含奖励资本',
       rewardLegacyRanking: '旧版排名 —— 尚无交易基线',
+      // v3.4 —— 年度收益目标与激进增长组
+      annualTarget: '年度收益目标',
+      annualTargetSub: '按账户资本计算',
+      annualTargetNotGuarantee: '目标，非保证',
+      annualTargetDailyPace: '所需日进度',
+      annualTargetHint: '50%/年 是进取目标而非承诺：它绝不会提高风险，也不会绕过 18 条硬制动或账户风控上限。仅统计交易盈亏 —— 激进组追加资金属于投入资本，不是利润。',
+      annualizedTradingReturn: '年化交易回报',
+      annualizedShortHistory: '历史不足（< 1 天）',
+      targetProgressLabel: '目标进度',
+      targetProgressShort: '进度',
+      targetPaceLabel: '相对目标进度',
+      targetOnTrack: '符合进度',
+      targetBehind: '落后进度',
+      targetUnknown: '尚无可用基线',
+      tradingPnlSinceBaseline: '基线以来交易盈亏',
+      accountCapitalBase: '账户资本基数',
+      tradingPnlTotalLabel: '交易盈亏合计',
+      baselineEquity: '基线权益',
+      baselineAtLabel: '基线设定',
+      daysElapsedLabel: '已过天数',
+      requiredTradingPnl: '达标所需盈亏',
+      performanceLegacyNote: '旧版快照：引擎尚未上报 v3.4 收益目标 —— 显示默认 50% 目标，暂无年化回报。',
+      aggression: '进取等级',
+      aggressionTableHint: '增长分组档案 —— 档案上限仅为天花板，18 条硬制动仍然生效',
+      aggressionAggressive: '激进',
+      aggressionBalanced: '均衡',
+      aggressionConservative: '保守',
+      aggressionShortAggressive: 'A',
+      aggressionShortBalanced: 'B',
+      aggressionShortConservative: 'C',
+      aggressionUnknown: '—',
+      aggressionCohort: '进取分组',
+      aggressionCohortHint: '固定增长分组：激进 / 均衡 / 保守',
+      aggressionFilterAll: '全部分组',
+      aggressionProfileTitle: '进取档案',
+      aggressionLimits: '档案上限',
+      aggressionNoLimits: '引擎尚未上报进取档案上限。',
+      aggressionBasketDay: '篮子（日内）',
+      aggressionBasketSwing: '篮子（波段）',
+      aggressionMaxOpenDay: '最大持仓（日内）',
+      aggressionMaxOpenSwing: '最大持仓（波段）',
+      aggressionMaxOrdersPerCycle: '每周期订单',
+      aggressionEntryZMultiplier: '入场 Z 倍率',
+      aggressionSizePctMultiplier: '仓位倍率',
+      aggressionStopPctMultiplier: '止损倍率',
+      aggressionTargetPctMultiplier: '目标倍率',
+      aggressionMaxHoldBarsMultiplier: '最长持仓倍率',
+      aggressionPolicySizeFloor: '政策仓位下限',
+      aggressionRespectStandDown: '观望政策',
+      aggressionStandDownRespected: '遵守观望',
+      aggressionStandDownBypass: '按下限谨慎入场',
+      aggressionCapitalMultiplier: '激进资本倍率',
+      aggressionCapitalNote: '激进组追加资金属于投入资本，不计入盈亏，也不是奖励。',
+      aggressionCapitalContributed: '激进资本（已投入）',
+      aggressionActivity: '个体活动',
+      aggressionActivityOrdersToday: '今日订单',
+      aggressionActivityTrades: '成交',
+      aggressionActivityPositions: '持仓',
+      aggressionActivityActive: '活跃分组',
+      aggressionActivityExecutions: '上周期成交',
+      aggressionActivityOrders: '上周期订单',
+      aggressionActivityTradesTotal: '启动以来成交',
+      aggressionActivityHaltReasons: '暂停原因',
+      engineActivity: '交易活动',
+      aggressionDisabled: '进取档案已禁用',
+      aggressionNone: '无',
     };
 
     /** Bind the Client locale service; fall back to the bundled English dictionary. */
@@ -2266,6 +2414,444 @@ window.__ModuleLoader__.load({
     }
 
     // -----------------------------------------------------------------------
+    // v3.4 annual return target + aggressive growth cohort
+    // (docs/AGGRESSIVE-GROWTH.md §3/§5; backend contract in task-29)
+    //
+    // The 50%/yr target is an AMBITION, never an order override and never a
+    // guarantee. Annualized trading return = trading P&L since the one-time
+    // baseline / baseline account equity × 365 / days elapsed; a short history
+    // (< 1 day) reports nulls instead of a fabricated rate. Aggressive-cohort
+    // capital top-ups are capital contributions, so they are excluded from every
+    // P&L number below. Every helper degrades to the old snapshot shape.
+    // -----------------------------------------------------------------------
+
+    /** Normalize a raw aggression value to a known profile key (null when unknown). */
+    function normalizeAggression(value) {
+      const text = String(value ?? '').trim().toLowerCase();
+      return AGGRESSION_KEYS.includes(text) ? text : null;
+    }
+
+    /**
+     * Profile badge for the agent table/detail: Aggressive/Balanced/Conservative, or
+     * a neutral unknown badge for legacy snapshots that carry no `agent.aggression`.
+     * @param {string|null|undefined} value 'aggressive' | 'balanced' | 'conservative'
+     */
+    function aggressionBadge(value) {
+      const key = normalizeAggression(value);
+      if (key === null) {
+        return { key: 'unknown', aggression: null, labelKey: 'aggressionUnknown', label: '—', tone: 'none', known: false, rank: null };
+      }
+      return {
+        key,
+        aggression: key,
+        labelKey: AGGRESSION_LABEL_KEYS[key],
+        label: EN[AGGRESSION_LABEL_KEYS[key]],
+        tone: key,
+        known: true,
+        rank: AGGRESSION_RANK[key],
+      };
+    }
+
+    /** Signed percent points from a fraction, e.g. 0.42 → "+42.0%" ('' → '—'). */
+    function fmtRatioPct(ratio, digits = 1) {
+      const number = toNumber(ratio);
+      if (number === null) return '—';
+      const points = number * 100;
+      const sign = points > 0 ? '+' : points < 0 ? '−' : '';
+      return `${sign}${Math.abs(points).toFixed(digits)}%`;
+    }
+
+    /** Profile-limit fields rendered in the agent detail (basket sizes, caps, multipliers). */
+    const AGGRESSION_LIMIT_FIELDS = Object.freeze([
+      { key: 'basketSizeDay', labelKey: 'aggressionBasketDay', kind: 'int' },
+      { key: 'basketSizeSwing', labelKey: 'aggressionBasketSwing', kind: 'int' },
+      { key: 'maxOpenPositionsDay', labelKey: 'aggressionMaxOpenDay', kind: 'int' },
+      { key: 'maxOpenPositionsSwing', labelKey: 'aggressionMaxOpenSwing', kind: 'int' },
+      { key: 'maxOrdersPerCycle', labelKey: 'aggressionMaxOrdersPerCycle', kind: 'int' },
+      { key: 'entryZMultiplier', labelKey: 'aggressionEntryZMultiplier', kind: 'multiplier' },
+      { key: 'sizePctMultiplier', labelKey: 'aggressionSizePctMultiplier', kind: 'multiplier' },
+      { key: 'stopPctMultiplier', labelKey: 'aggressionStopPctMultiplier', kind: 'multiplier' },
+      { key: 'targetPctMultiplier', labelKey: 'aggressionTargetPctMultiplier', kind: 'multiplier' },
+      { key: 'maxHoldBarsMultiplier', labelKey: 'aggressionMaxHoldBarsMultiplier', kind: 'multiplier' },
+      { key: 'policySizeFloor', labelKey: 'aggressionPolicySizeFloor', kind: 'fraction' },
+      { key: 'respectStandDown', labelKey: 'aggressionRespectStandDown', kind: 'standdown' },
+    ]);
+
+    /**
+     * Normalized aggression-profile limits (`agent.aggressionProfile` /
+     * `engine.aggression.profiles[name]`). Render-ready `items` carry a locale
+     * labelKey and either a formatted `text` or a `displayKey` (stand-down policy).
+     */
+    function aggressionProfileView(profile) {
+      const raw = plainObject(profile);
+      const hasLimits = AGGRESSION_LIMIT_FIELDS.some((field) => raw[field.key] !== undefined && raw[field.key] !== null);
+      const items = [];
+      for (const field of AGGRESSION_LIMIT_FIELDS) {
+        const rawValue = raw[field.key];
+        let text = null;
+        let displayKey = null;
+        if (field.kind === 'standdown') {
+          if (typeof rawValue === 'boolean') {
+            displayKey = rawValue ? 'aggressionStandDownRespected' : 'aggressionStandDownBypass';
+          }
+        } else {
+          const number = toNumber(rawValue);
+          if (number !== null) {
+            if (field.kind === 'int') text = fmtNum(number);
+            else if (field.kind === 'multiplier') text = `×${number.toFixed(2)}`;
+            else if (field.kind === 'fraction') text = `${Math.round(number * 100)}%`;
+          }
+        }
+        if (text === null && displayKey === null) continue;
+        items.push({ key: field.key, labelKey: field.labelKey, kind: field.kind, value: field.kind === 'standdown' ? rawValue : toNumber(rawValue), displayKey, text });
+      }
+      const standDownPolicy = typeof raw.respectStandDown === 'boolean'
+        ? (raw.respectStandDown ? 'respect' : 'cautious-floor')
+        : null;
+      return {
+        available: hasLimits,
+        hasLimits,
+        profile: raw,
+        limits: raw,
+        items,
+        standDownPolicy,
+      };
+    }
+
+    /** Per-agent aggression projection: key, badge and profile limits (detail block). */
+    function agentAggressionView(agent) {
+      const safeAgent = plainObject(agent);
+      const genome = plainObject(safeAgent.genome);
+      const rawAggression = safeAgent.aggression !== undefined && safeAgent.aggression !== null
+        ? safeAgent.aggression
+        : genome.aggression;
+      const badge = aggressionBadge(rawAggression);
+      const rawProfile = safeAgent.aggressionProfile ?? safeAgent.aggressionLimits ?? genome.aggressionProfile;
+      const profile = aggressionProfileView(rawProfile);
+      const capital = plainObject(safeAgent.capital);
+      const aggressiveCapitalUsd = firstNumber(
+        capital.aggressiveCapitalUsd,
+        capital.growthCapitalUsd,
+        capital.topUpUsd,
+        safeAgent.aggressiveCapitalUsd,
+      );
+      return {
+        available: badge.known || profile.available,
+        aggression: badge.aggression,
+        badge,
+        profile,
+        limits: profile.items,
+        aggressiveCapitalUsd,
+      };
+    }
+
+    /** Per-agent activity stats (`agent.activity`, with trades/positions fallbacks). */
+    function agentActivityView(agent) {
+      const safeAgent = plainObject(agent);
+      const raw = plainObject(safeAgent.activity);
+      const recentTrades = Array.isArray(safeAgent.recentTrades) ? safeAgent.recentTrades : [];
+      const positions = Array.isArray(safeAgent.positions) ? safeAgent.positions : [];
+      const ordersToday = toNumber(raw.ordersToday);
+      const trades = firstNumber(raw.trades, safeAgent.tradesCount, recentTrades.length);
+      const positionCount = firstNumber(raw.positions, safeAgent.positionCount, positions.length);
+      return {
+        available: Object.keys(raw).length > 0,
+        reported: Object.keys(raw).length > 0,
+        ordersToday,
+        trades,
+        positions: positionCount,
+        ordersTodayText: fmtNum(ordersToday),
+        tradesText: fmtNum(trades),
+        positionsText: fmtNum(positionCount),
+      };
+    }
+
+    /**
+     * Cohort counts + config summary (`engine.aggression`), falling back to the
+     * per-agent `aggression` fields on old/partial snapshots. Accepts a status
+     * payload or an array of built agent rows.
+     */
+    function profileCounts(source) {
+      const isList = Array.isArray(source);
+      const status = isList ? null : plainObject(source);
+      const agents = isList ? source : (Array.isArray(status?.agents) ? status.agents : []);
+      const engineAggression = plainObject(plainObject(status?.engine).aggression);
+      const reportedCounts = plainObject(engineAggression.counts);
+      const derived = { aggressive: 0, balanced: 0, conservative: 0, unknown: 0 };
+      for (const agent of agents) {
+        const key = normalizeAggression(agent?.aggression ?? plainObject(agent?.genome).aggression);
+        if (key === null) derived.unknown += 1;
+        else derived[key] += 1;
+      }
+      const counts = {
+        aggressive: toNumber(reportedCounts.aggressive) ?? derived.aggressive,
+        balanced: toNumber(reportedCounts.balanced) ?? derived.balanced,
+        conservative: toNumber(reportedCounts.conservative) ?? derived.conservative,
+        unknown: toNumber(reportedCounts.unknown) ?? derived.unknown,
+      };
+      const reported = Object.keys(engineAggression).length > 0;
+      const derivedAny = derived.aggressive + derived.balanced + derived.conservative > 0;
+      const total = toNumber(engineAggression.total)
+        ?? (agents.length > 0 ? agents.length : counts.aggressive + counts.balanced + counts.conservative + counts.unknown);
+      const rows = AGGRESSION_KEYS.map((key) => {
+        const count = counts[key];
+        const pct = total > 0 ? count / total : null;
+        return {
+          key,
+          labelKey: AGGRESSION_LABEL_KEYS[key],
+          label: EN[AGGRESSION_LABEL_KEYS[key]],
+          count,
+          pct,
+          pctText: pct === null ? '—' : `${Math.round(pct * 100)}%`,
+        };
+      });
+      const profiles = {};
+      for (const key of AGGRESSION_KEYS) {
+        profiles[key] = aggressionProfileView(plainObject(engineAggression.profiles)[key]);
+      }
+      return {
+        available: reported || derivedAny,
+        reported,
+        legacy: !reported,
+        enabled: typeof engineAggression.enabled === 'boolean' ? engineAggression.enabled : null,
+        aggressivePct: toNumber(engineAggression.aggressivePct),
+        balancedPct: toNumber(engineAggression.balancedPct),
+        capitalMultiplier: toNumber(engineAggression.capitalMultiplier),
+        counts,
+        total,
+        rows,
+        profiles,
+      };
+    }
+
+    /**
+     * Engine-level activity summary (`engine.activity`) with fallbacks: today's
+     * orders / trades sum from the agent rows and executions/orders from the last
+     * cycle. Never throws, never fabricates a rate.
+     */
+    function activityView(status) {
+      const source = plainObject(status);
+      const engine = plainObject(source.engine);
+      const raw = plainObject(engine.activity);
+      const lastCycle = plainObject(engine.lastCycle);
+      const agents = Array.isArray(source.agents) ? source.agents : [];
+      let ordersFromAgents = null;
+      let tradesFromAgents = null;
+      let positionsFromAgents = null;
+      const profiles = new Set();
+      for (const agent of agents) {
+        const activity = agentActivityView(agent);
+        if (activity.ordersToday !== null) ordersFromAgents = (ordersFromAgents ?? 0) + activity.ordersToday;
+        if (activity.trades !== null) tradesFromAgents = (tradesFromAgents ?? 0) + activity.trades;
+        if (activity.positions !== null) positionsFromAgents = (positionsFromAgents ?? 0) + activity.positions;
+        const key = normalizeAggression(agent?.aggression ?? plainObject(agent?.genome).aggression);
+        if (key !== null) profiles.add(key);
+      }
+      const normalizeList = (list) => (Array.isArray(list) ? list.map((value) => normalizeAggression(value)).filter((value) => value !== null) : []);
+      // The engine reports `activeProfiles` as a counts object
+      // ({aggressive, balanced, conservative}); older/alternate payloads may send an
+      // array of names — both are accepted, defaulting to the profiles present.
+      let activeProfiles;
+      if (Array.isArray(raw.activeProfiles)) {
+        activeProfiles = normalizeList(raw.activeProfiles);
+      } else if (raw.activeProfiles !== null && typeof raw.activeProfiles === 'object') {
+        const counts = plainObject(raw.activeProfiles);
+        activeProfiles = AGGRESSION_KEYS.filter((key) => (toNumber(counts[key]) ?? 0) > 0);
+      } else {
+        activeProfiles = AGGRESSION_KEYS.filter((key) => profiles.has(key));
+      }
+      const haltReasons = Array.isArray(raw.haltReasons)
+        ? raw.haltReasons.filter((reason) => typeof reason === 'string' && reason.length > 0)
+        : (Array.isArray(source.haltReasons) ? source.haltReasons.filter((reason) => typeof reason === 'string') : []);
+      const ordersToday = firstNumber(raw.ordersToday, ordersFromAgents);
+      const tradesTotal = firstNumber(raw.tradesTotal, tradesFromAgents);
+      const lastCycleExecutions = firstNumber(raw.lastCycleExecutions, lastCycle.executions);
+      const lastCycleOrders = firstNumber(raw.lastCycleOrders, lastCycle.orders);
+      const positionsTotal = firstNumber(raw.positionsTotal, positionsFromAgents);
+      return {
+        available: Object.keys(raw).length > 0,
+        reported: Object.keys(raw).length > 0,
+        ordersToday,
+        tradesTotal,
+        lastCycleExecutions,
+        lastCycleOrders,
+        activeProfiles,
+        activeProfileBadges: activeProfiles.map((key) => aggressionBadge(key)),
+        haltReasons,
+        halted: typeof raw.halted === 'boolean' ? raw.halted : null,
+        positionsTotal,
+        ordersTodayText: fmtNum(ordersToday),
+        tradesTotalText: fmtNum(tradesTotal),
+        lastCycleExecutionsText: fmtNum(lastCycleExecutions),
+        lastCycleOrdersText: fmtNum(lastCycleOrders),
+        positionsTotalText: fmtNum(positionsTotal),
+      };
+    }
+
+    /**
+     * Annual-return-target projection (`engine.performance` / top-level
+     * `performance`, v3.4 §3). Derived values are computed only when the engine
+     * omits them; a history shorter than one day reports null annualized return
+     * (never a fabricated annualization). Reward capital is excluded: the trading
+     * P&L totals come from the fair v3.3 accounting, and aggressive top-ups are
+     * capital contributions rather than P&L.
+     *
+     * @param {object|null} status GET /automaton/state payload
+     * @returns {object} render-ready view; always safe for legacy snapshots
+     */
+    function performanceView(status) {
+      const source = plainObject(status);
+      const engine = plainObject(source.engine);
+      const enginePerformance = plainObject(engine.performance);
+      const topLevelPerformance = plainObject(source.performance);
+      const raw = Object.keys(enginePerformance).length > 0 ? enginePerformance : topLevelPerformance;
+      const reported = Object.keys(raw).length > 0;
+      const account = plainObject(source.account);
+      const limits = plainObject(source.limits);
+      const totals = portfolioPnlTotals(source);
+
+      const rawTarget = toNumber(raw.targetAnnualReturnPct);
+      const targetAnnualReturnPct = rawTarget !== null && rawTarget > 0 ? rawTarget : DEFAULT_TARGET_ANNUAL_RETURN_PCT;
+      const requiredDailyReturnPct = firstNumber(
+        raw.requiredDailyReturnPct,
+        Math.pow(1 + targetAnnualReturnPct, 1 / DAYS_PER_YEAR) - 1,
+      );
+      const baselineAt = typeof raw.baselineAt === 'string' && raw.baselineAt.length > 0 ? raw.baselineAt : null;
+      const baselineAccountEquityUsd = toNumber(raw.baselineAccountEquityUsd);
+      const baselineTradingPnlUsd = toNumber(raw.baselineTradingPnlUsd);
+      const tradingPnlTotalUsd = firstNumber(raw.tradingPnlTotalUsd, totals.tradingPnlTotalUsd);
+      let daysElapsed = toNumber(raw.daysElapsed);
+      if (daysElapsed === null && baselineAt !== null) {
+        const baselineMs = Date.parse(baselineAt);
+        if (Number.isFinite(baselineMs)) daysElapsed = Math.max(0, (Date.now() - baselineMs) / 86400000);
+      }
+      let tradingPnlSinceBaselineUsd = toNumber(raw.tradingPnlSinceBaselineUsd);
+      if (tradingPnlSinceBaselineUsd === null && tradingPnlTotalUsd !== null && baselineTradingPnlUsd !== null) {
+        tradingPnlSinceBaselineUsd = round2(tradingPnlTotalUsd - baselineTradingPnlUsd);
+      }
+      let annualizedReturnPct = toNumber(raw.annualizedReturnPct);
+      let shortHistory = false;
+      const canAnnualize = tradingPnlSinceBaselineUsd !== null
+        && baselineAccountEquityUsd !== null
+        && baselineAccountEquityUsd > 0
+        && daysElapsed !== null;
+      if (annualizedReturnPct === null) {
+        if (canAnnualize && daysElapsed >= 1) {
+          annualizedReturnPct = (tradingPnlSinceBaselineUsd / baselineAccountEquityUsd) * (DAYS_PER_YEAR / daysElapsed);
+        } else if (daysElapsed !== null && daysElapsed < 1) {
+          shortHistory = true;
+        }
+      }
+      let targetProgressPct = toNumber(raw.targetProgressPct);
+      const progressFromAnnualized = annualizedReturnPct !== null && targetAnnualReturnPct > 0
+        ? annualizedReturnPct / targetAnnualReturnPct
+        : null;
+      if (targetProgressPct !== null) {
+        // The engine reports `targetProgressPct` as percent points (100 = on target,
+        // docs/AGGRESSIVE-GROWTH.md §3) while the UI works in fractions: accept both
+        // units by matching the value against the measured annualized ratio.
+        if (progressFromAnnualized !== null) {
+          const asPoints = progressFromAnnualized * 100;
+          targetProgressPct = Math.abs(targetProgressPct - progressFromAnnualized) <= Math.abs(targetProgressPct - asPoints)
+            ? targetProgressPct
+            : targetProgressPct / 100;
+        } else if (targetProgressPct > 5) {
+          targetProgressPct /= 100;
+        }
+      } else if (progressFromAnnualized !== null) {
+        targetProgressPct = progressFromAnnualized;
+      }
+      const requiredTradingPnlUsd = baselineAccountEquityUsd !== null && baselineAccountEquityUsd > 0 && daysElapsed !== null
+        ? round2(baselineAccountEquityUsd * (Math.pow(1 + targetAnnualReturnPct, daysElapsed / DAYS_PER_YEAR) - 1))
+        : null;
+      const paceRatio = requiredTradingPnlUsd !== null && requiredTradingPnlUsd > 0 && tradingPnlSinceBaselineUsd !== null
+        ? tradingPnlSinceBaselineUsd / requiredTradingPnlUsd
+        : null;
+      const reportedOnTrack = typeof raw.onTrack === 'boolean' ? raw.onTrack : null;
+      // Pace never invents an on-track verdict while the history is too short to
+      // annualize: on-track is only derived from the measured target progress.
+      const onTrack = reportedOnTrack !== null
+        ? reportedOnTrack
+        : (targetProgressPct === null ? null : targetProgressPct >= 1);
+      const accountEquityUsd = firstNumber(raw.accountEquityUsd, account.equityUsd);
+      const accountCapitalBase = firstNumber(
+        raw.accountCapitalBase,
+        raw.accountCapitalBaseUsd,
+        baselineAccountEquityUsd,
+        limits.allocationCapUsd,
+        accountEquityUsd,
+      );
+      return {
+        isPerformanceView: true,
+        available: reported,
+        reported,
+        legacy: !reported,
+        enabled: typeof raw.enabled === 'boolean' ? raw.enabled : null,
+        targetAnnualReturnPct,
+        targetAnnualReturnPctPoints: targetAnnualReturnPct * 100,
+        targetAnnualReturnText: `${(targetAnnualReturnPct * 100).toFixed(0)}%`,
+        requiredDailyReturnPct,
+        requiredDailyReturnText: `${(requiredDailyReturnPct * 100).toFixed(3)}%/day`,
+        baselineAt,
+        baselineAccountEquityUsd,
+        baselineAccountEquityText: fmtUsd(baselineAccountEquityUsd),
+        baselineTradingPnlUsd,
+        daysElapsed,
+        daysElapsedText: daysElapsed === null
+          ? '—'
+          : daysElapsed >= 10 ? fmtNum(Math.round(daysElapsed)) : `${Math.round(daysElapsed * 10) / 10}`,
+        tradingPnlSinceBaselineUsd,
+        tradingPnlSinceBaselineText: fmtSignedUsd(tradingPnlSinceBaselineUsd),
+        annualizedReturnPct,
+        annualizedReturnText: annualizedReturnPct === null ? '—' : fmtRatioPct(annualizedReturnPct, 1),
+        annualizedShortHistory: shortHistory,
+        targetProgressPct,
+        targetProgressText: targetProgressPct === null ? '—' : `${Math.round(targetProgressPct * 100)}%`,
+        requiredTradingPnlUsd,
+        requiredTradingPnlText: fmtSignedUsd(requiredTradingPnlUsd),
+        paceRatio,
+        paceText: paceRatio === null ? '—' : `${Math.round(paceRatio * 100)}%`,
+        onTrack,
+        onTrackLabelKey: onTrack === null ? 'targetUnknown' : onTrack ? 'targetOnTrack' : 'targetBehind',
+        accountEquityUsd,
+        accountEquityText: fmtUsd(accountEquityUsd),
+        accountCapitalBase,
+        accountCapitalBaseText: fmtUsd(accountCapitalBase),
+        tradingPnlTotalUsd,
+        tradingPnlTotalText: fmtSignedUsd(tradingPnlTotalUsd),
+        notGuarantee: true,
+        noteKey: reported ? 'annualTargetHint' : 'performanceLegacyNote',
+      };
+    }
+
+    /** Compact target projection for the annual-target card / header pill. */
+    function targetProgress(input) {
+      const candidate = plainObject(input);
+      const view = candidate.isPerformanceView === true ? candidate : performanceView(candidate);
+      return {
+        targetAnnualReturnPct: view.targetAnnualReturnPct,
+        targetAnnualReturnText: view.targetAnnualReturnText,
+        annualizedReturnPct: view.annualizedReturnPct,
+        annualizedReturnText: view.annualizedReturnText,
+        targetProgressPct: view.targetProgressPct,
+        targetProgressText: view.targetProgressText,
+        requiredDailyReturnPct: view.requiredDailyReturnPct,
+        requiredDailyReturnText: view.requiredDailyReturnText,
+        requiredTradingPnlUsd: view.requiredTradingPnlUsd,
+        requiredTradingPnlText: view.requiredTradingPnlText,
+        paceRatio: view.paceRatio,
+        paceText: view.paceText,
+        onTrack: view.onTrack,
+        onTrackLabelKey: view.onTrackLabelKey,
+        shortHistory: view.annualizedShortHistory,
+        daysElapsed: view.daysElapsed,
+        baselineAccountEquityUsd: view.baselineAccountEquityUsd,
+        tradingPnlSinceBaselineUsd: view.tradingPnlSinceBaselineUsd,
+        accountEquityUsd: view.accountEquityUsd,
+      };
+    }
+
+    // -----------------------------------------------------------------------
     // strategy taxonomy + per-bot agent brain (docs/BOT-AGENTS.md)
     // -----------------------------------------------------------------------
 
@@ -3033,6 +3619,8 @@ window.__ModuleLoader__.load({
         const rankBadges = agentRankingBadges(safeAgent.rankings);
         const strategy = agentStrategyMapping(safeAgent);
         const policy = botAgentPolicyMapping(safeAgent.policy);
+        const aggression = agentAggressionView(safeAgent);
+        const activityStats = agentActivityView(safeAgent);
         const parentId = safeAgent.parentId ? String(safeAgent.parentId) : null;
         const mutation = plainObject(safeAgent.mutation);
         const hasMutation = Object.keys(mutation).length > 0;
@@ -3122,6 +3710,14 @@ window.__ModuleLoader__.load({
           policy,
           roleCosts,
           roleCostsTotal,
+          // v3.4 growth cohort: profile badge + limits, per-agent activity stats.
+          // `aggression` is null on legacy snapshots (rendered as a neutral badge).
+          aggression: aggression.aggression,
+          aggressionBadge: aggression.badge,
+          aggressionProfile: aggression.profile,
+          aggressionLimits: aggression.profile.items,
+          aggressiveCapitalUsd: aggression.aggressiveCapitalUsd,
+          activityStats,
         };
       });
     }
@@ -3198,6 +3794,10 @@ window.__ModuleLoader__.load({
         ),
         brokerCapability: instrumentsCapabilityWarning(engine.instruments ?? status?.instruments ?? null),
         control: status?.control ?? null,
+        // v3.4: annual return target + aggressive growth cohort + activity summary.
+        performance: performanceView(status),
+        aggression: profileCounts(status),
+        activity: activityView(status),
       };
     }
 
@@ -3258,6 +3858,8 @@ window.__ModuleLoader__.load({
       const valueOf = (row) => {
         if (key === 'name') return String(row.name ?? '');
         if (key === 'status') return String(row.status ?? '');
+        // v3.4: aggression sorts by cohort rank (aggressive → conservative), unknown last.
+        if (key === 'aggression') return AGGRESSION_RANK[normalizeAggression(row.aggression)] ?? null;
         if (key === 'generation') return row.generation;
         return row[key];
       };
@@ -3276,12 +3878,21 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /** v3.4 profile-filter rows (aggressive / balanced / conservative / all). */
+    function filterRowsByAggression(rows, profile = 'all') {
+      const wanted = normalizeAggression(profile);
+      if (wanted === null) return [...(Array.isArray(rows) ? rows : [])];
+      return (Array.isArray(rows) ? rows : []).filter((row) => normalizeAggression(row?.aggression) === wanted);
+    }
+
     /** Status filter + text search over the built rows (names and ids both searchable). */
-    function filterAgentRows(rows, filter = 'all', query = '') {
+    function filterAgentRows(rows, filter = 'all', query = '', profile = 'all') {
       const wanted = STATUS_FILTERS.includes(filter) ? filter : 'all';
+      const wantedProfile = normalizeAggression(profile);
       const text = String(query ?? '').trim().toLowerCase();
       return rows.filter((row) => {
         if (wanted !== 'all' && row.status !== wanted) return false;
+        if (wantedProfile !== null && normalizeAggression(row.aggression) !== wantedProfile) return false;
         if (text.length === 0) return true;
         const haystack = [
           row.name,
@@ -4244,6 +4855,42 @@ window.__ModuleLoader__.load({
 .atm-close{font:inherit;font-size:13px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:6px;padding:0 7px;cursor:pointer}
 .atm-close:hover{color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-interactive-bg-hover,transparent)}
 .atm-icon{display:block}
+/* v3.4 — annual return target card + aggressive growth cohort */
+.atm-target-card{display:flex;flex-direction:column;gap:6px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:12px;padding:9px 12px;background:var(--dsw-alias-bg-l2,transparent);border-left:3px solid var(--dsw-alias-state-business-primary,currentColor)}
+.atm-target-card[data-ontrack="false"]{border-left-color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-error-primary,currentColor))}
+.atm-target-card[data-ontrack="unknown"]{border-left-color:var(--dsw-alias-border-l2,currentColor)}
+.atm-target-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.atm-target-titles{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;min-width:0}
+.atm-target-label{font-size:11.5px;font-weight:600;line-height:17px;color:var(--dsw-alias-label-tertiary,inherit);text-transform:uppercase;letter-spacing:.04em}
+.atm-target-value{font-size:24px;font-weight:700;line-height:28px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-target-sub{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-target-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.atm-target-caveat{display:inline-flex;align-items:center;border:.5px dashed var(--dsw-alias-state-warning-primary,var(--dsw-alias-border-l2,currentColor));border-radius:999px;padding:0 8px;font-size:10px;line-height:17px;letter-spacing:.03em;text-transform:uppercase;color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit));white-space:nowrap}
+.atm-target-status{display:inline-flex;align-items:center;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 8px;font-size:10px;line-height:17px;letter-spacing:.03em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-target-status[data-state="on"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-target-status[data-state="behind"]{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit));border-color:currentColor}
+.atm-target-track{position:relative;height:9px;border-radius:999px;background:var(--dsw-alias-fill-l2,var(--dsw-alias-border-l2,currentColor));overflow:hidden}
+.atm-target-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--dsw-alias-state-business-primary,currentColor)}
+.atm-target-pace{position:absolute;top:1px;bottom:1px;width:2px;background:var(--dsw-alias-label-primary,currentColor);opacity:.75}
+.atm-target-marker{position:absolute;top:-2px;bottom:-2px;left:calc(100% - 1.5px);width:1.5px;background:var(--dsw-alias-label-primary,currentColor);opacity:.55}
+.atm-target-pill{display:inline-flex;align-items:center;gap:5px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 8px;font-size:10.5px;line-height:18px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-target-pill[data-ontrack="true"]{border-color:var(--dsw-alias-state-business-primary,currentColor)}
+.atm-target-pill[data-ontrack="false"]{border-color:var(--dsw-alias-state-warning-primary,currentColor)}
+.atm-target-pill-target{font-weight:700;color:var(--dsw-alias-label-primary,inherit)}
+.atm-target-pill-label{text-transform:uppercase;letter-spacing:.03em;font-size:9.5px}
+.atm-cohorts{display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-size:10.5px;line-height:18px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-cohorts-compact .atm-cohort{padding:0 5px}
+.atm-cohort-label{text-transform:uppercase;letter-spacing:.04em;font-size:9.5px}
+.atm-cohort{display:inline-flex;align-items:baseline;gap:3px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 7px;white-space:nowrap;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-cohort[data-profile="aggressive"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor}
+.atm-cohort[data-profile="balanced"]{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-cohort[data-profile="conservative"]{color:var(--dsw-alias-label-primary,inherit)}
+.atm-cohort-count{font-variant-numeric:tabular-nums;font-weight:700}
+.atm-cohort-short{font-weight:600;opacity:.8}
+.atm-aggr-chip{display:inline-flex;align-items:center;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 6px;font-size:9.5px;line-height:15px;font-weight:600;letter-spacing:.03em;white-space:nowrap;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-aggr-chip[data-profile="aggressive"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor}
+.atm-aggr-chip[data-profile="balanced"]{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-aggr-chip[data-profile="conservative"]{color:var(--dsw-alias-label-primary,inherit)}
 `;
 
     // -----------------------------------------------------------------------
@@ -4274,13 +4921,40 @@ window.__ModuleLoader__.load({
     function HeaderStats({ t, summary }) {
       const population = summary.population;
       const treasury = summary.treasury;
+      const performance = summary.performance ?? performanceView(null);
+      const cohorts = summary.aggression ?? profileCounts(null);
+      const activity = summary.activity ?? activityView(null);
       const allocatedText = treasury.allocatedUsd === null && summary.allocationCapUsd === null
         ? '—'
         : `${fmtUsd(treasury.allocatedUsd)}${summary.allocationCapUsd === null ? '' : ` / ${fmtUsd(summary.allocationCapUsd)}`}`;
+      const cohortText = cohorts.available
+        ? cohorts.rows.map((row) => `${t(AGGRESSION_SHORT_LABEL_KEYS[row.key])} ${fmtNum(row.count)}`).join(' · ')
+        : '—';
       return h('div', { className: 'atm-grid' }, [
         h(StatCard, { key: 'mode', label: t('mode'), value: MODE_LABEL[summary.mode] ?? String(summary.mode).toUpperCase(), sub: summary.accountStatus ?? null }),
         h(StatCard, { key: 'loop', label: t('loop'), value: summary.running ? t('running') : t('stopped'), sub: summary.cycleIntervalSec ? `${summary.cycleIntervalSec}s` : null }),
         h(StatCard, { key: 'equity', label: t('account'), value: fmtUsd(summary.equityUsd), sub: `${t('cash')} ${fmtUsd(summary.cashUsd)}` }),
+        // v3.4: annual-return target + fixed growth cohort counts.
+        h(StatCard, {
+          key: 'target',
+          label: t('annualTarget'),
+          value: performance.targetAnnualReturnText,
+          sub: `${t('annualizedTradingReturn')} ${performance.annualizedReturnText} · ${t('targetProgressShort')} ${performance.targetProgressText}`,
+        }),
+        h(StatCard, {
+          key: 'cohorts',
+          label: t('aggressionCohort'),
+          value: cohortText,
+          sub: cohorts.available
+            ? `${t('aggressionAggressive')} / ${t('aggressionBalanced')} / ${t('aggressionConservative')}${cohorts.enabled === false ? ` · ${t('aggressionDisabled')}` : ''}`
+            : null,
+        }),
+        h(StatCard, {
+          key: 'activity',
+          label: t('engineActivity'),
+          value: activity.ordersTodayText,
+          sub: `${t('aggressionActivityTradesTotal')} ${activity.tradesTotalText} · ${t('aggressionActivityExecutions')} ${activity.lastCycleExecutionsText}`,
+        }),
         h(StatCard, {
           key: 'pop',
           label: t('population'),
@@ -5163,6 +5837,29 @@ window.__ModuleLoader__.load({
       return h('p', { className: 'atm-bridge-line' }, parts);
     }
 
+    /**
+     * v3.4 engine activity line (`engine.activity`): orders today, trades since start,
+     * executions/orders in the last cycle, active aggression profiles and halt reasons.
+     * Falls back to the agent-derived counters on snapshots without the block.
+     */
+    function ActivityLine({ t, activity }) {
+      const view = activity ?? activityView(null);
+      if (!view || (view.available !== true && view.ordersToday === null && view.tradesTotal === null)) return null;
+      const parts = [h('b', { key: 'title' }, t('engineActivity'))];
+      parts.push(h('span', { key: 'orders' }, `${t('aggressionActivityOrdersToday')} ${view.ordersTodayText}`));
+      parts.push(h('span', { key: 'trades' }, `${t('aggressionActivityTradesTotal')} ${view.tradesTotalText}`));
+      parts.push(h('span', { key: 'exec' }, `${t('aggressionActivityExecutions')} ${view.lastCycleExecutionsText}`));
+      parts.push(h('span', { key: 'lastOrders' }, `${t('aggressionActivityOrders')} ${view.lastCycleOrdersText}`));
+      const active = view.activeProfiles.length > 0
+        ? view.activeProfiles.map((key) => t(AGGRESSION_SHORT_LABEL_KEYS[key])).join('/')
+        : t('aggressionNone');
+      parts.push(h('span', { key: 'profiles' }, `${t('aggressionActivityActive')} ${active}`));
+      if (view.haltReasons.length > 0) {
+        parts.push(h('span', { key: 'halt', className: 'atm-warn' }, `${t('aggressionActivityHaltReasons')}: ${view.haltReasons.join(', ')}`));
+      }
+      return h('p', { className: 'atm-bridge-line' }, parts);
+    }
+
     /** Informational broker capability warning (shorting/margin restricted on the paper account). */
     function CapabilityWarningLine({ t, capability }) {
       if (!capability || capability.show !== true) return null;
@@ -5401,9 +6098,35 @@ window.__ModuleLoader__.load({
     // agent table
     // -----------------------------------------------------------------------
 
+    /** v3.4 cohort chip (Aggressive / Balanced / Conservative); neutral on legacy rows. */
+    function AggressionBadge({ t, value, badge }) {
+      const view = badge ?? aggressionBadge(value);
+      return h('span', {
+        className: 'atm-aggr-chip',
+        'data-profile': view.key,
+        title: view.known ? t(view.labelKey) : t('aggressionUnknown'),
+      }, view.known ? t(view.labelKey) : t('aggressionUnknown'));
+    }
+
+    /** v3.4 cohort counts strip shown in the agent-table header area. */
+    function AggressionCohortBar({ t, cohorts }) {
+      const rows = Array.isArray(cohorts?.rows) ? cohorts.rows : [];
+      if (cohorts?.available !== true || rows.length === 0) return null;
+      return h('div', { className: 'atm-cohorts', title: t('aggressionCohortHint') }, [
+        h('span', { key: 'label', className: 'atm-cohort-label' }, t('aggressionCohort')),
+        ...rows.map((row) => h('span', { key: row.key, className: 'atm-cohort', 'data-profile': row.key }, [
+          h('b', { key: 'n', className: 'atm-cohort-count' }, fmtNum(row.count)),
+          h('span', { key: 'l' }, t(row.labelKey)),
+          h('span', { key: 'p', className: 'atm-muted' }, ` ${row.pctText}`),
+        ])),
+      ]);
+    }
+
     const TABLE_COLUMNS = [
       { key: 'index', label: '#', sortable: false, width: '30px' },
       { key: 'name', labelKey: 'agent', sortable: true },
+      // v3.4 growth cohort: badge + sortable/filterable aggression profile.
+      { key: 'aggression', labelKey: 'aggression', sortable: true, hintKey: 'aggressionTableHint' },
       { key: 'basket', labelKey: 'basket', sortable: false },
       { key: 'generation', labelKey: 'gen', sortable: true },
       { key: 'strategyType', labelKey: 'strategyType', sortable: false },
@@ -5423,28 +6146,40 @@ window.__ModuleLoader__.load({
       { key: 'positions', labelKey: 'positions', sortable: false },
     ];
 
-    function AgentTable({ t, rows, selectedId, onSelect, strategyMix }) {
+    function AgentTable({ t, rows, selectedId, onSelect, strategyMix, cohorts }) {
       const [sortKey, setSortKey] = React.useState('pnlUsd');
       const [direction, setDirection] = React.useState('desc');
       const [filter, setFilter] = React.useState('all');
       const [category, setCategory] = React.useState('all');
+      const [profile, setProfile] = React.useState('all');
       const [query, setQuery] = React.useState('');
 
       const visible = React.useMemo(
-        () => sortAgentRows(filterAgentRows(filterRowsByCategory(rows, category), filter, query), sortKey, direction),
-        [rows, category, filter, query, sortKey, direction],
+        () => sortAgentRows(filterAgentRows(filterRowsByCategory(rows, category), filter, query, profile), sortKey, direction),
+        [rows, category, filter, query, profile, sortKey, direction],
       );
       const categoryOptions = React.useMemo(
         () => categoryTabs(strategyMix ? { strategyMix } : null, rows),
         [strategyMix, rows],
       );
+      // v3.4: cohort counts come from the engine summary, falling back to the rows.
+      const cohortSummary = React.useMemo(
+        () => (cohorts && cohorts.available ? cohorts : profileCounts(rows)),
+        [cohorts, rows],
+      );
+      const profileOptions = React.useMemo(() => {
+        if (cohortSummary.available !== true) return [];
+        const known = rows.some((row) => normalizeAggression(row.aggression) !== null);
+        if (!known) return [];
+        return [{ key: 'all', labelKey: 'aggressionFilterAll', count: rows.length }, ...cohortSummary.rows];
+      }, [cohortSummary, rows]);
 
       const onSort = (key) => {
         if (!SORTABLE_KEYS.has(key)) return;
         if (sortKey === key) setDirection(direction === 'asc' ? 'desc' : 'asc');
         else {
           setSortKey(key);
-          setDirection(key === 'name' || key === 'generation' || key === 'status' ? 'asc' : 'desc');
+          setDirection(key === 'name' || key === 'aggression' || key === 'generation' || key === 'status' ? 'asc' : 'desc');
         }
       };
 
@@ -5461,10 +6196,21 @@ window.__ModuleLoader__.load({
           onClick: () => setCategory(option.key),
           title: option.label,
         }, `${t(option.labelKey)} (${fmtNum(option.count)})`))),
+        h(AggressionCohortBar, { key: 'cohorts', t, cohorts: cohortSummary }),
         h('div', { className: 'atm-toolbar', key: 'toolbar' }, [
           h('h3', { className: 'atm-section-title', key: 'title' }, `${t('agents')} · ${fmtNum(visible.length)} ${t('rows')}`),
           h('span', { className: 'atm-muted', key: 'hint' }, t('clickHint')),
           h('span', { className: 'atm-spacer', key: 'spacer' }),
+          profileOptions.length > 0
+            ? h('div', { className: 'atm-seg', key: 'profiles' }, profileOptions.map((option) => h('button', {
+              key: option.key,
+              type: 'button',
+              'data-active': profile === option.key ? 'true' : 'false',
+              'data-profile': option.key,
+              title: option.key === 'all' ? t('aggressionFilterAll') : `${t(option.labelKey)} (${option.pctText})`,
+              onClick: () => setProfile(option.key),
+            }, option.key === 'all' ? t('aggressionFilterAll') : `${t(option.labelKey)} (${fmtNum(option.count)})`)))
+            : null,
           filters.map((value) => h('button', {
             key: value,
             type: 'button',
@@ -5514,6 +6260,7 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'atm-name-main', key: 'n', title: row.name }, row.name),
                   h('span', { className: 'atm-name-sub atm-mono', key: 'id', title: row.id }, row.shortId),
                 ])),
+                h('td', { key: 'aggression', title: t('aggressionTableHint') }, h(AggressionBadge, { t, value: row.aggression, badge: row.aggressionBadge })),
                 h('td', { key: 'basket', className: 'atm-muted', title: row.basket.length > 0 ? row.basket.join(', ') : '' }, row.basketText ?? '—'),
                 h('td', { key: 'gen', className: 'atm-mono' }, fmtNum(row.generation)),
                 h('td', { key: 'strategyType' }, h(StrategyTypeChip, { t, strategy: row.strategy })),
@@ -5701,6 +6448,49 @@ window.__ModuleLoader__.load({
           ? h('p', { className: 'atm-warn', key: 'legacy' }, t('pnlLegacyNote'))
           : null,
         h('p', { className: 'atm-note', key: 'note' }, t('pnlRewardsNote')),
+        row.aggression === 'aggressive'
+          ? h('p', { className: 'atm-note', key: 'aggression-note' }, t('aggressionCapitalNote'))
+          : null,
+      ]);
+    }
+
+    /**
+     * v3.4 aggression block (docs/AGGRESSIVE-GROWTH.md §5): the cohort badge,
+     * the profile limits that shape the deterministic executor (basket sizes,
+     * max open positions, orders/cycle, entry-Z/size/stop/target/max-hold
+     * multipliers, policy size floor, stand-down policy) and this agent's activity
+     * stats. Legacy snapshots show an explicit "limits not reported" state.
+     */
+    function AggressionSection({ t, row }) {
+      const badge = row.aggressionBadge ?? aggressionBadge(row.aggression);
+      const profile = row.aggressionProfile ?? aggressionProfileView(null);
+      const activity = row.activityStats ?? agentActivityView(row);
+      const limitItems = (Array.isArray(profile.items) ? profile.items : []).map((item) => ({
+        key: `limit-${item.key}`,
+        label: t(item.labelKey),
+        value: item.displayKey ? t(item.displayKey) : item.text,
+      }));
+      const activityItems = [
+        { key: 'ordersToday', label: t('aggressionActivityOrdersToday'), value: activity.ordersTodayText },
+        { key: 'trades', label: t('aggressionActivityTrades'), value: activity.tradesText },
+        { key: 'positions', label: t('aggressionActivityPositions'), value: activity.positionsText },
+      ];
+      return h('div', { key: 'aggression' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, [
+          h('span', { key: 'text' }, t('aggressionProfileTitle')),
+          badge.known ? h(AggressionBadge, { key: 'badge', t, value: row.aggression, badge }) : null,
+          row.aggressiveCapitalUsd !== null && row.aggressiveCapitalUsd !== undefined
+            ? h('span', { key: 'capital', className: 'atm-muted', title: t('aggressionCapitalNote') }, `${t('aggressionCapitalContributed')} ${fmtUsd(row.aggressiveCapitalUsd)}`)
+            : null,
+        ]),
+        limitItems.length > 0
+          ? h(DetailKv, { key: 'limits', items: limitItems })
+          : h('p', { className: 'atm-empty', key: 'no-limits' }, t('aggressionNoLimits')),
+        h('h4', { className: 'atm-detail-title', key: 'activity-title' }, t('aggressionActivity')),
+        h(DetailKv, { key: 'activity', items: activityItems }),
+        row.aggression === 'aggressive'
+          ? h('p', { className: 'atm-note', key: 'capital-note' }, t('aggressionCapitalNote'))
+          : null,
       ]);
     }
 
@@ -5818,6 +6608,9 @@ window.__ModuleLoader__.load({
             h('span', { className: 'atm-detail-id atm-mono', key: 'id', title: row.id }, row.id),
             h('div', { className: 'atm-toolbar', key: 'badges', style: { marginTop: 2 } }, [
               h(StatusCell, { key: 'status', t, row }),
+              row.aggression
+                ? h(AggressionBadge, { key: 'aggression', t, value: row.aggression, badge: row.aggressionBadge })
+                : null,
               h('span', { className: 'atm-muted', key: 'gen' }, `gen ${fmtNum(row.generation)}`),
               row.strategy ? h('span', { key: 'category', className: 'atm-muted', title: row.strategy.description }, row.categoryLabel) : null,
               h(StrategyTypeChip, { key: 'type', t, strategy: row.strategy }),
@@ -5837,6 +6630,7 @@ window.__ModuleLoader__.load({
         ]),
         h(DetailKv, { key: 'meta', items: metaItems }),
         h(PnlBreakdownCard, { key: 'pnl-breakdown', t, row }),
+        h(AggressionSection, { key: 'aggression', t, row }),
         deathInfo.length > 0 ? h('div', { key: 'death' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, t('tradingState')),
           h(DetailKv, { key: 'kv', items: deathInfo }),
@@ -6011,6 +6805,75 @@ window.__ModuleLoader__.load({
       }));
     }
 
+    /**
+     * v3.4 annual-return-target card (docs/AGGRESSIVE-GROWTH.md §5): target
+     * (default 50%), current annualized trading return, target progress/pace,
+     * trading P&L since the one-time baseline and account equity, with the
+     * explicit "target, not guarantee" caveat. Shows dashes (never an invented
+     * rate) while the history is shorter than a day or the engine is legacy.
+     */
+    function AnnualTargetCard({ t, performance }) {
+      const view = performance?.isPerformanceView === true ? performance : performanceView(performance);
+      const progressPct = view.targetProgressPct === null ? null : Math.max(0, Math.min(100, view.targetProgressPct * 100));
+      const pacePct = view.paceRatio === null ? null : Math.max(0, Math.min(100, view.paceRatio * 100));
+      const items = [
+        { key: 'annualized', label: t('annualizedTradingReturn'), value: view.annualizedReturnText },
+        { key: 'progress', label: t('targetProgressLabel'), value: view.targetProgressText },
+        { key: 'pace', label: t('targetPaceLabel'), value: view.paceText },
+        { key: 'fromBaseline', label: t('tradingPnlSinceBaseline'), value: view.tradingPnlSinceBaselineText },
+        { key: 'required', label: t('requiredTradingPnl'), value: view.requiredTradingPnlText },
+        { key: 'equity', label: t('totalEquity'), value: view.accountEquityText },
+        { key: 'capitalBase', label: t('accountCapitalBase'), value: view.accountCapitalBaseText },
+        { key: 'dailyPace', label: t('annualTargetDailyPace'), value: view.requiredDailyReturnText },
+        { key: 'days', label: t('daysElapsedLabel'), value: view.daysElapsedText },
+        { key: 'baseline', label: t('baselineAtLabel'), value: view.baselineAt ? fmtAgo(view.baselineAt) : '—' },
+      ];
+      return h('div', {
+        className: 'atm-target-card',
+        'data-ontrack': view.onTrack === null ? 'unknown' : view.onTrack ? 'true' : 'false',
+      }, [
+        h('div', { className: 'atm-target-head', key: 'head' }, [
+          h('div', { className: 'atm-target-titles', key: 'titles' }, [
+            h('span', { className: 'atm-target-label', key: 'label' }, t('annualTarget')),
+            h('span', { className: 'atm-target-value', key: 'value', title: t('annualTargetHint') }, view.targetAnnualReturnText),
+            h('span', { className: 'atm-target-sub', key: 'sub' }, t('annualTargetSub')),
+          ]),
+          h('div', { className: 'atm-target-badges', key: 'badges' }, [
+            h('span', { className: 'atm-target-caveat', key: 'caveat' }, t('annualTargetNotGuarantee')),
+            h('span', {
+              className: 'atm-target-status',
+              key: 'status',
+              'data-state': view.onTrack === null ? 'unknown' : view.onTrack ? 'on' : 'behind',
+            }, t(view.onTrackLabelKey)),
+            view.shortHistory ? h('span', { key: 'short', className: 'atm-muted' }, t('annualizedShortHistory')) : null,
+          ]),
+        ]),
+        h('div', { className: 'atm-target-track', key: 'track', title: `${t('targetProgressLabel')} ${view.targetProgressText}` }, [
+          h('div', { className: 'atm-target-fill', key: 'fill', style: { width: `${progressPct ?? 0}%` } }),
+          pacePct !== null ? h('div', { className: 'atm-target-pace', key: 'pace', style: { left: `${pacePct}%` } }) : null,
+          h('div', { className: 'atm-target-marker', key: 'marker', title: `100% · ${t('target')} ${view.targetAnnualReturnText}` }),
+        ]),
+        h(DetailKv, { key: 'kv', items }),
+        h('p', { className: 'atm-note', key: 'note' }, t('annualTargetHint')),
+        view.legacy ? h('p', { className: 'atm-note', key: 'legacy' }, t('performanceLegacyNote')) : null,
+      ]);
+    }
+
+    /** Compact annual-target pill for the top bar (header visibility on every tab). */
+    function TargetPill({ t, performance }) {
+      const view = performance?.isPerformanceView === true ? performance : performanceView(performance);
+      return h('span', {
+        className: 'atm-target-pill',
+        'data-ontrack': view.onTrack === null ? 'unknown' : view.onTrack ? 'true' : 'false',
+        title: `${t('annualTarget')} ${view.targetAnnualReturnText} · ${t('annualizedTradingReturn')} ${view.annualizedReturnText} · ${t('targetProgressLabel')} ${view.targetProgressText} · ${t('annualTargetNotGuarantee')}`,
+      }, [
+        h('span', { key: 'label', className: 'atm-target-pill-label' }, t('annualTarget')),
+        h('span', { key: 'target', className: 'atm-target-pill-target' }, view.targetAnnualReturnText),
+        h('span', { key: 'sep', className: 'atm-muted' }, '·'),
+        h('span', { key: 'annualized', className: 'atm-mono' }, view.annualizedReturnText),
+      ]);
+    }
+
     function MarketTape({ t, live, limit = null, titleKey = 'tape' }) {
       const rows = Array.isArray(live?.tape) ? (limit === null ? live.tape : live.tape.slice(0, limit)) : [];
       const feedStatus = live?.feedStatus ?? 'unavailable';
@@ -6135,6 +6998,27 @@ window.__ModuleLoader__.load({
           summary ? h('span', { className: 'atm-badge', key: 'running', 'data-running': summary.running ? 'true' : 'false' }, summary.running ? t('running') : t('stopped')) : null,
           summary?.halted ? h('span', { key: 'halted', className: 'atm-badge' }, t('halted')) : null,
           summary ? h(KillBadge, { key: 'kill', t, on: summary.killSwitch }) : null,
+          // v3.4 annual-return-target pill: visible in the header on every tab.
+          summary?.performance ? h(TargetPill, { key: 'target', t, performance: summary.performance }) : null,
+          // v3.4 cohort counts (aggressive / balanced / conservative).
+          summary?.aggression?.available
+            ? h('span', {
+              key: 'cohorts',
+              className: 'atm-cohorts atm-cohorts-compact',
+              title: t('aggressionCohortHint'),
+            }, [
+              h('span', { key: 'label', className: 'atm-cohort-label' }, t('aggressionCohort')),
+              ...summary.aggression.rows.map((row) => h('span', {
+                key: row.key,
+                className: 'atm-cohort',
+                'data-profile': row.key,
+                title: `${t(row.labelKey)} ${row.pctText}`,
+              }, [
+                h('span', { key: 'l', className: 'atm-cohort-short' }, t(AGGRESSION_SHORT_LABEL_KEYS[row.key])),
+                h('b', { key: 'n', className: 'atm-cohort-count' }, fmtNum(row.count)),
+              ])),
+            ])
+            : null,
           h('span', {
             key: 'feed',
             className: 'atm-feed-pill',
@@ -6217,6 +7101,7 @@ window.__ModuleLoader__.load({
         h(InstrumentsLine, { key: 'instruments', t, instruments: summary.instruments }),
         h(CapabilityWarningLine, { key: 'capability', t, capability: summary.brokerCapability }),
         h(LastCycleLine, { key: 'last-cycle', t, lastCycle: summary.lastCycle }),
+        h(ActivityLine, { key: 'activity', t, activity: summary.activity }),
       ];
       const workspace = h('div', { className: 'atm-workspace', key: 'workspace', 'data-detail': selectedRow ? 'true' : 'false' }, [
         h('div', { className: 'atm-main-col', key: 'left' }, [
@@ -6227,6 +7112,7 @@ window.__ModuleLoader__.load({
             selectedId: selectedRow ? selectedRow.id : null,
             onSelect: selectAgent,
             strategyMix: summary.strategyMix,
+            cohorts: summary.aggression,
           }),
         ]),
         selectedRow
@@ -6241,6 +7127,8 @@ window.__ModuleLoader__.load({
           : null,
       ].filter(Boolean);
       const overview = h('div', { className: 'atm-tab-panel', key: 'overview' }, [
+        // v3.4: the annual-return-target card sits at the head of the KPI area.
+        h(AnnualTargetCard, { key: 'target', t, performance: summary.performance }),
         h(KpiCards, { key: 'kpis', t, cards: live.kpis }),
         h('div', { className: 'atm-chart-grid', key: 'charts' }, [
           h(EquityChart, { key: 'equity', t, equity: live.equity }),
@@ -6549,6 +7437,22 @@ window.__ModuleLoader__.load({
         rewardsEligibilityReason,
         rewardSettingsPatch,
         portfolioPnlTotals,
+        // v3.4 annual return target + aggressive growth cohort helpers
+        performanceView,
+        targetProgress,
+        aggressionBadge,
+        normalizeAggression,
+        aggressionProfileView,
+        agentAggressionView,
+        agentActivityView,
+        profileCounts,
+        activityView,
+        filterRowsByAggression,
+        fmtRatioPct,
+        AGGRESSION_KEYS,
+        AGGRESSION_RANK,
+        AGGRESSION_LIMIT_FIELDS,
+        DEFAULT_TARGET_ANNUAL_RETURN_PCT,
         REWARD_RULE_DEFAULTS,
         REWARD_PERIODS,
         leaderboardPeriods,

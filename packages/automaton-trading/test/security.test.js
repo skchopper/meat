@@ -2508,3 +2508,330 @@ describe('v3.3 market view exposes fair trading day P&L without credential leaka
     }
   });
 });
+
+// ===========================================================================
+// O. v3.4 aggressive growth / 50% target / reconciliation allowance — adversarial
+//    The cohort must add opportunity, never a bypass: no new broker or tool surface,
+//    brakes/kill switch still win, the costs allowance mints nothing and hides no fill,
+//    and the informational target never sizes an order.
+// ===========================================================================
+
+const V34_CYCLE_MS = 5 * 60 * 1000;
+
+/** Fake broker for v3.4 worlds: fixed live-shaped account, no data, never places orders. */
+function v34FakeBroker({ equityUsd = 100000 } = {}) {
+  const state = { equityUsd: round2(equityUsd), offsetUsd: 0, calls: { getAccount: 0, getPositions: 0, submitOrder: 0 } };
+  return {
+    state,
+    calls: state.calls,
+    setEquityOffset(value) {
+      state.offsetUsd = Number(value) || 0;
+    },
+    async getAccount() {
+      state.calls.getAccount += 1;
+      const equity = round2(state.equityUsd + state.offsetUsd);
+      return {
+        equityUsd: equity,
+        cashUsd: equity,
+        buyingPowerUsd: equity,
+        status: 'ACTIVE',
+        currency: 'USD',
+        marginMultiplier: 1,
+        shortingEnabled: false,
+        optionsTradingLevel: 3,
+      };
+    },
+    async getPositions() {
+      state.calls.getPositions += 1;
+      return [];
+    },
+    async getClock() {
+      return { isOpen: true, timestamp: T0, nextOpen: null, nextClose: T0 + 6 * HOUR_MS };
+    },
+    async getBars() {
+      return {};
+    },
+    async getLatestQuote() {
+      return null;
+    },
+    async submitOrder() {
+      state.calls.submitOrder += 1;
+      throw new Error('v3.4 security world must never submit an order');
+    },
+    async getOrders() {
+      return [];
+    },
+  };
+}
+
+async function v34SecurityWorld({ initial = 3, cap = 8, aggression = true, overrides = {} } = {}) {
+  const env = makeEnv({
+    mode: 'sim',
+    population: { initial, cap },
+    endowmentUsd: 50,
+    replication: { childEndowmentUsd: 25 },
+    strategyMix: { dayPct: 0.7 },
+    aggression: { enabled: aggression },
+    account: { reconciliationTolerancePct: 0.000001, allocationCapPct: 0.92 },
+    risk: { maxOpenPositions: 10, maxOrderNotionalUsd: 60, maxDailyOrders: 40, maxPositionPct: 0.6 },
+    ...overrides,
+  });
+  const clock = makeClock(T0);
+  const broker = v34FakeBroker();
+  const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+  await automaton.init();
+  return {
+    env,
+    clock,
+    broker,
+    automaton,
+    ledger: automaton._internals.ledger,
+    registry: automaton._internals.registry,
+  };
+}
+
+describe('v3.4 reconciliation costs allowance cannot hide a fill or mint capital', () => {
+  it('the allowance explains virtual costs but a real unbooked fill still halts (both signs)', async () => {
+    const world = await v34SecurityWorld({
+      initial: 2,
+      aggression: false,
+      overrides: {
+        endowmentUsd: 5000,
+        // The live burn profile: a few dollars of virtual costs beyond the tight tolerance.
+        burn: { inferencePerCycleUsd: 0.0002, dataPerCycleUsd: 0.00005, hostingPerHourUsd: 0.00001, committedMonthlyUsd: 0 },
+      },
+    });
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick(); // anchor
+    world.ledger.charge(world.registry.alive()[0].id, 5, { category: 'hosting', role: 'hosting', at: world.clock.now() });
+    await world.ledger.save();
+
+    world.broker.setEquityOffset(5);
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick();
+    const positive = world.automaton._internals.state.lastTreasury;
+    assert.equal(positive.halted, true, 'a +$5 unbooked fill must still halt the engine');
+    assert.ok(positive.haltReasons.includes('reconciliation_mismatch'));
+    assert.ok(positive.reconciliation.costsSinceAnchorUsd >= 5, 'the virtual costs are still allowed back');
+    assert.ok(Math.abs(positive.reconciliation.deltaUsd - 5) < 0.05);
+
+    world.broker.setEquityOffset(-5);
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick();
+    const negative = world.automaton._internals.state.lastTreasury;
+    assert.equal(negative.halted, true, 'a -$5 unbooked fill must still halt the engine');
+    assert.ok(negative.haltReasons.includes('reconciliation_mismatch'));
+
+    world.broker.setEquityOffset(0);
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick();
+    assert.equal(world.automaton._internals.state.lastTreasury.halted, false, 'costs alone no longer halt');
+  });
+
+  it('a costs-only tick calls no money-creating ledger operation and moves no capital', async () => {
+    const world = await v34SecurityWorld({
+      initial: 2,
+      aggression: false,
+      overrides: { endowmentUsd: 5000 },
+    });
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick(); // anchor
+    const agentId = world.registry.alive()[0].id;
+    const capitalBefore = world.ledger.snapshot(agentId).capitalContributionsUsd;
+    const rewardBefore = world.ledger.snapshot(agentId).rewardCapitalUsd;
+    const poolBefore = world.ledger.pool().poolUsd;
+    const cashBefore = world.ledger.snapshot(agentId).cashUsd;
+    const costsBefore = world.ledger.costsSinceAnchor();
+    const moneyCalls = [];
+    for (const name of ['grant', 'credit', 'transfer']) {
+      const original = world.ledger[name].bind(world.ledger);
+      world.ledger[name] = (...args) => {
+        moneyCalls.push({ name, args });
+        return original(...args);
+      };
+    }
+    world.ledger.charge(agentId, 5, { category: 'hosting', role: 'hosting', at: world.clock.now() });
+    await world.ledger.save();
+    world.clock.advance(V34_CYCLE_MS);
+    await world.automaton.tick();
+    assert.deepEqual(moneyCalls, [], 'the costs fix must not mint or move capital/rewards to reconcile');
+    assert.equal(world.ledger.snapshot(agentId).capitalContributionsUsd, capitalBefore);
+    assert.equal(world.ledger.snapshot(agentId).rewardCapitalUsd, rewardBefore);
+    assert.equal(world.ledger.pool().poolUsd, poolBefore);
+    const cashSpent = round2(cashBefore - world.ledger.snapshot(agentId).cashUsd);
+    const costsAdded = round2(world.ledger.costsSinceAnchor() - costsBefore);
+    // Cash leaves only as the booked virtual cost (the manual $5 + this cycle's metabolism role costs).
+    assert.ok(cashSpent >= 5 && Math.abs(cashSpent - costsAdded) <= 0.06,
+      `cash spent ${cashSpent} must equal the newly booked virtual costs ${costsAdded}`);
+  });
+});
+
+describe('v3.4 aggressive growth adds no broker or tool surface', () => {
+  it('the aggressive capital top-up is a virtual treasury transfer: no order, no credential surface', async () => {
+    const world = await v34SecurityWorld({ initial: 3 });
+    assert.equal(world.broker.calls.submitOrder, 0, 'the migration must never place an order');
+    assert.equal(world.broker.calls.getAccount, 1, 'only the account read during init');
+    const status = await world.automaton.status();
+    const aggressive = status.agents.filter((agent) => agent.aggression === 'aggressive');
+    assert.ok(aggressive.length > 0);
+    for (const agent of aggressive) {
+      const events = world.ledger.get(agent.id).events;
+      const topUps = events.filter((event) => event.kind === 'transfer-in' && event.reason === 'v3.4 aggressive capital allocation');
+      assert.equal(topUps.length, 1);
+      assert.equal(topUps[0].amountUsd, 17.5);
+      assert.equal(agent.capital.aggressiveCapitalUsd, 17.5);
+      assert.equal(agent.capital.rewardCapitalUsd, 0, 'the top-up is contributed capital, never reward capital');
+      assert.equal(world.ledger.snapshot(agent.id).tradingPnlUsd, 0, 'the top-up is never P&L');
+    }
+    // No tool was added for aggression/capital/targets/transfers.
+    assert.equal(TOOL_NAMES.length, 10);
+    assert.equal(TOOL_NAMES.some((name) => /transfer|withdraw|capital|aggress|target|performance|cohort/i.test(name)), false);
+    // No credential-shaped value appears in the status that carries the new fields.
+    for (const secret of [SECRET_KEY_ID, SECRET_VALUE]) {
+      assert.equal(JSON.stringify(status).includes(secret), false, 'v3.4 status fields leaked credential material');
+    }
+  });
+
+  it('status/marketView carry the v3.4 contract without secrets', async () => {
+    const env = makeEnv({
+      mode: 'sim',
+      population: { initial: 2, cap: 4 },
+      endowmentUsd: 5000,
+      replication: { childEndowmentUsd: 25 },
+      aggression: { enabled: true },
+    });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    clock.advance(V34_CYCLE_MS);
+    await automaton.tick();
+    const envFile = path.join(env.dir, '.env');
+    fs.writeFileSync(envFile, `ALPACA_API_KEY_ID=${SECRET_KEY_ID}\nALPACA_API_SECRET_KEY=${SECRET_VALUE}\n`, 'utf8');
+    const engine = createEngine({
+      cwd: env.dir,
+      configFile: path.join(env.dir, 'no-such-config.json'),
+      envFile,
+      clock,
+      overrides: {
+        stateDir: env.paths.stateDir,
+        mode: 'sim',
+        accountEquityUsd: 100000,
+        aggression: { enabled: true },
+      },
+      brokerFactory: () => createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock }),
+    });
+    const view = await engine.marketView();
+    assert.equal(view.ok, true, JSON.stringify(view.error));
+    assert.ok(view.engine.performance && view.engine.aggression && view.engine.activity,
+      'market view must expose the v3.4 status blocks the UI consumes');
+    assert.ok(Array.isArray(view.agents) && view.agents.every((agent) => 'aggression' in agent && 'activity' in agent));
+    assert.equal(view.engine.performance.targetAnnualReturnPct, 0.5);
+    assert.equal(view.engine.aggression.enabled, true);
+    const status = await engine.status();
+    assert.ok(status.engine.performance.targetAnnualReturnPct === 0.5);
+    assert.ok(status.agents.every((agent) => agent.capital && 'aggressiveCapitalUsd' in agent.capital));
+    for (const [label, payload] of [['marketView', view], ['status', status]]) {
+      const text = JSON.stringify(payload);
+      for (const secret of [SECRET_KEY_ID, SECRET_VALUE]) {
+        assert.equal(text.includes(secret), false, `${label} leaked credential material`);
+      }
+    }
+  });
+});
+
+describe('v3.4 aggressive growth cannot bypass the kill switch or the risk caps', () => {
+  it('the kill switch still denies a converted aggressive entry before any broker call', async () => {
+    const env = makeEnv({ mode: 'sim' });
+    const clock = makeClock();
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000 });
+    const harness = brakeHarness(env, clock);
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent('atm-1', { endowmentUsd: 5000, at: clock.iso() });
+    ledger.grant('atm-1', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    const executor = createExecutor({ broker, brakes: harness.brakes, ledger, config: env.config, clock });
+    lockSwitchOn(env.paths);
+    const result = await executor.run({
+      agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbol: 'AAPL', family: 'breakout' } },
+      spec: baseSpec(),
+      mandate: baseMandate(),
+      quotes: { AAPL: { bid: 100, ask: 100.1, last: 100 } },
+      bars: { AAPL: breakoutBars() },
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+      now: clock.now(),
+      // The aggressive profile would convert this stand-down into a full-size bid...
+      policy: { stance: 'stand_down', atMs: clock.now(), sizeMultiplier: 1 },
+      profile: { aggression: 'aggressive', policySizeFloor: 0.8, respectStandDown: false },
+    });
+    assert.equal(result.orders.length, 0, 'D11 must win over the aggressive profile');
+    assert.equal(result.denied.length, 1);
+    assert.equal(result.denied[0].code, 'KILL_SWITCH');
+    assert.equal(broker.getOrders({ status: 'all', limit: 100 }).length, 0);
+    assert.equal(ledger.snapshot('atm-1').cashUsd, 5000, 'no fill may be booked');
+  });
+
+  it('the daily-order brake still denies a converted aggressive entry', async () => {
+    const env = makeEnv({ mode: 'sim' });
+    const clock = makeClock();
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000 });
+    const harness = brakeHarness(env, clock);
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent('atm-1', { endowmentUsd: 5000, at: clock.iso() });
+    ledger.grant('atm-1', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    const executor = createExecutor({ broker, brakes: harness.brakes, ledger, config: env.config, clock });
+    const result = await executor.run({
+      agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbol: 'AAPL', family: 'breakout' } },
+      spec: baseSpec(),
+      mandate: { ...baseMandate(), maxDailyOrdersRemaining: 0 },
+      quotes: { AAPL: { bid: 100, ask: 100.1, last: 100 } },
+      bars: { AAPL: breakoutBars() },
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+      now: clock.now(),
+      policy: { stance: 'stand_down', atMs: clock.now(), sizeMultiplier: 1 },
+      profile: { aggression: 'aggressive', policySizeFloor: 0.8, respectStandDown: false },
+    });
+    assert.equal(result.orders.length, 0, 'the profile is a ceiling/user policy, never a cap bypass');
+    assert.equal(result.denied[0].code, 'RATE_FORBIDDEN');
+    assert.equal(broker.getOrders({ status: 'all', limit: 100 }).length, 0);
+  });
+
+  it('the 50% target is status-only: no sizing/trading module can read it (source scan)', () => {
+    const srcDir = path.join(PKG_ROOT, 'src');
+    const targetFields = /targetAnnualReturnPct|requiredDailyReturnPct|targetProgressPct|annualReturnPct|config\.targets|targets\?\./;
+    const allowed = new Set(['config.js', 'orchestrator.js']);
+    for (const file of fs.readdirSync(srcDir).filter((name) => name.endsWith('.js'))) {
+      const source = fs.readFileSync(path.join(srcDir, file), 'utf8');
+      if (allowed.has(file)) continue;
+      assert.equal(targetFields.test(source), false, `${file} must not read the informational return target`);
+    }
+    // The UI consumes the target only through pure mapping helpers, including the explicit caveat.
+    const client = fs.readFileSync(path.join(PKG_ROOT, 'client.js'), 'utf8');
+    for (const hook of ['performanceView', 'targetProgressPct', 'annualTargetNotGuarantee', 'performanceLegacyNote',
+      'aggressiveCapitalUsd', 'aggressionCapitalNote']) {
+      assert.ok(client.includes(hook), `client.js must expose ${hook}`);
+    }
+    // The cohort profile is likewise never read by the brake wall, ledger or reward ranking.
+    for (const file of ['brakes.js', 'ledger.js', 'treasurer.js', 'rewards.js', 'rankings.js', 'reaper.js',
+      'broker-alpaca.js', 'broker-sim.js']) {
+      const source = fs.readFileSync(path.join(srcDir, file), 'utf8');
+      assert.equal(/aggression\.profiles|policySizeFloor|respectStandDown/.test(source), false,
+        `${file} must not implement an aggression execution override`);
+    }
+  });
+
+  it('aggressive capital never inflates reward capital, trading P&L or the reward ranking', async () => {
+    const world = await v34SecurityWorld({ initial: 6 });
+    const status = await world.automaton.status();
+    assert.ok(status.agents.some((agent) => agent.aggression === 'aggressive'));
+    assert.equal(status.engine.rewards.basis, 'trading-performance', 'reward basis unchanged by v3.4');
+    assert.equal(status.engine.capitalAccounting.tradingPnlTotalUsd, 0, 'a capital top-up is not trading P&L');
+    assert.equal(status.engine.capitalAccounting.rewardsLifetimeTotalUsd, 0);
+    for (const agent of status.agents) {
+      assert.equal(agent.capital.rewardCapitalUsd, 0);
+      assert.equal(agent.tradingPnlUsd, 0);
+    }
+  });
+});
+
+
+

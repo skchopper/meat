@@ -88,6 +88,14 @@ engine: {
   },
   capitalAccounting: {version:2, migrationMarker, rewardedAgents,
                       tradingPnlTotalUsd, rewardsLifetimeTotalUsd}, // v3.3
+  performance: {enabled, targetAnnualReturnPct, requiredDailyReturnPct, baselineAt,
+                baselineAccountEquityUsd, baselineTradingPnlUsd, daysElapsed,
+                tradingPnlSinceBaselineUsd, annualizedReturnPct, targetProgressPct,
+                onTrack, accountEquityUsd, accountCapitalBase, tradingPnlTotalUsd}, // v3.4
+  aggression: {enabled, aggressivePct, balancedPct, capitalMultiplier, profiles:{...},
+               counts:{aggressive,balanced,conservative}}, // v3.4
+  activity: {ordersToday, tradesTotal, positionsTotal, lastCycleExecutions, lastCycleOrders,
+             activeProfiles:{...}, haltReasons, halted}, // v3.4
   agents: {
     enabled, configured, provider, model,
     intervalDaySec, intervalSwingSec, maxReviewsPerCycle,
@@ -129,6 +137,12 @@ agents: [{
   equityUsd,                                  // TOTAL equity (includes reward capital)
   tradingPnlUsd, tradingPnlPct,               // v3.3 trading-only P&L; pct is a fraction
   capital: {contributedUsd, baseUsd, rewardCapitalUsd, rewardSharePct, capitalVersion},
+  aggression: 'aggressive'|'balanced'|'conservative', // v3.4
+  aggressionProfile: {name, basketSizeDay, basketSizeSwing, maxOpenPositionsDay,
+                      maxOpenPositionsSwing, maxOrdersPerCycle, entryZMultiplier,
+                      sizePctMultiplier, stopPctMultiplier, targetPctMultiplier,
+                      maxHoldBarsMultiplier, policySizeFloor, respectStandDown}, // v3.4
+  activity: {ordersToday, trades, positions}, // v3.4
   rewards: {lifetimeUsd, count, lastAt, history:[{period, periodKey, at, rank, amountUsd,
             share, periodTradingPnlUsd, periodTradingPnlPct}]},  // v3.3
   pnl: {tradingUsd, tradingPct, tradingRealizedUsd, tradingUnrealizedUsd, rewardsUsd,

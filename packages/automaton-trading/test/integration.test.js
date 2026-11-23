@@ -41,7 +41,7 @@ import { createAutomaton, genesisGenome } from '../src/orchestrator.js';
 import { createReaper } from '../src/reaper.js';
 import { createEngine } from '../src/engine.js';
 import { createJournal } from '../src/journal.js';
-import { createLedger } from '../src/ledger.js';
+import { createLedger, TREASURY_ID } from '../src/ledger.js';
 import { createRankings } from '../src/rankings.js';
 import { createRewards, resolveRewardSettings } from '../src/rewards.js';
 import { createRegistry } from '../src/registry.js';
@@ -54,6 +54,7 @@ import { createClock, mulberry32, round2 } from '../src/util.js';
 import { targetFamilyForIndex, tierForFamily } from '../src/strategy-types.js';
 import { resolveInstrumentPermissions } from '../src/instruments.js';
 import { DEATH_CAUSES } from '../src/contracts.js';
+import { createBuilder, PARAM_BOUNDS } from '../src/builder.js';
 
 const PKG_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const T0 = Date.UTC(2026, 0, 5, 15, 0, 0); // Mon 10:00 America/New_York (inside 09:35-15:50)
@@ -1185,12 +1186,12 @@ function instrumentBars(last, direction = 1) {
   return bars;
 }
 
-async function runInstrumentExecutor(world, { policy = null, direction = 1, dayStats = null, spec = null, bars = null } = {}) {
+async function runInstrumentExecutor(world, { policy = null, direction = 1, dayStats = null, spec = null, bars = null, profile = null, research = null, mandate = null } = {}) {
   const quote = world.broker.getLatestQuote(world.symbol);
   return world.executor.run({
     agent: world.registry.get(world.id),
     spec: spec ?? instrumentSpec(world),
-    mandate: {
+    mandate: mandate ?? {
       ...world.mandate,
       issuedAt: world.clock.iso(),
       expiresAt: new Date(world.clock.now() + 10 * 60 * 1000).toISOString(),
@@ -1200,6 +1201,8 @@ async function runInstrumentExecutor(world, { policy = null, direction = 1, dayS
     dayStats: dayStats ?? { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 },
     now: world.clock.now(),
     policy,
+    profile,
+    research,
   });
 }
 
@@ -4481,4 +4484,981 @@ describe('v3.3 daily loss uses trading P&L, not equity or capital moves', () => 
     assert.ok(world.executeTick.deathsExecuted?.some((entry) => entry.agentId === world.agents[1].id));
   });
 });
+
+// ===========================================================================
+// v3.4 part 1 — reconciliation costs allowance (docs/AGGRESSIVE-GROWTH.md §0)
+// The live paper account never pays virtual metabolism costs, so reconciliation
+// must expect them back — without minting capital and without hiding fill gaps.
+// ===========================================================================
+
+/** Fake broker for deterministic Treasury worlds: fixed equity + test-only equity offset. */
+function v34FakeBroker({ equityUsd = 100000 } = {}) {
+  const state = { equityUsd: round2(equityUsd), offsetUsd: 0 };
+  return {
+    state,
+    setEquityOffset(value) {
+      state.offsetUsd = Number(value) || 0;
+    },
+    async getAccount() {
+      const equity = round2(state.equityUsd + state.offsetUsd);
+      return {
+        equityUsd: equity,
+        cashUsd: equity,
+        buyingPowerUsd: equity,
+        status: 'ACTIVE',
+        currency: 'USD',
+        marginMultiplier: 1,
+        shortingEnabled: false,
+        optionsTradingLevel: 3,
+      };
+    },
+    async getPositions() {
+      return [];
+    },
+    async getClock() {
+      return { isOpen: true, timestamp: T0, nextOpen: null, nextClose: T0 + 6 * 60 * 60 * 1000 };
+    },
+    async getBars() {
+      return {};
+    },
+    async getLatestQuote() {
+      return null;
+    },
+    async submitOrder() {
+      throw new Error('the v3.4 reconciliation world must never trade');
+    },
+    async getOrders() {
+      return [];
+    },
+  };
+}
+
+/** Sim-mode automaton over a data-less fake broker: no hypotheses, no orders, only metabolism. */
+async function v34ReconWorld(overrides = {}) {
+  const env = makeEnv({
+    population: { initial: 2, cap: 4 },
+    endowmentUsd: 5000,
+    // Tight tolerance so a few dollars of drift is a real halt in these tests.
+    account: { reconciliationTolerancePct: 0.000001 },
+    ...overrides,
+  });
+  const clock = makeClock(T0);
+  const broker = v34FakeBroker();
+  const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+  await automaton.init();
+  return {
+    env,
+    config: env.config,
+    paths: env.paths,
+    clock,
+    broker,
+    automaton,
+    ledger: automaton._internals.ledger,
+    registry: automaton._internals.registry,
+  };
+}
+
+function v34Treasury(world) {
+  return world.automaton._internals.state.lastTreasury;
+}
+
+function v34WriteGrowthMarker(world, marker) {
+  fs.writeFileSync(path.join(world.paths.stateDir, 'growth-v34.json'), JSON.stringify(marker), 'utf8');
+}
+
+describe('v3.4 reconciliation: virtual metabolism costs are an allowance, not capital', () => {
+  it('cumulative virtual costs since the anchor clear the halt with no capital/cap effect', async () => {
+    const world = await v34ReconWorld();
+    // First tick anchors the virtual ledger to broker equity (the one-time anchor).
+    await world.automaton.tick();
+    assert.equal(v34Treasury(world).halted, false, 'the anchored first tick must be clean');
+    const agent = world.registry.alive()[0];
+    const capitalBefore = world.ledger.snapshot(agent.id).capitalContributionsUsd;
+    const rewardCapitalBefore = world.ledger.snapshot(agent.id).rewardCapitalUsd;
+    const endowmentBefore = world.registry.get(agent.id).endowmentUsd;
+    const poolBefore = world.ledger.pool().poolUsd;
+
+    // A week of virtual metabolism costs, booked after the anchor (the live-state failure mode).
+    const virtualCostUsd = 5;
+    world.ledger.charge(agent.id, virtualCostUsd, { category: 'hosting', role: 'hosting', at: world.clock.now() });
+    // The engine re-syncs ledger/registry from disk at the start of every tick, so persist the charge.
+    await world.ledger.save();
+    world.clock.advance(CYCLE_MS);
+    const tick = await world.automaton.tick();
+    const treasury = v34Treasury(world);
+    const reconciliation = treasury.reconciliation;
+
+    assert.equal(tick.treasury.halted, false, `halted: ${JSON.stringify(tick.treasury.haltReasons)}`);
+    assert.equal(reconciliation.ok, true);
+    assert.ok(Math.abs(reconciliation.deltaUsd) <= reconciliation.toleranceUsd,
+      `delta ${reconciliation.deltaUsd} must be inside tolerance ${reconciliation.toleranceUsd}`);
+    assert.ok(reconciliation.costsSinceAnchorUsd >= virtualCostUsd,
+      `costsSinceAnchor ${reconciliation.costsSinceAnchorUsd} must include the booked $${virtualCostUsd}`);
+    // Pre-fix expectation (allocated + pool) is short by ~the costs: that WAS the permanent halt.
+    const preFixDelta = round2(treasury.account.equityUsd - (treasury.allocatedUsd + treasury.poolUsd));
+    assert.ok(preFixDelta > reconciliation.toleranceUsd,
+      `pre-fix delta ${preFixDelta} must have exceeded the tolerance (a halt before v3.4)`);
+    // The allowance is reconciliation-only: no capital, no cash, no reward classification.
+    assert.equal(world.ledger.snapshot(agent.id).capitalContributionsUsd, capitalBefore);
+    assert.equal(world.ledger.snapshot(agent.id).rewardCapitalUsd, rewardCapitalBefore);
+    assert.equal(world.registry.get(agent.id).endowmentUsd, endowmentBefore);
+    assert.equal(world.ledger.pool().poolUsd, poolBefore);
+    // Conservation: broker equity = allocated + pool + virtual costs + residual delta.
+    assert.equal(
+      round2(treasury.account.equityUsd),
+      round2(treasury.allocatedUsd + treasury.poolUsd + reconciliation.costsSinceAnchorUsd + reconciliation.deltaUsd),
+      'reconciliation identity must be exact after the allowance',
+    );
+    assert.equal(reconciliation.virtualTotalUsd, round2(treasury.allocatedUsd + treasury.poolUsd + reconciliation.costsSinceAnchorUsd));
+  });
+
+  it('a genuine unbooked fill mismatch beyond tolerance still halts, in both directions', async () => {
+    const world = await v34ReconWorld();
+    await world.automaton.tick(); // anchor
+    // Costs are already covered by the allowance; now the broker disagrees by a real fill amount.
+    world.ledger.charge(world.registry.alive()[0].id, 5, { category: 'inference', role: 'executor', at: world.clock.now() });
+    await world.ledger.save();
+
+    world.broker.setEquityOffset(5);
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    const positive = v34Treasury(world);
+    assert.equal(positive.halted, true, 'a +$5 unbooked fill must halt the engine');
+    assert.ok(positive.haltReasons.includes('reconciliation_mismatch'));
+    assert.ok(Math.abs(positive.reconciliation.deltaUsd - 5) < 0.05,
+      `delta ${positive.reconciliation.deltaUsd} must expose the +$5 fill`);
+    assert.ok(positive.reconciliation.costsSinceAnchorUsd >= 5, 'the +$5 cost allowance must not mask it');
+
+    world.broker.setEquityOffset(-5);
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    const negative = v34Treasury(world);
+    assert.equal(negative.halted, true, 'a -$5 unbooked fill must halt the engine too');
+    assert.ok(negative.haltReasons.includes('reconciliation_mismatch'));
+    assert.ok(Math.abs(negative.reconciliation.deltaUsd + 5) < 0.05,
+      `delta ${negative.reconciliation.deltaUsd} must expose the -$5 fill`);
+
+    // Sub-tolerance noise still passes (the allowance is symmetric, not one-sided).
+    world.broker.setEquityOffset(0.02);
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    const noise = v34Treasury(world);
+    assert.equal(noise.halted, false, `$${noise.reconciliation.deltaUsd} is inside tolerance`);
+    assert.equal(noise.reconciliation.ok, true);
+  });
+
+  it('the allowance never lifts the allocation-cap wall (no cap inflation)', async () => {
+    // Treasurer-level world (no engine tick re-sync): two funded agents against a $1 allocation cap.
+    const env = makeEnv({
+      population: { initial: 0, cap: 4 },
+      endowmentUsd: 5000,
+      account: { reconciliationTolerancePct: 0.000001, allocationCapPct: 0.00001 },
+    });
+    const clock = makeClock(T0);
+    const broker = v34FakeBroker();
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    const ids = ['atm-cap-1', 'atm-cap-2'];
+    for (const id of ids) {
+      await registry.register({ id, generation: 0, bornAt: clock.iso(), status: 'alive', endowmentUsd: 5000, genome: { symbol: 'AAPL', family: 'momentum' } });
+      ledger.ensureAgent(id, { endowmentUsd: 5000, at: clock.iso() });
+      ledger.grant(id, 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    }
+    const treasurer = createTreasurer({
+      broker,
+      ledger,
+      registry,
+      journal: createJournal({ paths: env.paths, config: env.config }),
+      config: env.config,
+      paths: env.paths,
+      clock,
+    });
+    await treasurer.tick({ prices: {} }); // one-time anchor
+    // Virtual costs booked after the anchor are allowed back for reconciliation...
+    ledger.charge(ids[0], 5, { category: 'research', role: 'research', at: clock.now() });
+    const treasury = await treasurer.tick({ prices: {} });
+    // ...but the allocation cap is measured on allocated equity and is not relaxed by the allowance.
+    assert.equal(treasury.reconciliation.ok, true, JSON.stringify(treasury.reconciliation));
+    assert.equal(treasury.halted, true);
+    assert.deepEqual(treasury.haltReasons, ['allocation_cap'], JSON.stringify(treasury.haltReasons));
+    assert.ok(treasury.allocatedUsd > round2(treasury.account.equityUsd * 0.00001),
+      'allocated capital must not be reduced by the costs allowance');
+    assert.equal(treasury.reconciliation.costsSinceAnchorUsd, 5);
+    assert.equal(ledger.snapshot(ids[0]).capitalContributionsUsd, 5000, 'no capital minted');
+  });
+
+  it('anchored legacy ledgers normalise the missing baseline to 0; the anchor captures the baseline', () => {
+    const env = makeEnv({ population: { initial: 0, cap: 2 } });
+    const clock = makeClock(T0);
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent('atm-anchor', { endowmentUsd: 5000, at: clock.iso() });
+    ledger.grant('atm-anchor', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    ledger.charge('atm-anchor', 2, { category: 'inference', role: 'executor', at: clock.iso() });
+    const anchor = ledger.anchorToBrokerEquity(5000);
+    assert.equal(anchor.anchored, true);
+    assert.equal(anchor.anchorCostsUsd, 2, 'the anchor captures costs booked before it');
+    assert.equal(ledger.costsSinceAnchor(), 0, 'only post-anchor costs explain broker drift');
+    ledger.charge('atm-anchor', 0.3, { category: 'data', role: 'prospector', at: clock.iso() });
+    assert.equal(ledger.costsSinceAnchor(), 0.3);
+    // Re-anchoring is a no-op and keeps the captured baseline.
+    const again = ledger.anchorToBrokerEquity(4000);
+    assert.equal(again.anchored, false);
+    assert.equal(again.anchorCostsUsd, 2);
+
+    ledger.save();
+    const reloaded = createLedger({ paths: env.paths, config: env.config, clock });
+    reloaded.load();
+    assert.equal(reloaded.anchorCostsUsd, 2);
+    assert.equal(reloaded.costsSinceAnchor(), 0.3);
+    assert.equal(reloaded.totalCostsUsd(), 2.3);
+
+    // A legacy anchored ledger (the live state before v3.4) has no anchorCostsUsd field: normalise
+    // the baseline to 0 so every recorded cost counts and the first tick can clear the halt.
+    const raw = readJsonFile(env.paths.ledger);
+    const legacy = { ...raw, anchored: true, anchoredAt: raw.anchoredAt ?? clock.iso() };
+    delete legacy.anchorCostsUsd;
+    fs.writeFileSync(env.paths.ledger, JSON.stringify(legacy), 'utf8');
+    const normalised = createLedger({ paths: env.paths, config: env.config, clock });
+    normalised.load();
+    assert.equal(normalised.anchorCostsUsd, 0);
+    assert.equal(normalised.costsSinceAnchor(), 2.3, 'legacy normalisation counts every recorded cost');
+    // A persisted baseline larger than the booked costs must clamp to 0, never negative.
+    fs.writeFileSync(env.paths.ledger, JSON.stringify({ ...raw, anchored: true, anchorCostsUsd: 999 }), 'utf8');
+    const clamped = createLedger({ paths: env.paths, config: env.config, clock });
+    clamped.load();
+    assert.equal(clamped.costsSinceAnchor(), 0);
+  });
+});
+
+// ===========================================================================
+// v3.4 part 2 — aggressive growth cohort: assignment, funding, idempotence
+// ===========================================================================
+
+function v34CohortEnv({ initial = 30, cap = 60, overrides = {} } = {}) {
+  return makeEnv({
+    population: { initial, cap },
+    endowmentUsd: 50,
+    // The cohort runs at a $50 base endowment; the default child endowment ($2,500) would not
+    // fit that basis, so use a scaled one (same ratio as the live profile).
+    replication: { childEndowmentUsd: 25 },
+    strategyMix: { dayPct: 0.7 },
+    aggression: { enabled: true },
+    // The live profile's raised global caps (all 18 brakes still enforce them).
+    risk: { maxOpenPositions: 10, maxOrderNotionalUsd: 60, maxDailyOrders: 40, maxPositionPct: 0.6 },
+    account: { allocationCapPct: 0.92 },
+    ...overrides,
+  });
+}
+
+async function v34CohortWorld({ initial = 30, cap = 60, overrides = {} } = {}) {
+  const env = v34CohortEnv({ initial, cap, overrides });
+  const clock = makeClock(T0);
+  const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+  const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+  await automaton.init();
+  return {
+    env,
+    config: env.config,
+    paths: env.paths,
+    clock,
+    broker,
+    automaton,
+    ledger: automaton._internals.ledger,
+    registry: automaton._internals.registry,
+  };
+}
+
+const V34_BASKET_SIZES = {
+  aggressive: { day: 6, swing: 4 },
+  balanced: { day: 4, swing: 3 },
+  conservative: { day: 3, swing: 2 },
+};
+
+describe('v3.4 aggressive growth cohort: assignment, capital funding, idempotence', () => {
+  it('30 agents get deterministic day-first 12/13/5 profiles, profile baskets and markers', async () => {
+    const world = await v34CohortWorld();
+    const status = await world.automaton.status();
+    const counts = status.engine.aggression.counts;
+    assert.deepEqual(counts, { aggressive: 12, balanced: 13, conservative: 5 });
+    assert.equal(status.engine.aggression.enabled, true);
+    assert.equal(status.engine.aggression.capitalMultiplier, 1.35);
+    const agents = status.agents;
+    assert.equal(agents.length, 30);
+    const aggressive = agents.filter((agent) => agent.aggression === 'aggressive');
+    assert.equal(aggressive.length, 12);
+    assert.ok(aggressive.every((agent) => agent.tier === 'day'), 'aggressive cohort is day-first');
+    // Deterministic: re-deriving the same assignment from the same registry gives the same names.
+    const second = await world.automaton.status();
+    assert.deepEqual(second.engine.aggression.counts, counts);
+    for (const agent of agents) {
+      assert.deepEqual(agent.aggressionProfile.name, agent.aggression);
+      assert.equal(agent.symbols.length, V34_BASKET_SIZES[agent.aggression][agent.tier],
+        `${agent.aggression}/${agent.tier} basket`);
+      assert.equal(agent.activity.trades, 0);
+      assert.equal(agent.activity.positions, 0);
+    }
+    // Day-first ordering: all 12 aggressive are day bots, balanced fills the remaining day bots.
+    const dayAgents = agents.filter((agent) => agent.tier === 'day');
+    assert.equal(dayAgents.filter((agent) => agent.aggression === 'balanced').length, 9);
+    assert.equal(agents.filter((agent) => agent.tier === 'swing' && agent.aggression === 'balanced').length, 4);
+    assert.equal(agents.filter((agent) => agent.tier === 'swing' && agent.aggression === 'conservative').length, 5);
+    // Markers are versioned and idempotent.
+    const profileMarker = readJsonFile(path.join(world.paths.stateDir, 'aggression-v34.json'));
+    assert.equal(profileMarker.version, 1);
+    assert.deepEqual(profileMarker.profiles, counts);
+    assert.equal(profileMarker.changed, 30);
+    const capitalMarker = readJsonFile(path.join(world.paths.stateDir, 'aggression-capital-v34.json'));
+    assert.equal(capitalMarker.version, 1);
+    assert.equal(capitalMarker.targetCapitalUsd, 67.5);
+    assert.equal(capitalMarker.creditedUsd, 210);
+    assert.equal(Object.keys(capitalMarker.allocations).length, 12);
+    assert.equal(readJsonFile(path.join(world.paths.stateDir, 'growth-v34.json')).version, 1);
+  });
+
+  it('small populations keep the documented day-first proportions', async () => {
+    const world = await v34CohortWorld({ initial: 5, cap: 8 });
+    const status = await world.automaton.status();
+    assert.deepEqual(status.engine.aggression.counts, { aggressive: 2, balanced: 2, conservative: 1 });
+    const agents = status.agents;
+    assert.ok(agents.filter((agent) => agent.aggression === 'aggressive').every((agent) => agent.tier === 'day'));
+    assert.ok(agents.filter((agent) => agent.aggression === 'conservative').every((agent) => agent.tier === 'swing'));
+    for (const agent of agents) {
+      assert.equal(agent.symbols.length, V34_BASKET_SIZES[agent.aggression][agent.tier]);
+    }
+  });
+
+  it('aggression disabled keeps v3.3 balanced genomes, 4/3 baskets and no v3.4 profile markers', async () => {
+    const env = makeEnv({ population: { initial: 3, cap: 4 } });
+    assert.equal(env.config.aggression.enabled, false, 'the code default is opt-out for compatibility');
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const status = await automaton.status();
+    assert.deepEqual(status.engine.aggression.counts, { aggressive: 0, balanced: 3, conservative: 0 });
+    for (const agent of status.agents) {
+      assert.equal(agent.genome.aggression, 'balanced');
+      assert.equal(agent.symbols.length, agent.tier === 'day' ? 4 : 3, 'v3.3 4/3 baskets');
+      assert.equal(agent.aggressionProfile.policySizeFloor, 0);
+      assert.equal(agent.aggressionProfile.respectStandDown, true);
+    }
+    assert.equal(fs.existsSync(path.join(env.paths.stateDir, 'aggression-v34.json')), false);
+    assert.equal(fs.existsSync(path.join(env.paths.stateDir, 'aggression-capital-v34.json')), false);
+  });
+
+  it('disabled aggression passes the OPERATOR portfolio limits and a neutral executor profile', async () => {
+    const env = makeEnv({
+      population: { initial: 3, cap: 6 },
+      portfolio: { maxOpenPositionsDay: 2, maxOpenPositionsSwing: 1, maxOrdersPerCycle: 1 },
+    });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 6, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const captured = [];
+    const originalRun = automaton._internals.executor.run.bind(automaton._internals.executor);
+    automaton._internals.executor.run = async (args) => {
+      captured.push(args);
+      return originalRun(args);
+    };
+    for (const agent of automaton._internals.registry.alive()) {
+      automaton._internals.state.lastAnalysisAt.set(agent.id, 0);
+    }
+    clock.advance(CYCLE_MS);
+    await automaton.tick();
+    assert.ok(captured.length > 0, 'the executor must be reached in a deterministic sim cycle');
+    for (const args of captured) {
+      const tier = args.agent.tier === 'day' ? 'day' : 'swing';
+      assert.equal(args.portfolio.maxOpenPositions, env.config.portfolio[`maxOpenPositions${tier === 'day' ? 'Day' : 'Swing'}`],
+        `${tier} open cap must come from config.portfolio when aggression is disabled`);
+      assert.equal(args.portfolio.maxOrdersPerCycle, env.config.portfolio.maxOrdersPerCycle);
+      assert.deepEqual(args.profile, { aggression: 'balanced', policySizeFloor: 0, respectStandDown: true },
+        'a disabled cohort is neutral, not a hidden balanced profile');
+    }
+    assert.equal(fs.existsSync(path.join(env.paths.stateDir, 'aggression-v34.json')), false);
+  });
+
+  it('aggressive capital is a one-time pool-funded capital contribution, never P&L/reward', async () => {
+    const world = await v34CohortWorld();
+    const status = await world.automaton.status();
+    const pool = world.ledger.pool();
+    assert.equal(pool.poolUsd, 98290, 'pool falls by the $210 top-up only');
+    assert.equal(pool.allocatedUsd, 1710, '12 x 67.5 + 18 x 50 allocated');
+    assert.equal(round2(pool.poolUsd + pool.allocatedUsd), 100000, 'capital moved, never minted');
+    for (const agent of status.agents) {
+      const ledger = world.ledger.snapshot(agent.id);
+      if (agent.aggression === 'aggressive') {
+        assert.equal(agent.endowmentUsd, 67.5);
+        assert.equal(agent.capital.aggressiveCapitalUsd, 17.5, 'the contributed top-up is exposed for the UI');
+        assert.equal(ledger.capitalContributionsUsd, 67.5);
+        assert.equal(ledger.tradingPnlUsd, 0, 'the top-up must not be P&L');
+        assert.equal(agent.capital.rewardCapitalUsd, 0, 'the top-up is not reward capital');
+        assert.equal(agent.rewards.lifetimeUsd, 0);
+        const transfers = world.ledger.get(agent.id).events
+          .filter((event) => event.kind === 'transfer-in' && event.reason === 'v3.4 aggressive capital allocation');
+        assert.equal(transfers.length, 1, 'exactly one capital-contribution transfer');
+        assert.equal(transfers[0].amountUsd, 17.5);
+      } else {
+        assert.equal(agent.endowmentUsd, 50);
+        assert.equal(agent.capital.aggressiveCapitalUsd, 0);
+        assert.equal(ledger.capitalContributionsUsd, 50);
+      }
+    }
+    // The top-up came from the treasury pool, not from an external grant.
+    const treasuryTransfers = world.ledger.get(TREASURY_ID).events
+      .filter((event) => event.kind === 'transfer-out' && event.reason === 'v3.4 aggressive capital allocation');
+    assert.equal(treasuryTransfers.length, 12);
+    assert.equal(round2(treasuryTransfers.reduce((sum, event) => sum + Number(event.amountUsd || 0), 0)), 210);
+    // Allocation cap was respected by construction.
+    assert.ok(pool.allocatedUsd <= 100000 * 0.92);
+  });
+
+  it('restart is idempotent: no second top-up, no profile drift, markers untouched', async () => {
+    const world = await v34CohortWorld();
+    const statusBefore = await world.automaton.status();
+    const markerBefore = fs.readFileSync(path.join(world.paths.stateDir, 'aggression-v34.json'), 'utf8');
+    const capitalMarkerBefore = fs.readFileSync(path.join(world.paths.stateDir, 'aggression-capital-v34.json'), 'utf8');
+    const endowmentsBefore = Object.fromEntries(statusBefore.agents.map((agent) => [agent.id, agent.endowmentUsd]));
+    const poolBefore = world.ledger.pool().poolUsd;
+
+    const clock2 = makeClock(T0 + CYCLE_MS);
+    const broker2 = createSimBroker(world.config, { seed: 7, accountEquityUsd: 100000, clock: clock2 });
+    const restarted = await createAutomaton({ config: world.config, paths: world.paths, broker: broker2, clock: clock2 });
+    await restarted.init();
+    const statusAfter = await restarted.status();
+    assert.deepEqual(statusAfter.engine.aggression.counts, statusBefore.engine.aggression.counts);
+    assert.equal(restarted._internals.ledger.pool().poolUsd, poolBefore, 'no second top-up');
+    for (const agent of statusAfter.agents) {
+      assert.equal(agent.endowmentUsd, endowmentsBefore[agent.id]);
+      assert.equal(agent.capital.aggressiveCapitalUsd, statusBefore.agents.find((row) => row.id === agent.id).capital.aggressiveCapitalUsd);
+    }
+    assert.equal(fs.readFileSync(path.join(world.paths.stateDir, 'aggression-v34.json'), 'utf8'), markerBefore);
+    assert.equal(fs.readFileSync(path.join(world.paths.stateDir, 'aggression-capital-v34.json'), 'utf8'), capitalMarkerBefore);
+    assert.equal(statusAfter.engine.performance.baselineAt, statusBefore.engine.performance.baselineAt,
+      'the growth baseline is one-time');
+  });
+
+  it('a skipped-marker legacy state can still be migrated when aggression is enabled later', async () => {
+    // Simulate a state dir whose old build wrote the v3.4 markers as skipped.
+    const env = makeEnv({
+      population: { initial: 3, cap: 6 },
+      endowmentUsd: 50,
+      replication: { childEndowmentUsd: 25 },
+      strategyMix: { dayPct: 0.7 },
+    });
+    const clock = makeClock(T0);
+    const first = await createAutomaton({
+      config: env.config,
+      paths: env.paths,
+      broker: createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock }),
+      clock,
+    });
+    await first.init();
+    fs.writeFileSync(path.join(env.paths.stateDir, 'aggression-v34.json'),
+      JSON.stringify({ version: 1, skipped: true, reason: 'aggression disabled' }), 'utf8');
+    fs.writeFileSync(path.join(env.paths.stateDir, 'aggression-capital-v34.json'),
+      JSON.stringify({ version: 1, skipped: true, reason: 'aggression disabled' }), 'utf8');
+    const enabled = loadConfig({
+      cwd: env.dir,
+      env: {},
+      configFile: path.join(env.dir, 'no-such-config.json'),
+      overrides: {
+        mode: 'sim',
+        population: { initial: 3, cap: 6 },
+        endowmentUsd: env.config.endowmentUsd,
+        replication: { childEndowmentUsd: 25 },
+        paths: { stateDir: env.paths.stateDir, envFile: path.join(env.paths.stateDir, '.env') },
+        aggression: { enabled: true },
+      },
+    }).config;
+    const clock2 = makeClock(T0 + CYCLE_MS);
+    const second = await createAutomaton({
+      config: enabled,
+      paths: statePaths(enabled),
+      broker: createSimBroker(enabled, { seed: 7, accountEquityUsd: 100000, clock: clock2 }),
+      clock: clock2,
+    });
+    await second.init();
+    const status = await second.status();
+    const counts = status.engine.aggression.counts;
+    assert.ok(counts.aggressive > 0, `a stale skipped marker must not block the migration: ${JSON.stringify(counts)}`);
+    const marker = readJsonFile(path.join(env.paths.stateDir, 'aggression-v34.json'));
+    assert.notEqual(marker.skipped, true, 'the skipped marker is overwritten by the real migration');
+    const capitalMarker = readJsonFile(path.join(env.paths.stateDir, 'aggression-capital-v34.json'));
+    assert.ok(Number(capitalMarker.creditedUsd) > 0);
+    const aggressive = second._internals.registry.alive().filter((agent) => agent.genome.aggression === 'aggressive');
+    assert.ok(aggressive.every((agent) => agent.endowmentUsd <= 50 * 1.35 + 0.01), 'no double top-up on re-run');
+  });
+
+  it('migration keeps held positions on their opening spec while the entry basket follows the profile', async () => {
+    const env = makeEnv({ population: { initial: 2, cap: 4 }, endowmentUsd: 5000 });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const first = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await first.init();
+    const registry = first._internals.registry;
+    const ledger = first._internals.ledger;
+    const dayAgent = registry.alive().find((agent) => agent.tier === 'day');
+    const swingAgent = registry.alive().find((agent) => agent.tier === 'swing');
+    assert.ok(dayAgent && swingAgent);
+    await registry.update(dayAgent.id, { specId: 'spec-held-opening' });
+    await registry.update(swingAgent.id, { specId: 'spec-flat-stale' });
+    await registry.save();
+    ledger.applyFill(dayAgent.id, { symbol: dayAgent.genome.symbol, side: 'buy', qty: 1, priceUsd: 100, at: clock.now() });
+    await ledger.save();
+
+    const enabled = loadConfig({
+      cwd: env.dir,
+      env: {},
+      configFile: path.join(env.dir, 'no-such-config.json'),
+      overrides: {
+        mode: 'sim',
+        population: { initial: 2, cap: 4 },
+        endowmentUsd: 5000,
+        paths: { stateDir: env.paths.stateDir, envFile: path.join(env.paths.stateDir, '.env') },
+        aggression: { enabled: true },
+      },
+    }).config;
+    const clock2 = makeClock(T0 + CYCLE_MS);
+    const second = await createAutomaton({
+      config: enabled,
+      paths: statePaths(enabled),
+      broker: createSimBroker(enabled, { seed: 7, accountEquityUsd: 100000, clock: clock2 }),
+      clock: clock2,
+    });
+    await second.init();
+    const held = second._internals.registry.get(dayAgent.id);
+    const flat = second._internals.registry.get(swingAgent.id);
+    assert.equal(held.specId, 'spec-held-opening', 'held positions keep their opening spec for safe exits');
+    assert.equal(Object.keys(second._internals.ledger.snapshot(dayAgent.id).positions).length, 1, 'the position itself survives');
+    assert.equal(held.genome.aggression, 'aggressive');
+    assert.equal(held.symbols.length, V34_BASKET_SIZES.aggressive[held.tier], 'entry basket follows the profile');
+    assert.equal(flat.specId, null, 'flat agents lose the stale cached spec so the builder recompiles');
+    assert.equal(flat.genome.aggression, 'balanced');
+    assert.equal(flat.symbols.length, V34_BASKET_SIZES.balanced[flat.tier]);
+  });
+
+  it('replication inherits the aggression profile with exactly one genome mutation', async () => {
+    const env = makeV32Env({
+      population: { initial: 0, cap: 100 },
+      endowmentUsd: 5000,
+      replication: { childEndowmentUsd: 2500, surplus7dUsd: 2, minRunwayHours: 24 },
+    });
+    const { clock } = v32Boot(env);
+    const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    const journal = createJournal({ paths: env.paths, config: env.config });
+    const parentBasket = ['F', 'AAPL', 'MSFT', 'BAC'];
+    const parentGenome = {
+      symbol: parentBasket[0],
+      symbols: [...parentBasket],
+      family: 'momentum',
+      lookback: 60,
+      entryZ: 1.2,
+      exitZ: 0.3,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 8,
+      sizePct: 0.15,
+      sessionFilter: 'any',
+      aggression: 'aggressive',
+      aggressionCapitalUsd: 17.5,
+    };
+    const parentId = 'atm-v34-parent';
+    await registry.register({
+      id: parentId,
+      generation: 0,
+      bornAt: clock.iso(),
+      status: 'alive',
+      endowmentUsd: 5000,
+      genome: parentGenome,
+      symbols: [...parentBasket],
+      specIds: {},
+      mutation: null,
+      specId: null,
+      tier: 'day',
+    });
+    ledger.ensureAgent(parentId, { endowmentUsd: 5000, at: clock.iso() });
+    ledger.grant(parentId, 5000, { reason: 'genesis', at: clock.iso() });
+    const treasurer = {
+      fundChild(parentID, childId, amountUsd) {
+        ledger.transfer(parentID, childId, amountUsd, { reason: 'child-endowment', at: clock.iso() });
+      },
+    };
+    const replicator = createReplicator({ treasurer, registry, ledger, journal, config: env.config, clock, rng: mulberry32(7) });
+    const gate = { mayReplicate: true, surplus7dUsd: 1000, runwayHours: 1000, agentViews: [{ agentId: parentId, equityUsd: 5000 }] };
+    const { child, mutation } = await replicator.spawn(parentId, gate);
+    assert.equal(child.genome.aggression, 'aggressive', 'the child inherits the cohort profile');
+    assert.equal(child.genome.aggressionCapitalUsd, 17.5, 'the inherited top-up classification travels with the genome');
+    const changedMutable = MUTABLE_FIELDS.filter(
+      (field) => JSON.stringify(parentGenome[field]) !== JSON.stringify(child.genome[field]),
+    );
+    assert.deepEqual(changedMutable, [mutation.field], 'exactly one MUTABLE-catalogue mutation');
+    // The profile is not a mutable axis: it is never the field that mutates.
+    assert.notEqual(mutation.field, 'aggression');
+    const nonMutableChanges = Object.keys(parentGenome).filter((field) => {
+      if (field === mutation.field || field === 'symbols') return false;
+      return JSON.stringify(parentGenome[field]) !== JSON.stringify(child.genome[field]);
+    });
+    assert.deepEqual(nonMutableChanges, [], 'no unheritable re-specialisation');
+  });
+});
+
+// ===========================================================================
+// v3.4 part 3 — builder + executor aggression profile behaviour
+// ===========================================================================
+
+/** Stock-only instrument world: deterministic notional comparisons without option playbooks. */
+function v34StockWorld() {
+  return makeInstrumentWorld({
+    overrides: {
+      instruments: { enabled: true, allowOptions: false, allowSpreads: false, allowCoveredCalls: false, allowShort: false, allowMargin: false },
+    },
+  });
+}
+
+const V34_AGGRESSIVE_PROFILE = Object.freeze({ aggression: 'aggressive', policySizeFloor: 0.8, respectStandDown: false });
+const V34_BALANCED_PROFILE = Object.freeze({ aggression: 'balanced', policySizeFloor: 0, respectStandDown: true });
+
+function v34BuilderHypothesis({ symbol = 'AAPL', family = 'momentum', specsHint = null } = {}) {
+  return {
+    id: 'hyp-v34',
+    symbol,
+    family,
+    proof: {
+      vendor: 'alpaca',
+      url: `https://data.alpaca.markets/v2/stocks/bars?symbols=${symbol}`,
+      observedAt: new Date(T0 - 60 * 60 * 1000).toISOString(),
+      metric: 'meanBps',
+      sampleSize: 30,
+      stats: { meanBps: 42 },
+    },
+    ...(specsHint ? { specsHint } : {}),
+  };
+}
+
+function v34Compile(config, genome, hypothesis = v34BuilderHypothesis()) {
+  const clock = makeClock(T0);
+  const builder = createBuilder({ config, clock });
+  return builder.compile({ hypothesis, agentId: 'atm-v34', cycleBudgetUsd: 100, genome });
+}
+
+const V34_MOMENTUM_GENOME = Object.freeze({
+  symbol: 'AAPL',
+  family: 'momentum',
+  lookback: 60,
+  entryZ: 1.2,
+  exitZ: 0.5,
+  stopPct: 0.02,
+  targetPct: 0.04,
+  maxHoldBars: 12,
+  sizePct: 0.2,
+  sessionFilter: 'any',
+});
+
+describe('v3.4 builder/executor aggression profiles', () => {
+  it('builder applies the profile multipliers after genome/hint values and before hard bounds', () => {
+    const env = makeEnv();
+    const balanced = v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'balanced' }).spec;
+    const aggressive = v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'aggressive' }).spec;
+    const conservative = v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'conservative' }).spec;
+    assert.equal(aggressive.params.entryZ, 1.2 * 0.7);
+    assert.equal(aggressive.params.sizePct, 0.2 * 1.35);
+    assert.equal(aggressive.params.stopPct, 0.02 * 0.8);
+    assert.equal(aggressive.params.targetPct, 0.04 * 1.2);
+    assert.equal(aggressive.params.maxHoldBars, 9, '12 x 0.75 rounded to an integer bar count');
+    assert.equal(aggressive.params.lookback, 60, 'lookback is not a profile axis');
+    assert.equal(aggressive.params.exitZ, 0.5, 'exitZ is not a profile axis');
+    assert.equal(aggressive.symbol, 'AAPL');
+    assert.equal(aggressive.family, 'momentum');
+    assert.equal(aggressive.profile.aggression, 'aggressive');
+    assert.equal(conservative.params.entryZ, 1.2 * 1.15);
+    assert.equal(conservative.params.sizePct, 0.2 * 0.8);
+    assert.equal(conservative.params.stopPct, 0.02);
+    assert.equal(conservative.params.targetPct, 0.04 * 0.9);
+    assert.equal(balanced.params.entryZ, 1.2);
+    // Profile scaling happens BEFORE the clamp: an aggressive over-bound value is clamped, not scaled.
+    const clamped = v34Compile(env.config, {
+      ...V34_MOMENTUM_GENOME,
+      aggression: 'aggressive',
+      entryZ: 3,
+      stopPct: 0.005,
+      targetPct: 0.12,
+      maxHoldBars: 48,
+      sizePct: 0.4,
+    }).spec;
+    assert.equal(clamped.params.entryZ, 3 * 0.7);
+    assert.equal(clamped.params.stopPct, PARAM_BOUNDS.stopPct.min, '0.005 x 0.8 clamps at the 0.005 floor');
+    assert.equal(clamped.params.targetPct, PARAM_BOUNDS.targetPct.max, '0.12 x 1.2 clamps at the 0.12 ceiling');
+    assert.equal(clamped.params.sizePct, PARAM_BOUNDS.sizePct.max, '0.4 x 1.35 clamps at the 0.4 ceiling');
+    for (const spec of [aggressive, conservative, balanced]) {
+      for (const [name, bound] of Object.entries(PARAM_BOUNDS)) {
+        assert.ok(spec.params[name] >= bound.min && spec.params[name] <= bound.max, `${spec.profile.aggression}.${name} in bounds`);
+      }
+    }
+  });
+
+  it('balanced and legacy genomes compile byte-compatible v3.3 specs', () => {
+    const env = makeEnv();
+    const legacy = v34Compile(env.config, { ...V34_MOMENTUM_GENOME }).spec;
+    const balanced = v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'balanced' }).spec;
+    const unknown = v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'reckless' }).spec;
+    assert.equal(legacy.profile, undefined, 'no aggression field means the legacy spec shape');
+    assert.equal(unknown.profile, undefined, 'unknown names never guess a profile');
+    assert.deepEqual(balanced.params, legacy.params);
+    assert.equal(balanced.specId, legacy.specId, 'balanced params hash exactly as v3.3 did');
+    assert.deepEqual(unknown.params, legacy.params);
+    assert.equal(unknown.specId, legacy.specId);
+    assert.equal(balanced.profile.aggression, 'balanced');
+    assert.equal(balanced.profile.entryZMultiplier, 1);
+    // deterministic: same inputs -> identical spec (no randomness in the profile path)
+    assert.deepEqual(v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'aggressive' }),
+      v34Compile(env.config, { ...V34_MOMENTUM_GENOME, aggression: 'aggressive' }));
+  });
+
+  it('executor aggressive floor raises cautious entries; balanced keeps legacy sizing', async () => {
+    const cautiousPolicy = (clock) => ({ stance: 'cautious', atMs: clock.now(), sizeMultiplier: 0.2 });
+    const baselineWorld = v34StockWorld();
+    const baseline = await runInstrumentExecutor(baselineWorld, { policy: cautiousPolicy(baselineWorld.clock) });
+    assert.equal(baseline.orders.length, 1);
+    // sizePct 0.2 x mandate.sizeBudgetUsd 2500 x cautious 0.2 = $100
+    assert.ok(Math.abs(round2(baseline.orders[0].qty * baseline.orders[0].avgFillPriceUsd) - 100) < 1.5,
+      'cautious sizing without a profile is the v3.3 $100');
+    assert.deepEqual(baseline.actions.find((action) => action.type === 'entry').policy, {
+      stance: 'cautious', sizeMultiplier: 0.2, applied: 'size',
+    });
+    const floorWorld = v34StockWorld();
+    const floored = await runInstrumentExecutor(floorWorld, {
+      policy: cautiousPolicy(floorWorld.clock),
+      profile: V34_AGGRESSIVE_PROFILE,
+    });
+    assert.ok(Math.abs(round2(floored.orders[0].qty * floored.orders[0].avgFillPriceUsd) - 400) < 1.5,
+      'aggressive floor: max(0.2, 0.8) x $500 = $400');
+    const flooredEntry = floored.actions.find((action) => action.type === 'entry');
+    assert.equal(flooredEntry.policy.profile, 'aggressive');
+    assert.equal(flooredEntry.policy.policyFloor, 0.8);
+    assert.equal(flooredEntry.policy.effectiveSizeMultiplier, 0.8);
+    // Balanced profile with floor 0 is exactly the legacy run.
+    const balancedWorld = v34StockWorld();
+    const balanced = await runInstrumentExecutor(balancedWorld, {
+      policy: cautiousPolicy(balancedWorld.clock),
+      profile: V34_BALANCED_PROFILE,
+    });
+    assert.ok(Math.abs(round2(balanced.orders[0].qty * balanced.orders[0].avgFillPriceUsd) - 100) < 1.5);
+    assert.deepEqual(balanced.actions.find((action) => action.type === 'entry').policy, {
+      stance: 'cautious', sizeMultiplier: 0.2, applied: 'size',
+    });
+  });
+
+  it('executor converts stand_down at the floor only when respectStandDown=false', async () => {
+    const world = v34StockWorld();
+    const blocked = await runInstrumentExecutor(world, {
+      policy: { stance: 'stand_down', atMs: world.clock.now(), sizeMultiplier: 0.4 },
+      profile: V34_BALANCED_PROFILE,
+    });
+    assert.equal(blocked.orders.length, 0);
+    assert.ok(blocked.actions.some((action) => action.reason === 'agent_stand_down'));
+
+    const convertedWorld = v34StockWorld();
+    const converted = await runInstrumentExecutor(convertedWorld, {
+      policy: { stance: 'stand_down', atMs: convertedWorld.clock.now(), sizeMultiplier: 0.4 },
+      profile: V34_AGGRESSIVE_PROFILE,
+    });
+    assert.equal(converted.orders.length, 1);
+    const entry = converted.actions.find((action) => action.type === 'entry');
+    assert.equal(entry.policy.converted, true);
+    assert.equal(entry.policy.convertedFrom, 'stand_down');
+    assert.equal(entry.policy.stance, 'cautious');
+    assert.equal(entry.policy.effectiveSizeMultiplier, 0.8);
+    assert.ok(Math.abs(round2(converted.orders[0].qty * converted.orders[0].avgFillPriceUsd) - 400) < 1.5, 'converted notional=' + round2(converted.orders[0]?.qty * converted.orders[0]?.avgFillPriceUsd) + ' orders=' + converted.orders.length + ' entries=' + JSON.stringify(converted.actions.map((a) => ({ type: a.type, reason: a.reason, policy: a.policy }))));
+
+    // Regression D-V34-3: bot-agent stores sizeMultiplier 1 when the model omits it; the
+    // converted stance must still size AT the floor, not at the bot's 1x factor.
+    const fullSizeWorld = v34StockWorld();
+    const fullSize = await runInstrumentExecutor(fullSizeWorld, {
+      policy: { stance: 'stand_down', atMs: fullSizeWorld.clock.now(), sizeMultiplier: 1 },
+      profile: V34_AGGRESSIVE_PROFILE,
+    });
+    assert.equal(fullSize.orders.length, 1);
+    assert.ok(Math.abs(round2(fullSize.orders[0].qty * fullSize.orders[0].avgFillPriceUsd) - 400) < 1.5,
+      'a converted stand-down is capped at the 0.8 floor, never a full-size entry');
+    assert.equal(fullSize.actions.find((action) => action.type === 'entry').policy.effectiveSizeMultiplier, 0.8);
+  });
+
+  it('research ALERT and the brake wall still veto a converted aggressive entry', async () => {
+    const researchWorld = v34StockWorld();
+    const vetoed = await runInstrumentExecutor(researchWorld, {
+      policy: { stance: 'stand_down', atMs: researchWorld.clock.now(), sizeMultiplier: 0.4 },
+      profile: V34_AGGRESSIVE_PROFILE,
+      research: { verdict: 'ALERT', sentiment: -0.8, confidence: 0.9, risks: ['gap risk'], atMs: researchWorld.clock.now() },
+    });
+    assert.equal(vetoed.orders.length, 0, 'research ALERT still wins over the converted stance');
+    assert.equal(vetoed.denied.length, 0, 'a research veto is an advisory skip, not a brake denial');
+    assert.ok(vetoed.actions.some((action) => action.reason === 'research_veto'));
+
+    const brakeWorld = v34StockWorld();
+    const denied = await runInstrumentExecutor(brakeWorld, {
+      policy: { stance: 'stand_down', atMs: brakeWorld.clock.now(), sizeMultiplier: 1 },
+      profile: V34_AGGRESSIVE_PROFILE,
+      mandate: { ...brakeWorld.mandate, maxDailyOrdersRemaining: 0 },
+    });
+    assert.equal(denied.orders.length, 0, 'the aggressive profile cannot bypass the D6 daily-order brake');
+    assert.equal(denied.denied[0].code, 'RATE_FORBIDDEN');
+    assert.equal(brakeWorld.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+  });
+});
+
+// ===========================================================================
+// v3.4 part 4 — annual-return target / performance + activity status
+// ===========================================================================
+
+describe('v3.4 annual-return target and activity status', () => {
+  it('target math: required daily pace, annualized return, progress points and onTrack', async () => {
+    const world = await v34ReconWorld();
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick(); // anchors + populates the account snapshot
+    const baseStatus = await world.automaton.status();
+    const baseline = baseStatus.engine.performance;
+    assert.equal(baseline.enabled, true);
+    assert.equal(baseline.targetAnnualReturnPct, 0.5);
+    assert.equal(baseline.requiredDailyReturnPct, Math.pow(1.5, 1 / 365) - 1);
+    assert.ok(Math.abs(baseline.requiredDailyReturnPct * 100 - 0.11115) < 0.0001, '~0.111%/day');
+    assert.ok(baseline.baselineAt, 'one-time growth baseline written on first start');
+    assert.equal(baseline.baselineAccountEquityUsd, 100000);
+    assert.ok(baseline.daysElapsed < 1, 'short history within the first day');
+    assert.equal(baseline.annualizedReturnPct, null, 'never fabricate an annualized return in short history');
+    assert.equal(baseline.targetProgressPct, null);
+    assert.equal(baseline.onTrack, null);
+    assert.deepEqual(baseStatus.performance, baseStatus.engine.performance);
+    const pnlTotal = baseline.tradingPnlTotalUsd;
+    const markerAt = (msAgo) => new Date(world.clock.now() - msAgo).toISOString();
+
+    // A 30-day history with +$1,000 trading P&L: 1% x 365/30 = 12.17%/yr = 24.33% of the 50% target.
+    v34WriteGrowthMarker(world, {
+      version: 1,
+      at: markerAt(30 * 86_400_000),
+      baselineAccountEquityUsd: 100000,
+      baselineTradingPnlUsd: pnlTotal - 1000,
+      targetAnnualReturnPct: 0.5,
+    });
+    const below = await world.automaton.refreshSnapshot();
+    const belowPerf = below.engine.performance;
+    assert.equal(belowPerf.daysElapsed, 30);
+    assert.equal(belowPerf.tradingPnlSinceBaselineUsd, 1000);
+    assert.equal(belowPerf.annualizedReturnPct, Math.round((1000 / 100000) * (365 / 30) * 1e6) / 1e6);
+    assert.ok(Math.abs(belowPerf.annualizedReturnPct - 0.121667) < 1e-6);
+    assert.equal(belowPerf.targetProgressPct, 24.33, 'points: 100 = on target');
+    assert.equal(belowPerf.onTrack, false, 'onTrack is informational only');
+    assert.equal(belowPerf.accountEquityUsd, 100000);
+
+    // +$5,000: 60.83%/yr = 121.67 points -> on pace.
+    v34WriteGrowthMarker(world, {
+      version: 1,
+      at: markerAt(30 * 86_400_000),
+      baselineAccountEquityUsd: 100000,
+      baselineTradingPnlUsd: pnlTotal - 5000,
+      targetAnnualReturnPct: 0.5,
+    });
+    const above = await world.automaton.refreshSnapshot();
+    const abovePerf = above.engine.performance;
+    assert.equal(abovePerf.targetProgressPct, 121.67);
+    assert.equal(abovePerf.onTrack, true);
+    assert.ok(abovePerf.annualizedReturnPct >= 0.5);
+
+    // Short history (< 1 elapsed day) hides annualized/progress/onTrack even with measured P&L.
+    v34WriteGrowthMarker(world, {
+      version: 1,
+      at: markerAt(12 * 60 * 60 * 1000),
+      baselineAccountEquityUsd: 100000,
+      baselineTradingPnlUsd: pnlTotal - 100,
+      targetAnnualReturnPct: 0.5,
+    });
+    const short = await world.automaton.refreshSnapshot();
+    assert.equal(short.engine.performance.daysElapsed, 0.5);
+    assert.equal(short.engine.performance.tradingPnlSinceBaselineUsd, 100);
+    assert.equal(short.engine.performance.annualizedReturnPct, null);
+    assert.equal(short.engine.performance.targetProgressPct, null);
+    assert.equal(short.engine.performance.onTrack, null);
+    // Capital base / equity are reported alongside for the UI card.
+    const capitalFromAgents = short.agents.reduce((sum, agent) => sum + Number(agent.capital?.contributedUsd || 0), 0);
+    assert.equal(short.engine.performance.accountCapitalBase, round2(capitalFromAgents + world.ledger.pool().poolUsd));
+  });
+
+  it('status exposes the v3.4 performance/aggression/activity contract on a stopped engine', async () => {
+    const world = await v34CohortWorld({ initial: 5, cap: 8 });
+    const status = await world.automaton.status();
+    assert.equal(world.automaton.isRunning(), false, 'status is served by a stopped engine');
+    assert.deepEqual(status.performance, status.engine.performance);
+    assert.deepEqual(status.aggression, status.engine.aggression);
+    assert.deepEqual(status.activity, status.engine.activity);
+    assert.equal(typeof status.engine.performance.requiredDailyReturnPct, 'number');
+    for (const key of [
+      'targetAnnualReturnPct', 'requiredDailyReturnPct', 'baselineAt', 'baselineAccountEquityUsd',
+      'baselineTradingPnlUsd', 'daysElapsed', 'tradingPnlSinceBaselineUsd', 'annualizedReturnPct',
+      'targetProgressPct', 'onTrack', 'accountEquityUsd', 'accountCapitalBase', 'tradingPnlTotalUsd',
+    ]) {
+      assert.ok(key in status.engine.performance, `performance.${key} is part of the UI contract`);
+    }
+    assert.deepEqual(Object.keys(status.engine.aggression).sort(),
+      ['aggressivePct', 'balancedPct', 'capitalMultiplier', 'counts', 'enabled', 'profiles'].sort());
+    for (const key of ['ordersToday', 'tradesTotal', 'positionsTotal', 'lastCycleExecutions', 'lastCycleOrders',
+      'activeProfiles', 'haltReasons', 'halted']) {
+      assert.ok(key in status.engine.activity, `activity.${key} is part of the UI contract`);
+    }
+    for (const agent of status.agents) {
+      assert.ok(['aggressive', 'balanced', 'conservative'].includes(agent.aggression));
+      assert.equal(agent.aggressionProfile.name, agent.aggression);
+      for (const key of ['basketSizeDay', 'basketSizeSwing', 'maxOpenPositionsDay', 'maxOpenPositionsSwing',
+        'maxOrdersPerCycle', 'entryZMultiplier', 'sizePctMultiplier', 'stopPctMultiplier',
+        'targetPctMultiplier', 'maxHoldBarsMultiplier', 'policySizeFloor', 'respectStandDown']) {
+        assert.ok(key in agent.aggressionProfile, `aggressionProfile.${key}`);
+      }
+      for (const key of ['ordersToday', 'trades', 'positions']) {
+        assert.ok(key in agent.activity, `activity.${key}`);
+      }
+    }
+    // The UI needs the aggressive capital split; it is contributed capital, never reward/P&L.
+    const aggressive = status.agents.filter((agent) => agent.aggression === 'aggressive');
+    assert.ok(aggressive.length > 0);
+    assert.ok(aggressive.every((agent) => agent.capital.aggressiveCapitalUsd === 17.5));
+    assert.ok(aggressive.every((agent) => agent.capital.rewardCapitalUsd === 0));
+  });
+
+  it('the 50% target never drives order sizing (status-only wiring)', async () => {
+    const world = await v34ReconWorld();
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    const agentId = world.registry.alive()[0].id;
+    const mandateBefore = v34Treasury(world).mandates[agentId];
+    assert.ok(mandateBefore);
+    assert.equal(JSON.stringify(mandateBefore).includes('target'), false);
+    assert.equal(JSON.stringify(mandateBefore).includes('performance'), false);
+    const pnlTotal = (await world.automaton.status()).engine.performance.tradingPnlTotalUsd;
+    // Hide the target far behind: if any engine path sized orders from progress, these mandates would change.
+    v34WriteGrowthMarker(world, {
+      version: 1,
+      at: new Date(T0 - 30 * 86_400_000).toISOString(),
+      baselineAccountEquityUsd: 100000,
+      baselineTradingPnlUsd: pnlTotal + 1_000_000,
+      targetAnnualReturnPct: 0.5,
+    });
+    world.clock.advance(CYCLE_MS);
+    await world.automaton.tick();
+    const status = await world.automaton.status();
+    assert.equal(status.engine.performance.onTrack, false);
+    const mandateAfter = v34Treasury(world).mandates[agentId];
+    assert.ok(Math.abs(mandateAfter.sizeBudgetUsd - mandateBefore.sizeBudgetUsd) <= 0.02, 'sizeBudget before ' + mandateBefore.sizeBudgetUsd + ' after ' + mandateAfter.sizeBudgetUsd);
+    assert.ok(Math.abs(mandateAfter.maxOrderNotionalUsd - mandateBefore.maxOrderNotionalUsd) <= 0.02);
+    // The mandate cap is still the configured risk formula, not a performance/target number.
+    const expectedCap = round2(Math.min(
+      Number(world.config.risk.maxOrderNotionalUsd),
+      Number(world.config.risk.maxOrderPctOfEquity) * mandateAfter.equityUsd,
+    ));
+    assert.ok(Math.abs(mandateAfter.sizeBudgetUsd - expectedCap) <= 0.01, 'sizeBudget ' + mandateAfter.sizeBudgetUsd + ' expectedCap ' + expectedCap + ' equity ' + mandateAfter.equityUsd);
+  });
+});
+
+
+
+
 

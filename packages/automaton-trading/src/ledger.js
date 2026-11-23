@@ -28,6 +28,11 @@
  * normalised on load (and OCC symbols are recognised as options), and legacy records get
  * `capitalContributionsUsd = declaredEndowmentUsd + creditsUsd`, reward 0, version 1.
  *
+ * v3.4 reconciliation costs allowance (docs/AGGRESSIVE-GROWTH.md §0): `costsUsd` is virtual
+ * metabolism spend the paper account never paid. The one-time anchor persists `anchorCostsUsd`;
+ * `costsSinceAnchor()` reports the post-anchor portion (0 for legacy anchored ledgers) so
+ * reconciliation can expect it without minting cash/capital or hiding real fill mismatches.
+ *
  * Owned by mortality-core. Contract: docs/INSTRUMENTS.md + docs/CONTRACTS.md +
  * docs/FAIR-PNL-REWARDS.md §3.
  */
@@ -169,11 +174,14 @@ export function createLedger({ paths, config, clock } = {}) {
     ? Number(instruments.maxMarginPctEquity)
     : 1;
 
-  /** @type {{ version: number, anchored: boolean, anchoredAt: string|null, agents: Record<string, object> }} */
+  /**
+   * @type {{ version: number, anchored: boolean, anchoredAt: string|null,
+   *   anchorCostsUsd: number, agents: Record<string, object> }}
+   */
   let state = emptyState();
 
   function emptyState() {
-    return { version: 3, anchored: false, anchoredAt: null, agents: {} };
+    return { version: 3, anchored: false, anchoredAt: null, anchorCostsUsd: 0, agents: {} };
   }
 
   function newRecord(agentId, { endowmentUsd = 0, at } = {}) {
@@ -713,6 +721,33 @@ export function createLedger({ paths, config, clock } = {}) {
   /** Clamped capital contributions of a record (finite, ≥0, 2dp). */
   function capitalTotal(record) {
     return round2(Math.max(0, Number(record?.capitalContributionsUsd) || 0));
+  }
+
+  /**
+   * Cumulative virtual metabolism costs booked to every ledger record (agents + treasury).
+   *
+   * These are SIMULATED operating expenses (hosting/inference/data/research/agent reviews):
+   * they reduce virtual cash/equity but the paper broker account never pays them, so the
+   * reconciliation adds the post-anchor portion back (`costsSinceAnchor`) instead of treating
+   * them as unbooked fills. Kept at 8dp because charges accumulate sub-cent amounts.
+   * @returns {number}
+   */
+  function totalCostsUsd() {
+    let total = 0;
+    for (const record of Object.values(state.agents)) total += Number(record?.costsUsd) || 0;
+    return round8(total);
+  }
+
+  /**
+   * Virtual costs booked SINCE the one-time reconciliation anchor (2dp, clamped ≥0).
+   *
+   * The anchor sets virtual total = broker account equity and captures `anchorCostsUsd`, so
+   * only costs after that point explain a broker-vs-virtual drift. A legacy anchored ledger
+   * with no persisted baseline normalises the baseline to 0 (every recorded cost counts).
+   * @returns {number}
+   */
+  function costsSinceAnchor() {
+    return round2(Math.max(0, totalCostsUsd() - state.anchorCostsUsd));
   }
 
   /** Clamped reward-capital subset of a record (≤ capital, ≥0, 2dp). */
@@ -1272,13 +1307,20 @@ export function createLedger({ paths, config, clock } = {}) {
    * One-time reconciliation anchor: credit `'__treasury__'` with the broker capital that
    * is not yet allocated, so sum(agent equity) + treasury equity = broker account equity
    * at the anchor point. Later drift is what `treasurer.tick()` reports as mismatch.
+   *
+   * Also captures `anchorCostsUsd` (the virtual costs booked so far): costs AFTER the anchor
+   * are simulated operating expenses the paper account never paid, so the Treasurer adds
+   * `costsSinceAnchor()` to the expected virtual total instead of halting on their drift.
+   * This is a reconciliation allowance only; it never mints cash or capital for an agent.
    */
   function anchorToBrokerEquity(accountEquityUsd) {
     const accountEquity = round2(Number(accountEquityUsd));
     if (!Number.isFinite(accountEquity)) {
       fail('CONFIG_INVALID', 'anchorToBrokerEquity requires a finite account equity', { accountEquityUsd });
     }
-    if (state.anchored) return { anchored: false, seededUsd: 0, poolUsd: pool().poolUsd };
+    if (state.anchored) {
+      return { anchored: false, seededUsd: 0, poolUsd: pool().poolUsd, anchorCostsUsd: state.anchorCostsUsd };
+    }
     const allocated = pool().allocatedUsd;
     const seed = round2(accountEquity - allocated);
     if (seed > 0) {
@@ -1286,7 +1328,13 @@ export function createLedger({ paths, config, clock } = {}) {
     }
     state.anchored = true;
     state.anchoredAt = currentClock.iso();
-    return { anchored: true, seededUsd: Math.max(0, seed), poolUsd: pool().poolUsd };
+    state.anchorCostsUsd = totalCostsUsd();
+    return {
+      anchored: true,
+      seededUsd: Math.max(0, seed),
+      poolUsd: pool().poolUsd,
+      anchorCostsUsd: state.anchorCostsUsd,
+    };
   }
 
   function save() {
@@ -1299,6 +1347,9 @@ export function createLedger({ paths, config, clock } = {}) {
     if (!raw) return;
     state.anchored = raw.anchored === true;
     state.anchoredAt = typeof raw.anchoredAt === 'string' ? raw.anchoredAt : null;
+    // Legacy ledgers predate the costs allowance: normalise the missing baseline to 0, so
+    // every recorded cost counts as "since anchor" and the first reconciliation can clear.
+    state.anchorCostsUsd = round8(Math.max(0, Number(raw.anchorCostsUsd) || 0));
     const agents = isPlainObject(raw.agents) ? raw.agents : {};
     for (const [agentId, record] of Object.entries(agents)) {
       if (!isPlainObject(record)) continue;
@@ -1328,6 +1379,15 @@ export function createLedger({ paths, config, clock } = {}) {
     setCapitalBasis,
     hasCapitalAccounting,
     roleCosts,
+    // v3.4 reconciliation costs allowance (docs/AGGRESSIVE-GROWTH.md §0). Virtual costs
+    // booked since the one-time anchor are simulated operating expenses the paper broker
+    // never paid, so reconciliation adds them back; they are never minted agent capital.
+    totalCostsUsd,
+    costsSinceAnchor,
+    /** @returns {number} virtual costs booked at the one-time anchor (0 when never anchored). */
+    get anchorCostsUsd() {
+      return state.anchorCostsUsd;
+    },
     history,
     groups,
     pool,

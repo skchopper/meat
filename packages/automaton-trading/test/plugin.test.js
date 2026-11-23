@@ -1116,6 +1116,108 @@ function buildV33StatusPayload() {
   return status;
 }
 
+/**
+ * v3.4 annual-return-target + aggressive-growth-cohort fixture
+ * (docs/AGGRESSIVE-GROWTH.md §1/§2/§3/§5). Decorates the v3.3 payload with
+ * `engine.performance` / `engine.aggression` / `engine.activity`, per-agent
+ * `aggression` + `aggressionProfile` + `activity`, and the aggressive capital
+ * top-up marker recorded as contributed capital.
+ */
+const V34_AGGRESSION_PROFILES = {
+  aggressive: {
+    basketSizeDay: 6, basketSizeSwing: 4, maxOpenPositionsDay: 8, maxOpenPositionsSwing: 5,
+    maxOrdersPerCycle: 4, entryZMultiplier: 0.7, sizePctMultiplier: 1.35, stopPctMultiplier: 0.8,
+    targetPctMultiplier: 1.2, maxHoldBarsMultiplier: 0.75, policySizeFloor: 0.8, respectStandDown: false,
+  },
+  balanced: {
+    basketSizeDay: 4, basketSizeSwing: 3, maxOpenPositionsDay: 5, maxOpenPositionsSwing: 3,
+    maxOrdersPerCycle: 2, entryZMultiplier: 1, sizePctMultiplier: 1, stopPctMultiplier: 1,
+    targetPctMultiplier: 1, maxHoldBarsMultiplier: 1, policySizeFloor: 0, respectStandDown: true,
+  },
+  conservative: {
+    basketSizeDay: 3, basketSizeSwing: 2, maxOpenPositionsDay: 3, maxOpenPositionsSwing: 2,
+    maxOrdersPerCycle: 1, entryZMultiplier: 1.15, sizePctMultiplier: 0.8, stopPctMultiplier: 1,
+    targetPctMultiplier: 0.9, maxHoldBarsMultiplier: 1, policySizeFloor: 0, respectStandDown: true,
+  },
+};
+
+/** Deterministic 12 aggressive / 13 balanced / 5 conservative (day agents first). */
+function aggressionForIndex(index) {
+  if (index < 12) return 'aggressive';
+  if (index < 25) return 'balanced';
+  return 'conservative';
+}
+
+function buildV34StatusPayload() {
+  const status = buildV33StatusPayload();
+  const agents = status.agents;
+  const counts = { aggressive: 0, balanced: 0, conservative: 0 };
+  agents.forEach((agent, index) => {
+    const aggression = aggressionForIndex(index);
+    counts[aggression] += 1;
+    agent.aggression = aggression;
+    agent.genome.aggression = aggression;
+    agent.aggressionProfile = { ...V34_AGGRESSION_PROFILES[aggression] };
+    agent.activity = {
+      ordersToday: index % 3,
+      trades: index % 4,
+      positions: (Array.isArray(agent.positions) ? agent.positions : []).length,
+    };
+  });
+  // The first aggressive agent owns the one-time v3.4 top-up: it is capital
+  // contributed (base 20 + rewards 58.56 + aggressive 28.44 = 107), never P&L.
+  const topped = agents[0];
+  topped.capital = {
+    contributedUsd: 107,
+    baseUsd: 20,
+    rewardCapitalUsd: 58.56,
+    aggressiveCapitalUsd: 28.44,
+    rewardSharePct: 54.73,
+    capitalVersion: 2,
+  };
+  topped.equityUsd = 105.3; // contributed 107 + trading P&L −1.70
+  topped.cashUsd = 105.3;
+  status.engine.capitalAccounting = { ...status.engine.capitalAccounting, tradingPnlTotalUsd: 200 };
+  status.engine.performance = {
+    enabled: true,
+    targetAnnualReturnPct: 0.5,
+    requiredDailyReturnPct: 0.001113,
+    baselineAt: '2025-11-01T00:00:00.000Z',
+    baselineAccountEquityUsd: 20000,
+    baselineTradingPnlUsd: 0,
+    daysElapsed: 22,
+    tradingPnlSinceBaselineUsd: 200,
+    annualizedReturnPct: 0.1659090909,
+    // The engine reports this field as PERCENT POINTS (100 = on target); the UI
+    // normalizes to a fraction. 20000 × 16.6%/yr ÷ 50% target ≈ 33.18.
+    targetProgressPct: 33.18,
+    onTrack: false,
+    accountEquityUsd: 20200,
+    accountCapitalBase: 20000,
+    tradingPnlTotalUsd: 200,
+  };
+  status.engine.aggression = {
+    enabled: true,
+    aggressivePct: 0.4,
+    balancedPct: 0.45,
+    capitalMultiplier: 1.35,
+    profiles: JSON.parse(JSON.stringify(V34_AGGRESSION_PROFILES)),
+    counts: { ...counts },
+  };
+  status.engine.activity = {
+    ordersToday: 9,
+    tradesTotal: 33,
+    positionsTotal: 17,
+    lastCycleExecutions: 2,
+    lastCycleOrders: 3,
+    // The engine reports the active profiles as a counts object, not an array.
+    activeProfiles: { aggressive: 12, balanced: 13, conservative: 5 },
+    haltReasons: ['market_closed'],
+    halted: false,
+  };
+  return status;
+}
+
 function createFakeEngine(options = {}) {
   const calls = {
     start: 0,
@@ -4166,6 +4268,446 @@ test('pure data mapping v3.3: KPI equity/P&L separation, trading day rows and le
 
     // No secret material below the KPI/rows mapping.
     const serialized = JSON.stringify([cards, rows, periods, totals]);
+    assert.equal(serialized.includes(SECRET), false);
+    assert.equal(serialized.includes(SECRET_TWO), false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v3.4 annual return target + aggressive growth cohort
+// (docs/AGGRESSIVE-GROWTH.md §1/§2/§3/§5)
+// ---------------------------------------------------------------------------
+
+test('pure data mapping v3.4: annual return target math, pacing, short history and legacy fallback', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV34StatusPayload();
+    const performance = helpers.performanceView(status);
+    const requiredTradingPnlUsd = Math.round(20000 * (Math.pow(1.5, 22 / 365) - 1) * 100) / 100;
+    const expectedAnnualized = (200 / 20000) * (365 / 22);
+
+    // ---- target + pacing (engine-reported values) ----
+    assert.equal(performance.available, true);
+    assert.equal(performance.reported, true);
+    assert.equal(performance.legacy, false);
+    assert.equal(performance.enabled, true);
+    assert.equal(performance.targetAnnualReturnPct, 0.5);
+    assert.equal(performance.targetAnnualReturnPctPoints, 50);
+    assert.equal(performance.targetAnnualReturnText, '50%');
+    assert.equal(performance.requiredDailyReturnPct, 0.001113);
+    assert.equal(performance.requiredDailyReturnText, '0.111%/day');
+    assert.equal(performance.baselineAt, '2025-11-01T00:00:00.000Z');
+    assert.equal(performance.baselineAccountEquityUsd, 20000);
+    assert.equal(performance.baselineTradingPnlUsd, 0);
+    assert.equal(performance.daysElapsed, 22);
+    assert.equal(performance.daysElapsedText, '22');
+    assert.equal(performance.tradingPnlSinceBaselineUsd, 200);
+    assert.equal(performance.tradingPnlSinceBaselineText, '+$200.00');
+    assert.equal(performance.annualizedReturnPct, 0.1659090909);
+    assert.equal(performance.annualizedReturnText, '+16.6%');
+    assert.ok(Math.abs(performance.targetProgressPct - 0.3318) < 1e-12, 'engine percent points are normalized to a fraction');
+    assert.equal(performance.targetProgressText, '33%');
+    assert.equal(performance.requiredTradingPnlUsd, requiredTradingPnlUsd, 'required cumulative trading P&L for the elapsed days');
+    assert.equal(performance.paceText, `${Math.round((200 / requiredTradingPnlUsd) * 100)}%`);
+    assert.equal(performance.onTrack, false);
+    assert.equal(performance.onTrackLabelKey, 'targetBehind');
+    assert.equal(performance.accountEquityUsd, 20200);
+    assert.equal(performance.accountEquityText, '$20,200.00');
+    assert.equal(performance.accountCapitalBase, 20000);
+    assert.equal(performance.tradingPnlTotalUsd, 200);
+    assert.equal(performance.notGuarantee, true, 'the target is explicitly labelled target, not guarantee');
+    assert.equal(performance.noteKey, 'annualTargetHint');
+
+    // ---- targetProgress() compact projection (accepts view or raw status) ----
+    const compact = helpers.targetProgress(performance);
+    assert.equal(compact.targetAnnualReturnText, '50%');
+    assert.equal(compact.annualizedReturnText, '+16.6%');
+    assert.ok(Math.abs(compact.targetProgressPct - 0.3318) < 1e-12);
+    assert.equal(compact.onTrack, false);
+    assert.equal(compact.shortHistory, false);
+    const compactFromStatus = helpers.targetProgress(status);
+    assert.equal(compactFromStatus.targetAnnualReturnText, '50%');
+    assert.equal(compactFromStatus.annualizedReturnPct, 0.1659090909);
+
+    // ---- derived math when the engine omits the computed fields ----
+    const derivedStatus = buildV34StatusPayload();
+    delete derivedStatus.engine.performance.annualizedReturnPct;
+    delete derivedStatus.engine.performance.targetProgressPct;
+    delete derivedStatus.engine.performance.requiredDailyReturnPct;
+    delete derivedStatus.engine.performance.onTrack;
+    const derived = helpers.performanceView(derivedStatus);
+    assert.ok(Math.abs(derived.annualizedReturnPct - expectedAnnualized) < 1e-12, 'annualized = trading P&L / baseline equity × 365 / days');
+    assert.ok(Math.abs(derived.targetProgressPct - expectedAnnualized / 0.5) < 1e-12, 'progress = annualized / target');
+    assert.ok(Math.abs(derived.requiredDailyReturnPct - (Math.pow(1.5, 1 / 365) - 1)) < 1e-15);
+    assert.equal(derived.requiredDailyReturnText, '0.111%/day');
+    assert.equal(derived.onTrack, false, 'informational pace only');
+    assert.equal(derived.onTrackLabelKey, 'targetBehind');
+
+    // ---- too little history (< 1 day): explicit nulls, never a fabricated rate ----
+    const shortStatus = buildV34StatusPayload();
+    shortStatus.engine.performance.daysElapsed = 0.4;
+    delete shortStatus.engine.performance.annualizedReturnPct;
+    delete shortStatus.engine.performance.targetProgressPct;
+    delete shortStatus.engine.performance.onTrack;
+    const short = helpers.performanceView(shortStatus);
+    assert.equal(short.annualizedReturnPct, null, 'fewer than 24h of history cannot be annualized');
+    assert.equal(short.annualizedReturnText, '—');
+    assert.equal(short.annualizedShortHistory, true);
+    assert.equal(short.targetProgressPct, null);
+    assert.equal(short.targetProgressText, '—');
+    assert.equal(short.onTrack, null);
+    assert.equal(short.onTrackLabelKey, 'targetUnknown');
+    assert.equal(short.daysElapsedText, '0.4');
+    assert.equal(short.targetAnnualReturnText, '50%', 'the target itself is still shown');
+    assert.equal(typeof short.requiredDailyReturnText, 'string');
+
+    // ---- on pace when the annualized return meets the target ----
+    const onPaceStatus = buildV34StatusPayload();
+    onPaceStatus.engine.performance.annualizedReturnPct = 0.62;
+    onPaceStatus.engine.performance.targetProgressPct = 124; // engine percent points
+    onPaceStatus.engine.performance.onTrack = true;
+    const onPace = helpers.performanceView(onPaceStatus);
+    assert.equal(onPace.onTrack, true);
+    assert.equal(onPace.onTrackLabelKey, 'targetOnTrack');
+    assert.ok(Math.abs(onPace.targetProgressPct - 1.24) < 1e-12);
+    assert.equal(onPace.targetProgressText, '124%');
+    assert.equal(onPace.annualizedReturnText, '+62.0%');
+
+    // ---- targetProgressPct unit tolerance: points (engine) or fraction (docs) ----
+    const pointsStatus = buildV34StatusPayload();
+    pointsStatus.engine.performance.annualizedReturnPct = 0.075; // 7.5%/yr
+    pointsStatus.engine.performance.targetProgressPct = 15; // 15% of the 50% target
+    const pointsBacked = helpers.performanceView(pointsStatus);
+    assert.ok(Math.abs(pointsBacked.targetProgressPct - 0.15) < 1e-12);
+    assert.equal(pointsBacked.targetProgressText, '15%');
+    pointsStatus.engine.performance.targetProgressPct = 0.15; // fraction form is accepted too
+    const fractionBacked = helpers.performanceView(pointsStatus);
+    assert.ok(Math.abs(fractionBacked.targetProgressPct - 0.15) < 1e-12);
+    assert.equal(fractionBacked.targetProgressText, '15%');
+    // A small progress value must not be mistaken for a fraction (3 points = 3%).
+    pointsStatus.engine.performance.annualizedReturnPct = 0.015;
+    pointsStatus.engine.performance.targetProgressPct = 3;
+    const smallProgress = helpers.performanceView(pointsStatus);
+    assert.ok(Math.abs(smallProgress.targetProgressPct - 0.03) < 1e-12);
+    assert.equal(smallProgress.targetProgressText, '3%');
+
+    // ---- top-level `performance` alias is accepted ----
+    const topLevel = helpers.performanceView({
+      performance: { targetAnnualReturnPct: 0.5, daysElapsed: 10, baselineAccountEquityUsd: 10000, tradingPnlSinceBaselineUsd: 100 },
+    });
+    assert.equal(topLevel.available, true);
+    assert.ok(Math.abs(topLevel.annualizedReturnPct - (100 / 10000) * (365 / 10)) < 1e-12);
+
+    // ---- legacy snapshot (no v3.4 performance block): default target, dashes ----
+    const legacy = helpers.performanceView(buildStatusPayload({ running: true }));
+    assert.equal(legacy.available, false);
+    assert.equal(legacy.legacy, true);
+    assert.equal(legacy.targetAnnualReturnText, '50%', 'the default 50% target is still displayed');
+    assert.equal(legacy.annualizedReturnText, '—');
+    assert.equal(legacy.annualizedReturnPct, null);
+    assert.equal(legacy.onTrack, null);
+    assert.equal(legacy.noteKey, 'performanceLegacyNote');
+    assert.equal(typeof legacy.tradingPnlTotalUsd, 'number', 'fair v3.3 trading P&L totals still feed the card');
+    const empty = helpers.performanceView(null);
+    assert.equal(empty.available, false);
+    assert.equal(empty.targetAnnualReturnPct, 0.5);
+    assert.ok(Math.abs(empty.requiredDailyReturnPct - (Math.pow(1.5, 1 / 365) - 1)) < 1e-15);
+    assert.equal(empty.requiredDailyReturnText, '0.111%/day');
+
+    // Reward capital never enters the target math: the fixture agent holds $58.56
+    // of reward capital and the trading totals stay exactly as the engine reports.
+    assert.equal(status.agents[0].rewards.lifetimeUsd, 58.56);
+    assert.equal(performance.tradingPnlTotalUsd, 200);
+    assert.equal(performance.tradingPnlSinceBaselineUsd, 200);
+    assert.equal(helpers.summarize(status).performance.targetAnnualReturnText, '50%');
+
+    // No secret material can leak through the performance projection.
+    const serializedPerf = JSON.stringify([performance, compact, derived, short, legacy]);
+    assert.equal(serializedPerf.includes(SECRET), false);
+    assert.equal(serializedPerf.includes(SECRET_TWO), false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping v3.4: aggression badges, cohorts, filter/sort, profile limits and activity', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV34StatusPayload();
+    const rows = helpers.buildAgentRows(status);
+    const item = (row, key) => (row.aggressionProfile.items ?? []).find((entry) => entry.key === key);
+
+    // ---- exported helper surface ----
+    assert.deepEqual(helpers.AGGRESSION_KEYS, ['aggressive', 'balanced', 'conservative']);
+    for (const name of ['performanceView', 'targetProgress', 'aggressionBadge', 'profileCounts', 'activityView', 'agentActivityView', 'aggressionProfileView', 'filterRowsByAggression']) {
+      assert.equal(typeof helpers[name], 'function', `helpers.${name} is exported`);
+    }
+
+    // ---- badges: labels, tone, defensive normalization ----
+    assert.equal(rows.length, POPULATION);
+    const aggressiveRows = rows.filter((row) => row.aggression === 'aggressive');
+    const balancedRows = rows.filter((row) => row.aggression === 'balanced');
+    const conservativeRows = rows.filter((row) => row.aggression === 'conservative');
+    assert.equal(aggressiveRows.length, 12);
+    assert.equal(balancedRows.length, 13);
+    assert.equal(conservativeRows.length, 5);
+    assert.equal(rows[0].aggression, 'aggressive', 'day agents are assigned first');
+    assert.equal(rows[29].aggression, 'conservative');
+    assert.equal(rows[0].aggressionBadge.labelKey, 'aggressionAggressive');
+    assert.equal(rows[0].aggressionBadge.label, 'Aggressive');
+    assert.equal(rows[0].aggressionBadge.tone, 'aggressive');
+    assert.equal(rows[0].aggressionBadge.known, true);
+    assert.equal(rows[12].aggressionBadge.label, 'Balanced');
+    assert.equal(rows[25].aggressionBadge.label, 'Conservative');
+    assert.equal(helpers.aggressionBadge('BALANCED').key, 'balanced', 'case-insensitive');
+    const unknownBadge = helpers.aggressionBadge('turbo');
+    assert.equal(unknownBadge.known, false);
+    assert.equal(unknownBadge.key, 'unknown');
+    assert.equal(unknownBadge.label, '—');
+    assert.equal(helpers.aggressionBadge(undefined).known, false);
+
+    // ---- cohort counts (engine summary first, rows as fallback) ----
+    const cohorts = helpers.profileCounts(status);
+    assert.equal(cohorts.available, true);
+    assert.equal(cohorts.reported, true);
+    assert.equal(cohorts.enabled, true);
+    assert.equal(cohorts.aggressivePct, 0.4);
+    assert.equal(cohorts.balancedPct, 0.45);
+    assert.equal(cohorts.capitalMultiplier, 1.35);
+    assert.deepEqual(cohorts.counts, { aggressive: 12, balanced: 13, conservative: 5, unknown: 0 });
+    assert.equal(cohorts.total, 30);
+    assert.deepEqual(cohorts.rows.map((row) => [row.key, row.count, row.pctText]), [
+      ['aggressive', 12, '40%'],
+      ['balanced', 13, '43%'],
+      ['conservative', 5, '17%'],
+    ]);
+    assert.equal(cohorts.profiles.aggressive.items.length, 12);
+    assert.deepEqual(helpers.profileCounts(rows).counts, cohorts.counts, 'built rows can be counted too');
+    const derivedCounts = helpers.profileCounts(buildV34StatusPayload().agents);
+    assert.equal(derivedCounts.counts.aggressive, 12);
+    const emptyCounts = helpers.profileCounts([]);
+    assert.equal(emptyCounts.available, false);
+    assert.equal(emptyCounts.total, 0);
+
+    // ---- profile limits mapping (basket, caps, multipliers, floor, stand-down) ----
+    assert.equal(rows[0].aggressionProfile.available, true);
+    assert.equal(rows[0].aggressionProfile.items.length, 12);
+    assert.equal(item(rows[0], 'basketSizeDay').text, '6');
+    assert.equal(item(rows[0], 'basketSizeSwing').text, '4');
+    assert.equal(item(rows[0], 'maxOpenPositionsDay').text, '8');
+    assert.equal(item(rows[0], 'maxOpenPositionsSwing').text, '5');
+    assert.equal(item(rows[0], 'maxOrdersPerCycle').text, '4');
+    assert.equal(item(rows[0], 'entryZMultiplier').text, '×0.70');
+    assert.equal(item(rows[0], 'sizePctMultiplier').text, '×1.35');
+    assert.equal(item(rows[0], 'stopPctMultiplier').text, '×0.80');
+    assert.equal(item(rows[0], 'targetPctMultiplier').text, '×1.20');
+    assert.equal(item(rows[0], 'maxHoldBarsMultiplier').text, '×0.75');
+    assert.equal(item(rows[0], 'policySizeFloor').text, '80%');
+    assert.equal(item(rows[0], 'respectStandDown').displayKey, 'aggressionStandDownBypass');
+    assert.equal(rows[0].aggressionProfile.standDownPolicy, 'cautious-floor');
+    assert.equal(item(rows[12], 'policySizeFloor').text, '0%');
+    assert.equal(item(rows[12], 'respectStandDown').displayKey, 'aggressionStandDownRespected');
+    assert.equal(rows[12].aggressionProfile.standDownPolicy, 'respect');
+    assert.equal(item(rows[25], 'entryZMultiplier').text, '×1.15');
+    assert.equal(item(rows[25], 'sizePctMultiplier').text, '×0.80');
+    assert.equal(item(rows[25], 'maxOrdersPerCycle').text, '1');
+    const noProfile = helpers.aggressionProfileView(null);
+    assert.equal(noProfile.available, false);
+    assert.deepEqual(noProfile.items, []);
+
+    // ---- per-agent activity stats (reported + fallbacks) ----
+    assert.equal(rows[0].activityStats.available, true);
+    assert.equal(rows[0].activityStats.ordersToday, 0);
+    assert.equal(rows[1].activityStats.ordersToday, 1);
+    assert.equal(rows[2].activityStats.ordersToday, 2);
+    assert.equal(rows[3].activityStats.trades, 3);
+    assert.equal(rows[0].activityStats.positionsText, '0');
+    const fallbackActivity = helpers.agentActivityView({
+      tradesCount: 4,
+      positions: [{ symbol: 'AAPL' }, { symbol: 'MSFT' }, { symbol: 'F' }],
+    });
+    assert.equal(fallbackActivity.available, false);
+    assert.equal(fallbackActivity.ordersToday, null);
+    assert.equal(fallbackActivity.ordersTodayText, '—');
+    assert.equal(fallbackActivity.trades, 4);
+    assert.equal(fallbackActivity.tradesText, '4');
+    assert.equal(fallbackActivity.positions, 3);
+
+    // ---- engine activity summary (reported + derived fallbacks) ----
+    const activity = helpers.activityView(status);
+    assert.equal(activity.available, true);
+    assert.equal(activity.ordersToday, 9);
+    assert.equal(activity.tradesTotal, 33);
+    assert.equal(activity.positionsTotal, 17);
+    assert.equal(activity.lastCycleExecutions, 2);
+    assert.equal(activity.lastCycleOrders, 3);
+    assert.deepEqual(activity.activeProfiles, ['aggressive', 'balanced', 'conservative'], 'counts-object form is normalized');
+    assert.deepEqual(activity.haltReasons, ['market_closed']);
+    assert.equal(activity.halted, false);
+    assert.deepEqual(activity.activeProfileBadges.map((badge) => badge.key), ['aggressive', 'balanced', 'conservative']);
+    // Alternate payload shapes: array of names + a counts object with zero entries.
+    const arrayProfiles = helpers.activityView({ engine: { activity: { activeProfiles: ['conservative', 'aggressive'] } } });
+    assert.deepEqual(arrayProfiles.activeProfiles, ['conservative', 'aggressive']);
+    const partialProfiles = helpers.activityView({ engine: { activity: { activeProfiles: { aggressive: 0, balanced: 2, conservative: 0 } } } });
+    assert.deepEqual(partialProfiles.activeProfiles, ['balanced']);
+    const derivedStatus = buildV34StatusPayload();
+    delete derivedStatus.engine.activity;
+    const derivedActivity = helpers.activityView(derivedStatus);
+    const expectedOrders = derivedStatus.agents.reduce((total, agent) => total + agent.activity.ordersToday, 0);
+    const expectedTrades = derivedStatus.agents.reduce((total, agent) => total + agent.activity.trades, 0);
+    const expectedPositions = derivedStatus.agents.reduce((total, agent) => total + agent.activity.positions, 0);
+    assert.equal(derivedActivity.available, false);
+    assert.equal(derivedActivity.ordersToday, expectedOrders);
+    assert.equal(derivedActivity.tradesTotal, expectedTrades);
+    assert.equal(derivedActivity.positionsTotal, expectedPositions);
+    assert.deepEqual(derivedActivity.activeProfiles, ['aggressive', 'balanced', 'conservative']);
+    assert.equal(derivedActivity.lastCycleExecutions, 2, 'falls back to the last-cycle counters');
+    assert.equal(derivedActivity.lastCycleOrders, 4);
+    assert.deepEqual(helpers.activityView(null).activeProfiles, []);
+
+    // ---- profile filter (composes with status filter + search) ----
+    assert.equal(helpers.filterRowsByAggression(rows, 'aggressive').length, 12);
+    assert.equal(helpers.filterRowsByAggression(rows, 'balanced').length, 13);
+    assert.equal(helpers.filterRowsByAggression(rows, 'conservative').length, 5);
+    assert.equal(helpers.filterRowsByAggression(rows, 'all').length, 30);
+    assert.equal(helpers.filterRowsByAggression(rows, 'nonsense').length, 30, 'unknown filters are ignored');
+    const filteredAggressive = helpers.filterAgentRows(rows, 'all', '', 'aggressive');
+    assert.equal(filteredAggressive.length, 12);
+    assert.equal(filteredAggressive.every((row) => row.aggression === 'aggressive'), true);
+    const deadAggressive = helpers.filterAgentRows(rows, 'dead', '', 'aggressive');
+    assert.equal(deadAggressive.length, rows.filter((row) => row.status === 'dead' && row.aggression === 'aggressive').length);
+    const seeded = helpers.filterAgentRows(rows, 'alive', 'Momentum AAPL', 'aggressive');
+    assert.ok(seeded.every((row) => row.aggression === 'aggressive' && row.status === 'alive'));
+    const invalidProfile = helpers.filterAgentRows(rows, 'all', '', 'nonsense');
+    assert.equal(invalidProfile.length, 30);
+
+    // ---- aggression sorting: cohort order, unknown profiles last ----
+    assert.equal(helpers.SORTABLE_KEYS.has('aggression'), true);
+    const byAggressionAsc = helpers.sortAgentRows(rows, 'aggression', 'asc');
+    assert.equal(byAggressionAsc[0].aggression, 'aggressive');
+    assert.equal(byAggressionAsc[12].aggression, 'balanced');
+    assert.equal(byAggressionAsc[25].aggression, 'conservative');
+    for (let index = 1; index < byAggressionAsc.length; index += 1) {
+      assert.ok(helpers.AGGRESSION_RANK[byAggressionAsc[index - 1].aggression] <= helpers.AGGRESSION_RANK[byAggressionAsc[index].aggression]);
+    }
+    const byAggressionDesc = helpers.sortAgentRows(rows, 'aggression', 'desc');
+    assert.equal(byAggressionDesc[0].aggression, 'conservative');
+    assert.equal(byAggressionDesc[29].aggression, 'aggressive');
+    const mixedLegacy = helpers.sortAgentRows([
+      ...helpers.buildAgentRows(buildStatusPayload({ running: true })),
+      rows[0],
+    ], 'aggression', 'asc');
+    assert.equal(mixedLegacy[0].aggression, 'aggressive', 'known profiles sort before legacy null rows');
+    assert.equal(mixedLegacy.slice(1).every((row) => row.aggression === null), true);
+
+    // ---- table wiring ----
+    const aggressionColumn = helpers.TABLE_COLUMNS.find((column) => column.key === 'aggression');
+    assert.ok(aggressionColumn);
+    assert.equal(aggressionColumn.sortable, true);
+    assert.equal(aggressionColumn.labelKey, 'aggression');
+    assert.equal(aggressionColumn.hintKey, 'aggressionTableHint');
+
+    // ---- summary carries all three projections ----
+    const summary = helpers.summarize(status);
+    assert.equal(summary.performance.available, true);
+    assert.equal(summary.aggression.available, true);
+    assert.equal(summary.activity.available, true);
+    assert.equal(summary.aggression.counts.aggressive, 12);
+
+    // No secret material can leak through the aggression/activity projections.
+    const serializedAgg = JSON.stringify([rows, cohorts, activity, summary.aggression, summary.activity]);
+    assert.equal(serializedAgg.includes(SECRET), false);
+    assert.equal(serializedAgg.includes(SECRET_TWO), false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping v3.4: aggressive capital is contributed capital; legacy fallbacks; no secrets', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildV34StatusPayload();
+    const rows = helpers.buildAgentRows(status);
+    const topped = rows.find((row) => row.id === status.agents[0].id);
+
+    // ---- the v3.4 top-up is contributed capital, not P&L and not rewards ----
+    assert.equal(topped.aggression, 'aggressive');
+    assert.equal(topped.aggressiveCapitalUsd, 28.44);
+    assert.equal(topped.capitalBreakdown.contributedUsd, 107);
+    assert.equal(topped.capitalBreakdown.baseUsd, 20);
+    assert.equal(topped.capitalBreakdown.rewardCapitalUsd, 58.56);
+    assert.equal(topped.tradingPnlUsd, -1.7, 'the top-up never inflates trading P&L');
+    assert.equal(topped.equityUsd, 105.3);
+    assert.equal(topped.rewardsUsd, 58.56, 'aggressive capital is not a reward payout');
+
+    // Invariance: a larger top-up raises equity + contributed capital by the same
+    // amount and leaves trading P&L untouched.
+    const toppedMore = JSON.parse(JSON.stringify(status.agents[0]));
+    toppedMore.capital.contributedUsd += 10;
+    toppedMore.capital.aggressiveCapitalUsd += 10;
+    toppedMore.equityUsd += 10;
+    toppedMore.cashUsd += 10;
+    const toppedMoreRow = helpers.buildAgentRows({ agents: [toppedMore] })[0];
+    assert.equal(toppedMoreRow.tradingPnlUsd, -1.7);
+    assert.equal(toppedMoreRow.capitalBreakdown.contributedUsd, 117);
+    assert.equal(toppedMoreRow.aggressiveCapitalUsd, 38.44);
+    assert.equal(toppedMoreRow.rewardsUsd, 58.56);
+
+    // ---- old snapshot (v3.2/v3.3 without the v3.4 fields) ----
+    const legacyStatus = buildStatusPayload({ running: true });
+    const legacyRows = helpers.buildAgentRows(legacyStatus);
+    assert.equal(legacyRows.length, POPULATION);
+    assert.equal(legacyRows.every((row) => row.aggression === null && row.aggressionBadge.known === false), true);
+    assert.equal(legacyRows.every((row) => row.aggressionProfile.available === false), true);
+    assert.equal(legacyRows[0].activityStats.ordersToday, null);
+    assert.equal(legacyRows[0].activityStats.trades, legacyStatus.agents[0].tradesCount);
+    const legacyCounts = helpers.profileCounts(legacyStatus);
+    assert.equal(legacyCounts.available, false);
+    assert.deepEqual(legacyCounts.counts, { aggressive: 0, balanced: 0, conservative: 0, unknown: POPULATION });
+    assert.equal(legacyCounts.total, POPULATION);
+    assert.equal(helpers.activityView(legacyStatus).available, false);
+    assert.equal(helpers.performanceView(legacyStatus).available, false);
+    // The table keeps working: aggression filter/sort are no-ops, indexes stay stable.
+    assert.equal(helpers.filterAgentRows(legacyRows, 'all', '', 'aggressive').length, 0);
+    assert.equal(helpers.sortAgentRows(legacyRows, 'aggression', 'asc').length, POPULATION);
+    assert.equal(helpers.summarize(legacyStatus).aggression.available, false);
+
+    // ---- the whole mapping survives a malformed/partial snapshot ----
+    const partial = {
+      engine: {
+        performance: { targetAnnualReturnPct: 0.5, baselineAccountEquityUsd: 1000, daysElapsed: 2, tradingPnlSinceBaselineUsd: 10 },
+        aggression: { enabled: false, counts: { aggressive: 1 } },
+        activity: { ordersToday: 1, haltReasons: 'not-an-array' },
+      },
+      agents: [{ id: 'atm-partial', aggression: 'aggressive', aggressionProfile: { basketSizeDay: 6 } }],
+    };
+    const partialPerf = helpers.performanceView(partial);
+    assert.equal(partialPerf.available, true);
+    assert.ok(Math.abs(partialPerf.annualizedReturnPct - (10 / 1000) * (365 / 2)) < 1e-12);
+    const partialCounts = helpers.profileCounts(partial);
+    assert.equal(partialCounts.available, true);
+    assert.equal(partialCounts.enabled, false);
+    assert.equal(partialCounts.counts.aggressive, 1);
+    const partialActivity = helpers.activityView(partial);
+    assert.equal(partialActivity.ordersToday, 1);
+    assert.deepEqual(partialActivity.haltReasons, []);
+    assert.equal(helpers.agentAggressionView({ aggression: 'balanced' }).profile.available, false);
+
+    // ---- no secret material below the v3.4 mapping ----
+    const serialized = JSON.stringify([
+      topped,
+      toppedMoreRow,
+      legacyRows[0],
+      helpers.performanceView(status),
+      helpers.profileCounts(status),
+      helpers.activityView(status),
+      helpers.summarize(status),
+    ]);
     assert.equal(serialized.includes(SECRET), false);
     assert.equal(serialized.includes(SECRET_TWO), false);
   } finally {

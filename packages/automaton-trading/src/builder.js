@@ -44,6 +44,78 @@ export const FAMILY_DEFAULTS = Object.freeze({
 /** Estimated Builder inference cost attributed per compile (USD). Capped by policy. */
 export const ESTIMATED_BUILD_COST_USD = 0.01;
 
+/**
+ * v3.4 aggression profile multipliers (docs/AGGRESSIVE-GROWTH.md §1-§2).
+ *
+ * `config.aggression.profiles[<name>]` overrides these per key; the contract values below are the
+ * safe defaults used when the config layer is missing or partial. Balanced multipliers are 1, so a
+ * balanced genome (and every legacy genome without `aggression`) compiles byte-identically to v3.3.
+ */
+export const AGGRESSION_PROFILE_DEFAULTS = Object.freeze({
+  aggressive: Object.freeze({
+    entryZMultiplier: 0.70,
+    sizePctMultiplier: 1.35,
+    stopPctMultiplier: 0.80,
+    targetPctMultiplier: 1.20,
+    maxHoldBarsMultiplier: 0.75,
+  }),
+  balanced: Object.freeze({
+    entryZMultiplier: 1,
+    sizePctMultiplier: 1,
+    stopPctMultiplier: 1,
+    targetPctMultiplier: 1,
+    maxHoldBarsMultiplier: 1,
+  }),
+  conservative: Object.freeze({
+    entryZMultiplier: 1.15,
+    sizePctMultiplier: 0.80,
+    stopPctMultiplier: 1.00,
+    targetPctMultiplier: 0.90,
+    maxHoldBarsMultiplier: 1.00,
+  }),
+});
+
+/** Known aggression profiles (most → least aggressive). Anything else means "no multipliers". */
+export const AGGRESSION_PROFILES = Object.freeze(Object.keys(AGGRESSION_PROFILE_DEFAULTS));
+
+/** Parameter name → profile multiplier name (the only params a profile scales). */
+const PARAM_MULTIPLIER_KEYS = Object.freeze({
+  entryZ: 'entryZMultiplier',
+  sizePct: 'sizePctMultiplier',
+  stopPct: 'stopPctMultiplier',
+  targetPct: 'targetPctMultiplier',
+  maxHoldBars: 'maxHoldBarsMultiplier',
+});
+
+const MULTIPLIER_KEYS = Object.freeze(Object.values(PARAM_MULTIPLIER_KEYS));
+
+/**
+ * Resolve the multipliers for one genome aggression profile.
+ *
+ * Config values win per key when they are finite and positive; contract defaults fill the rest.
+ * An unknown/missing aggression resolves to null, which means "no multipliers" — the v3.3
+ * behaviour. The Builder never reads executor fields (policySizeFloor/respectStandDown) and never
+ * lets a profile change symbol/family/notional.
+ *
+ * @param {object} config
+ * @param {string|undefined|null} aggression
+ * @returns {{aggression:string, entryZMultiplier:number, sizePctMultiplier:number,
+ *            stopPctMultiplier:number, targetPctMultiplier:number, maxHoldBarsMultiplier:number}|null}
+ */
+export function resolveAggressionMultipliers(config, aggression) {
+  const name = typeof aggression === 'string' && AGGRESSION_PROFILES.includes(aggression) ? aggression : null;
+  if (!name) return null;
+  const defaults = AGGRESSION_PROFILE_DEFAULTS[name];
+  const configured = config?.aggression?.profiles?.[name];
+  /** @type {Record<string, any>} */
+  const resolved = { aggression: name };
+  for (const key of MULTIPLIER_KEYS) {
+    const raw = Number(configured?.[key]);
+    resolved[key] = Number.isFinite(raw) && raw > 0 ? raw : defaults[key];
+  }
+  return resolved;
+}
+
 const PARAM_KEYS = Object.freeze([
   'lookback',
   'entryZ',
@@ -190,10 +262,14 @@ export function createBuilder({ config, brakes, clock } = {}) {
     }
     const spentUsd = round4(Math.min(ESTIMATED_BUILD_COST_USD, spendCap));
 
-    // --- params: family defaults -> hypothesis.specsHint -> inherited genome -> bounds ---
+    // --- params: family defaults -> hypothesis.specsHint -> inherited genome -> profile
+    // multipliers -> bounds ------------------------------------------------------
     const base = FAMILY_DEFAULTS[family];
     const hinted = hypothesis.specsHint && typeof hypothesis.specsHint === 'object' ? hypothesis.specsHint : {};
     const inherited = genome && typeof genome === 'object' ? genome : {};
+    // v3.4: the genome's aggression profile scales sizing/exit parameters AFTER hint/genome values
+    // and BEFORE the hard bounds clamp (docs/AGGRESSIVE-GROWTH.md §2). Unknown/missing = null.
+    const profileMultipliers = resolveAggressionMultipliers(config, inherited.aggression);
     /** @type {Record<string, any>} */
     const params = {};
     for (const key of PARAM_KEYS) {
@@ -201,7 +277,16 @@ export function createBuilder({ config, brakes, clock } = {}) {
       let value = fallback;
       if (hinted[key] !== undefined) value = hinted[key];
       if (inherited[key] !== undefined) value = inherited[key];
-      params[key] = clampParam(key, value, fallback);
+      const multiplier = profileMultipliers?.[PARAM_MULTIPLIER_KEYS[key]];
+      if (Number.isFinite(multiplier) && multiplier !== 1) {
+        // A malformed hint/genome value falls back to the family default, which the profile
+        // still scales; the clamp below remains the hard bound.
+        const numeric = Number(value);
+        const scaled = (Number.isFinite(numeric) ? numeric : Number(fallback)) * multiplier;
+        params[key] = clampParam(key, scaled, fallback);
+      } else {
+        params[key] = clampParam(key, value, fallback);
+      }
     }
     const sessionFilter = SESSION_FILTERS.includes(inherited.sessionFilter)
       ? inherited.sessionFilter
@@ -233,6 +318,9 @@ export function createBuilder({ config, brakes, clock } = {}) {
         sampleSize: Number(hypothesis.proof.sampleSize),
       },
       params,
+      // v3.4: the resolved aggression profile that scaled `params` (omitted for legacy genomes).
+      // Informational only: the deterministic params above are what the executor trades.
+      ...(profileMultipliers ? { profile: { ...profileMultipliers } } : {}),
       budgetUsedUsd: spentUsd,
     };
 

@@ -225,6 +225,9 @@ export const RESEARCH_VERDICTS = Object.freeze(['HOLD', 'AVOID', 'ALERT']);
 /** Stances a bot agent's own policy may declare (docs/BOT-AGENTS.md). */
 export const AGENT_STANCES = Object.freeze(['trade', 'cautious', 'stand_down']);
 
+/** v3.4 aggression profile names the orchestrator may pass in `run({profile})`. */
+export const AGGRESSION_NAMES = Object.freeze(['aggressive', 'balanced', 'conservative']);
+
 /**
  * Resolve whether a per-bot agent policy may influence this execution cycle.
  *
@@ -639,6 +642,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      * @param {{
      *   agent: object, spec?: object, specs?: Array<object>, mandate: object,
      *   portfolio?: {maxOpenPositions?: number, maxOrdersPerCycle?: number},
+     *   profile?: {aggression?: string, policySizeFloor?: number, respectStandDown?: boolean},
      *   quotes?: Record<string, {bid?:number, ask?:number, last?:number, ts?:number}>,
      *   bars?: Record<string, Array<object>>|Array<object>,
      *   dayStats?: object, now?: number|string|Date,
@@ -649,7 +653,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      * @returns {Promise<{agentId:string, actions:Array<object>, orders:Array<object>,
      *           denied:Array<{code:string, reason:string}>, spentUsd:number}>}
      */
-    async run({ agent, spec: specInput, specs, portfolio, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, policy, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
+    async run({ agent, spec: specInput, specs, portfolio, profile, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, policy, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
       const atMs = normalizeNow(nowInput, now);
       const at = new Date(atMs).toISOString();
       // --- spec normalization: legacy single spec OR multi-symbol basket ---------
@@ -980,11 +984,59 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       const policyState = agentsEnabled
         ? resolveAgentPolicy({ policy, config, atMs })
         : null;
-      const policyStandDown = Boolean(policyState && policyState.stance === 'stand_down');
       const policyExitPressure = Boolean(policyState && policyState.exitPressure === 'exit');
-      const policySizeFactor = policyState ? policyState.sizeMultiplier : 1;
+
+      // --- v3.4 aggression profile (docs/AGGRESSIVE-GROWTH.md §2) -----------------
+      // Optional per-agent profile supplied by the orchestrator (agent.genome.aggression):
+      //   { aggression, policySizeFloor, respectStandDown }
+      // It is a deterministic sizing/stance policy, NOT a risk override:
+      //   - trade/cautious: effective size factor = max(bot sizeMultiplier, policySizeFloor),
+      //     so an aggressive bot's own caution cannot shrink it below the configured floor;
+      //   - respectStandDown === false: a `stand_down` stance becomes a cautious,
+      //     floor-sized entry instead of blocking entries;
+      //   - research ALERT/risk vetoes, the whole brake wall, the mandate and every portfolio
+      //     cap still apply, and the profile never grows size above the bot's own 1x factor.
+      // Absent/true respectStandDown keeps the legacy stand-down block exactly as before.
+      const runProfile = profile && typeof profile === 'object' ? profile : null;
+      const resolvedAggression = AGGRESSION_NAMES.includes(runProfile?.aggression)
+        ? runProfile.aggression
+        : AGGRESSION_NAMES.includes(runProfile?.name)
+          ? runProfile.name
+          : null;
+      const profileSizeFloor = clamp(numberOrNull(runProfile?.policySizeFloor) ?? 0, 0, 1);
+      const profileRespectStandDown = runProfile?.respectStandDown !== false;
+      const policyStandDown = Boolean(policyState && policyState.stance === 'stand_down');
+      const policyStandDownBlocks = policyStandDown && profileRespectStandDown;
+      const profileConvertsStandDown = Boolean(policyStandDown && !profileRespectStandDown);
+      const policyBaseSizeFactor = policyState ? policyState.sizeMultiplier : 1;
+      const profileAppliesFloor = Boolean(
+        runProfile
+        && profileSizeFloor > 0
+        && (profileConvertsStandDown || policyState?.stance === 'trade' || policyState?.stance === 'cautious'),
+      );
+      const policySizeFactor = profileConvertsStandDown
+        // A converted stand-down is treated as a cautious entry AT the configured floor (never
+        // sized up by the bot's own 1.0 multiplier).
+        ? (profileSizeFloor > 0 ? profileSizeFloor : Math.min(policyBaseSizeFactor, 1))
+        : profileAppliesFloor
+          ? Math.max(policyBaseSizeFactor, profileSizeFloor)
+          : policyBaseSizeFactor;
       const policyEffect = policyState
         ? { stance: policyState.stance, sizeMultiplier: policyState.sizeMultiplier }
+        : null;
+      // Entry-side effect record: unchanged for legacy/balanced calls; for an aggressive floor or
+      // a converted stand-down it records exactly what the deterministic executor did.
+      const policyEntryEffect = policyState
+        ? {
+            // The effective stance is cautious after a conversion (entries were taken at the floor).
+            stance: profileConvertsStandDown ? 'cautious' : policyState.stance,
+            sizeMultiplier: policyState.sizeMultiplier,
+            applied: 'size',
+            ...(profileConvertsStandDown ? { converted: true, convertedFrom: 'stand_down' } : {}),
+            ...(profileAppliesFloor
+              ? { profile: resolvedAggression, policyFloor: profileSizeFloor, effectiveSizeMultiplier: policySizeFactor }
+              : {}),
+          }
         : null;
 
       // --- own position book (never broker.getAccount) ----------------------------
@@ -1767,7 +1819,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           positionsSnapshot: Object.fromEntries(positions),
           orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
-          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
+          policy: policyEntryEffect,
         });
         return Boolean(order);
       }
@@ -1802,7 +1854,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           positionsSnapshot: Object.fromEntries(positions),
           orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
-          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
+          policy: policyEntryEffect,
         });
         return Boolean(order);
       }
@@ -1843,7 +1895,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           positionsSnapshot: Object.fromEntries(positions),
           orderSpec: activeSpec,
           research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
-          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
+          policy: policyEntryEffect,
         }));
       }
 
@@ -2222,7 +2274,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           });
           continue;
         }
-        if (policyStandDown) {
+        if (policyStandDownBlocks) {
           // The bot's own brain said stand down: no new exposure. This is a stance
           // skip, not a brake denial; the exit pass above still ran for held positions.
           result.actions.push({

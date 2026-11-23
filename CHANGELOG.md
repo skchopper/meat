@@ -12,6 +12,50 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v3.4.0 — 2026-11-23 — aggressive growth cohort, 50% annual target, and the halt root cause
+
+Trading had effectively stopped because the paper engine was **dark for six days**. This release fixes
+that, adds a dedicated aggressive cohort and exposes an honest 50%-annual target.
+
+- **Inactivity root cause fixed.** The engine had been halted since 2026-11-17 with
+  `reconciliation_mismatch` (every tick `executions:0, orders:0`). The $50.39 delta exactly matched
+  **$50.64 of cumulative virtual metabolism costs**. The virtual ledger deducts hosting/inference/data/
+  research/review costs, but the paper broker account never pays them, so the one-time anchor was
+  permanently exceeded. The ledger now tracks `anchorCostsUsd`/`totalCostsUsd()`/`costsSinceAnchor()`;
+  reconciliation adds virtual costs since the anchor to the expected virtual total. Genuine unbooked-fill
+  mismatches (positive or negative) beyond tolerance still halt; no capital is minted and all agent
+  equity/P&L still reflects costs. A live-state-copy dry run showed the halt clearing on the first tick.
+- **Aggressive growth cohort.** Deterministic, day-first `aggression` profiles: **40% aggressive / 45%
+  balanced / 15% conservative** (at 30 bots: **12 aggressive day**, 13 balanced, 5 conservative).
+  Aggressive bots get 6/4-symbol baskets, up to 8/5 open positions, 4 orders/cycle, entry thresholds
+  ×0.70, size ×1.35, stops ×0.80, targets ×1.20, hold bars ×0.75, and a 0.8 policy-size floor with
+  stand-down conversion unless a research ALERT/risk veto fires. Builder compiles profile-adjusted specs
+  (hard bounds preserved) and the executor enforces profile caps/floor under the unchanged 18-brake wall;
+  balanced configs remain byte-compatible. The code default keeps aggression disabled for compatibility;
+  the live profile enables it.
+- **More capital for the cohort — as capital, not profit.** One-time **aggressive capital** top-ups from
+  the treasury pool toward **1.35× base endowment**, only within the allocation-cap headroom, recorded as
+  contributed capital (never P&L or reward). Live allocation cap rises to **0.92**; risk ceilings rise to
+  **10 open positions / $60 max order / 40 orders per day / 0.6 position cap** while profile caps remain
+  tighter. The pool is deliberately reduced (~$370→~$160) to back larger growth capital; weekly reward
+  capital shrinks until winners rebuild it.
+- **50% annual target (target, not guarantee).** One-time performance baseline; status/UI expose
+  target 50%, required daily pace (~0.111%/day), annualized trading return since baseline, progress
+  (100 = on target), on-track flag, trading P&L since baseline, account equity/capital base, short-history
+  caveats, and cohort/activity diagnostics. The target never changes order sizing automatically; brakes,
+  caps and the paper/live gates are unchanged.
+- **UI.** Header/KPI annual-target card and per-tab target pill; Aggressive/Balanced/Conservative badges,
+  filter, cohort counts, profile limits and activity in agent table/detail; aggressive capital shown as
+  contributed capital with an explicit not-P&L/not-reward note. All v3.3 fair P&L/rewards sections kept.
+- **Tests/docs:** **446/446** across 10 suites (mortality 91, market 56, plugin 52, integration 99,
+  security 71, research 13, rankings 29, control 19, bot-agent 9, instruments 7), including the
+  independent verifier's 29 v3.4 additions (halt fix, profiles/capital, builder/executor, target,
+  security);
+  contract `docs/AGGRESSIVE-GROWTH.md`, RUNBOOK §8h, CONTROL-PANEL/ARCHITECTURE/README updated.
+- **Compatibility/risk:** paper default and live triple-gate unchanged. 50%/year is an ambition; more
+  aggression increases drawdown/loss risk, the aggressive top-up consumes treasury/reward headroom, and
+  the target must not be treated as a promise.
+
 ## v3.3.0 — 2026-11-22 — fair P&L and performance-based capital rewards
 
 Reward payouts are now **trading capital, never profit**, and the population's rewards follow measured

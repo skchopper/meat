@@ -200,11 +200,26 @@ the operating config).
   budget, eligible candidates and payout history. Daily-loss bookkeeping also uses trading P&L, so a
   reward top-up never looks like a daily gain/loss. Contract `docs/FAIR-PNL-REWARDS.md`; ops
   `docs/RUNBOOK.md` §8g.
+- **Aggressive growth cohort + 50% annual target + halt fix (v3.4):** the paper engine had been silently
+  halted since 2026-11-17 on `reconciliation_mismatch` — the $50.39 delta was exactly the **$50.64 of
+  cumulative virtual metabolism costs** that the paper broker never paid. Reconciliation now adds
+  **virtual costs since the anchor** back to the expected total (no capital minted; genuine unbooked
+  fills still halt), so trading resumes on the next tick. A deterministic **day-first 40/45/15 cohort**
+  now runs: at 30 bots **12 aggressive day bots**, 13 balanced, 5 conservative. Aggressive bots get
+  **6-symbol baskets, up to 8 open positions, 4 orders/cycle, lower entry thresholds (×0.7), larger
+  sizing (×1.35), tighter stops, larger targets, shorter holds and a 0.8 policy-size floor**; they are
+  funded with one-time **aggressive capital** from the treasury pool toward **1.35× base endowment**
+  (contributed capital, never P&L/reward), within the allocation cap. Live risk ceilings rise to 10 open
+  positions, $60 max order, 40 orders/day, 0.6 position cap and allocation cap 0.92. The panel/status
+  expose the **annual target 50%** (required daily pace, annualized trading return, progress; clearly
+  labeled *target, not guarantee*), cohort counts and profile badges/limits/activity. The target is
+  informational and never increases order size automatically; all 18 brakes still apply. Contract
+  `docs/AGGRESSIVE-GROWTH.md`; ops `docs/RUNBOOK.md` §8h.
 
 ## Status (this build)
 
-- 10 test suites: mortality 88, market 50, plugin 49, independent integration 78, security 63,
-  research 13, rankings 29, control 18, bot-agent 9 and instruments 7 — **404 tests, 404 pass,
+- 10 test suites: mortality 91, market 56, plugin 52, independent integration 99, security 71,
+  research 13, rankings 29, control 19, bot-agent 9 and instruments 7 — **446 tests, 446 pass,
   0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
   `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live

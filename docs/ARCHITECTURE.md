@@ -141,6 +141,20 @@ top three, capped per agent, and paid as capital — never profit. Status, the p
 expose trading P&L, capital breakdown, lifetime rewards and per-agent reward history, and daily-loss
 bookkeeping uses trading P&L deltas. Contract: `docs/FAIR-PNL-REWARDS.md`; ops: `docs/RUNBOOK.md` §8g.
 
+### Aggressive growth cohort, reconciliation-burn accounting and return target (v3.4)
+
+The paper engine's virtual metabolism costs (hosting/inference/data/research/reviews) are not paid by the
+broker account, so reconciliation now adds **virtual costs since the anchor** back to the expected virtual
+total; this clears the long-lived false `reconciliation_mismatch` halt without minting capital, while
+genuine unbooked fills still halt. A deterministic **40/45/15 day-first aggression cohort** gives 40% of
+bots larger baskets, more concurrent positions/orders, lower entry bars, larger sizing, tighter
+stops/shorter holds and a policy-size floor; aggressive bots receive one-time **capital** top-ups from the
+treasury pool (within the allocation cap) so their larger risk budgets are backed by real virtual capital.
+The builder applies profile multipliers to specs and the executor applies profile caps/policy floor under
+the same 18 brakes. A one-time performance baseline and 50%-annual target view expose actual annualized
+trading return/pace for the operator; the target is informational and never overrides risk. Contract:
+`docs/AGGRESSIVE-GROWTH.md`; ops: `docs/RUNBOOK.md` §8h.
+
 ### Multi-instrument execution (v3.0)
 
 The population may express a strategy through more than long stock: **short stock, long calls/puts,

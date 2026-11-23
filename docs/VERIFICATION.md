@@ -1192,3 +1192,343 @@ secrets. One behavioural defect was found and fixed this round (D-V33-1, marketV
 scale, 100×), and one documentation inconsistency was reported (builder-owned CONTROL-PANEL snippets).
 **Verified as a paper/sim fair-P&L and performance-reward capability; live broker/UI visual behaviour,
 the live-process migration and long-run reward effects remain unverified.**
+
+---
+
+## 12. v3.4 aggressive growth cohort, 50% annual target and the reconciliation-burn fix — independent verification (2026-11-23)
+
+Verifier: independent verifier teammate (`verifier-v34`), not an author of any module under test.
+Contract read first: `docs/AGGRESSIVE-GROWTH.md`. Host: Windows, Node **v22.18.0**, DSH file sandbox
+`workspace-write`, **no network**, no Alpaca credentials used. Scope: verifier wrote **only**
+`test/integration.test.js`, `test/security.test.js` and this section; **no `src/**`, `client.js`,
+config or builder-owned test was edited by the verifier**. Five behavioural/contract defects were
+reported to the Lead with minimal repros; the Lead fixed them in `src/orchestrator.js`,
+`src/executor.js` and `docs/AGGRESSIVE-GROWTH.md` and froze the tree before the final runs.
+
+What v3.4 changes: (a) the live paper engine had been halted since 2026-11-17 on
+`reconciliation_mismatch` because the virtual ledger deducted ~$50.6 of metabolism costs the paper
+broker never paid; reconciliation now adds `costsSinceAnchor()` to the expected virtual total without
+minting capital or hiding fill gaps; (b) a deterministic day-first cohort (40% aggressive / 45%
+balanced / 15% conservative) with larger baskets/position caps/order caps, scaled entry/size/stop/
+target/hold parameters, a policy-size floor and stand-down conversion; (c) a one-time, pool-funded
+aggressive **capital** top-up toward 1.35× base endowment, recorded as contributed capital, never P&L
+or reward; (d) an informational 50%-annual-return target with baseline, required daily pace, annualized
+trading return, progress and on-track flag; (e) a UI target card + profile badges/limits/activity and
+the aggressive-capital (contributed) split.
+
+### 12.1 Reproduce
+
+The sandbox blocks `node --test test/`, so every suite runs **directly** in a fresh Node process from
+`D:\CounterStikers\packages\automaton-trading`:
+
+```powershell
+cd D:\CounterStikers\packages\automaton-trading
+
+node test/integration.test.js    # verifier: reconciliation fix, cohort, builder/executor profile, target/status
+node test/security.test.js       # verifier: allowance cannot hide fills/mint, no new surface, brakes/secrets/reward fairness
+node test/mortality.test.js      # builder-owned
+node test/market.test.js         # builder-owned
+node test/plugin.test.js         # builder-owned UI suite (52 green; also contains a live-copy recon dry run)
+node test/rankings.test.js       # builder-owned
+node test/control.test.js        # builder-owned
+node test/research.test.js       # builder-owned
+node test/bot-agent.test.js      # builder-owned
+node test/instruments.test.js    # builder-owned
+```
+
+Real-live-state dry run (read-only copy of the REAL `automaton-data`; fake broker with the live
+account equity; **no network/credentials**; the live files are only read/copied). Save as a throwaway
+file in the package root, run, then delete:
+
+```js
+// packages/automaton-trading/.v34-dryrun.mjs  (throwaway; never writes automaton-data)
+import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
+import { loadConfig, statePaths } from './src/config.js';
+import { createAutomaton } from './src/orchestrator.js';
+const REPO = path.resolve('.', '..', '..'); const LIVE = path.join(REPO, 'automaton-data');
+const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'v34-dryrun-'));
+for (const f of ['settings.json','registry.json','ledger.json','rewards.json','rankings.json',
+  'day-stats.json','state.json','treasury.json','deaths.json','capital-v33.json','portfolio-v32.json',
+  'instruments-v3-symbols.json']) if (fs.existsSync(path.join(LIVE,f))) fs.copyFileSync(path.join(LIVE,f), path.join(copy,f));
+for (const d of ['specs','research','agents']) if (fs.existsSync(path.join(LIVE,d))) fs.cpSync(path.join(LIVE,d), path.join(copy,d), { recursive: true });
+const { config } = loadConfig({ cwd: REPO, env: {}, configFile: path.join(REPO,'automaton.config.json'),
+  overrides: { paths: { stateDir: copy, envFile: path.join(copy,'.env') } } });
+const live = JSON.parse(fs.readFileSync(path.join(copy,'state.json'),'utf8'));
+const equity = Number(live.account.equityUsd);
+const broker = { async getAccount(){ return { equityUsd: equity, cashUsd: equity, status:'ACTIVE', marginMultiplier:1, shortingEnabled:false, optionsTradingLevel:3 }; },
+  async getPositions(){ return []; }, async getClock(){ return { isOpen:true }; },
+  async getBars(){ return {}; }, async getLatestQuote(){ return null; },
+  async submitOrder(){ throw new Error('dry run must not order'); } };
+const clock = { now: () => Date.now(), iso: () => new Date().toISOString() };
+const a = await createAutomaton({ config, paths: statePaths(config), broker, clock }); await a.init();
+const s1 = await a.status(); const t1 = await a.tick();
+const treasury = a._internals.state.lastTreasury;
+console.log(JSON.stringify({ counts: s1.engine.aggression.counts,
+  aggressiveEndowments: s1.agents.filter(x=>x.aggression==='aggressive').map(x=>x.endowmentUsd).slice(0,3),
+  aggressiveCapital: s1.agents.find(x=>x.aggression==='aggressive')?.capital.aggressiveCapitalUsd,
+  halted: treasury.halted, reconciliation: treasury.reconciliation,
+  legacyDelta: Math.round((treasury.account.equityUsd - (treasury.reconciliation.virtualTotalUsd - treasury.reconciliation.costsSinceAnchorUsd))*100)/100,
+  performance: s1.engine.performance, pool: a._internals.ledger.pool() }, null, 1));
+// idempotent restart: a second init on the same copy must not top up again
+const a2 = await createAutomaton({ config, paths: statePaths(config), broker, clock }); await a2.init();
+console.log(JSON.stringify({ secondInitPool: a2._internals.ledger.pool() }));
+fs.rmSync(copy, { recursive: true, force: true });
+```
+
+### 12.2 Results (fresh runs, 2026-11-23, tree frozen at `orchestrator.js` 23:06; every process exit code 0)
+
+| # | Suite | Tests | Pass | Fail | TODO | Notes |
+|---|-------|------:|-----:|-----:|-----:|-------|
+| 1 | `test/integration.test.js` (verifier) | **99** | **99** | 0 | 0 | 78 pre-existing + **21 new v3.4 tests** |
+| 2 | `test/security.test.js` (verifier) | **71** | **71** | 0 | 0 | 63 pre-existing + **8 new v3.4 tests** |
+| 3 | `test/mortality.test.js` | 91 | 91 | 0 | 0 | builder-owned (incl. its own live-copy recon test; may skip on a torn copy) |
+| 4 | `test/market.test.js` | 56 | 56 | 0 | 0 | builder-owned |
+| 5 | `test/plugin.test.js` | 52 | 52 | 0 | 0 | builder-owned UI/plugin suite |
+| 6 | `test/rankings.test.js` | 29 | 29 | 0 | 0 | builder-owned |
+| 7 | `test/control.test.js` | 19 | 19 | 0 | 0 | builder-owned |
+| 8 | `test/research.test.js` | 13 | 13 | 0 | 0 | builder-owned |
+| 9 | `test/bot-agent.test.js` | 9 | 9 | 0 | 0 | builder-owned |
+| 10 | `test/instruments.test.js` | 7 | 7 | 0 | 0 | builder-owned |
+| | **Total** | **446** | **446** | **0** | **0** | baseline was 417/417 before verifier additions |
+
+Runtimes on this host: integration ≈ 3.0 s, security ≈ 0.7 s, plugin ≈ 0.9 s, mortality ≈ 0.7 s; all
+ten processes exit 0. Verifier additions only: no existing assertion was weakened and no builder-owned
+file was modified by the verifier.
+
+Independent live-state dry-run result (**37/37 checks PASS**, read-only copy, live files untouched):
+
+```text
+PASS pre-migration halt reproduced (legacy delta > tolerance) :: legacy delta 50.62 vs tolerance 39.93
+PASS costs since anchor ~= legacy delta (> 40) :: costs 50.85, legacy delta 50.62
+PASS profile counts 12/13/5 :: {"aggressive":12,"balanced":13,"conservative":5}
+PASS all 12 aggressive agents are day tier
+PASS aggressive day baskets are 6 symbols; balanced day 4 / swing 3; conservative swing 2
+PASS held agents keep their opening spec; entry basket follows the profile :: 10/10 held agents
+PASS flat agents had their cached specs cleared :: 20/20
+PASS aggressive top-up funded from treasury pool :: pool 370.82 -> 160.82, credited 210
+PASS marker records per-agent allocations (12 x $17.50); endowments 50 -> 67.5; non-aggressive stay 50
+PASS top-up counted as contributed capital (no reward capital) and created no trading P&L
+PASS pool + allocated conserved across the top-up :: before 1945.94 after 1945.94
+PASS top-up respected the allocation cap (allocated 1785.12 <= cap 1836.84)
+PASS growth-v34 baseline recorded on first start (equity 1996.56)
+PASS target math: 50% target, required daily pace 0.111148%/day, short-history nulls
+PASS first tick clears the reconciliation halt
+PASS reconciliation delta is inside tolerance after the cost add-back :: delta -0.24, tolerance 39.93, costs 50.86
+PASS pre-fix expectation was short by exactly the costs since the anchor (50.62)
+PASS conservation: virtualTotal + delta == broker equity (1996.80 - 0.24 = 1996.56)
+PASS first tick: paper-mode no-death rule and no trading without hypotheses
+PASS restart is idempotent (no second top-up, same profiles, markers not rewritten, same baseline)
+PASS live registry/treasury files were never written by the dry run
+SUMMARY pass=37 fail=0
+```
+
+Independently re-run probe for the five defects (13/13 checks PASS after the Lead's fixes) confirmed:
+disabled aggression passes the operator `config.portfolio` limits + neutral executor profile and writes
+no markers; enabling aggression later (even over an old `{skipped:true}` marker) migrates + tops up;
+converted stand-down entries size at the 0.8 floor (not at the bot's 1.0); and a costs-only engine tick
+calls no money-creating ledger operation.
+
+### 12.3 Verified behaviour (what the new tests prove)
+
+1. **Reconciliation root cause + fix (`src/ledger.js`, `src/treasurer.js`).** A virtual cost booked
+   after the one-time anchor no longer halts: with a 0.0001% tolerance, $5 of synthetic metabolism
+   costs pushed the pre-fix expectation (allocated + pool) $5 below broker equity — the old permanent
+   halt — while `costsSinceAnchor()` puts the delta back inside tolerance. `reconciliation` exposes
+   `deltaUsd`, `toleranceUsd`, `costsSinceAnchorUsd`, `virtualTotalUsd`, and the identity
+   `broker equity = allocated + pool + costsSinceAnchor + delta` holds to the cent.
+2. **Genuine fill mismatches still halt, symmetrically.** Broker equity offset by +$5 or −$5 with the
+   same allowed-back costs produces `halted: true` with `reconciliation_mismatch` and a delta exposing
+   exactly the fill (the allowance masks neither sign); a +$0.02 disagreement stays inside tolerance.
+   An allowance of $5 does not hide a $5 fill mismatch.
+3. **The allowance is reconciliation-only.** After costs: agent `capitalContributionsUsd`,
+   `rewardCapitalUsd`, registry `endowmentUsd`, treasury pool and cash are unchanged except the booked
+   charge itself; a costs-only tick calls no `grant`/`credit`/`transfer`; and a $1 allocation cap still
+   halts with `allocation_cap` (the allowance never inflates allocated capital or the cap).
+4. **Anchor baseline / legacy normalisation.** `anchorToBrokerEquity` captures `anchorCostsUsd` (costs
+   booked before the anchor are not allowed back; post-anchor costs are), re-anchoring is a no-op,
+   persisted baselines survive reload, a legacy anchored ledger without the field normalises to 0 so
+   every recorded cost counts, and a baseline larger than booked costs clamps to 0 (never negative).
+   The live state is exactly that legacy shape (`anchored` 2026-10-24, no `anchorCostsUsd`), which is
+   why the add-back of all ~$50.8 works on the first post-restart tick.
+5. **Real live-state copy dry run.** On a read-only copy of the actual `automaton-data` (30 alive agents,
+   21/9 day/swing mix, 23 open positions, $1,996.56 broker equity implied by the live status): the
+   legacy delta is $50.62 > $39.93 tolerance, matched by $50.85 of costs since the anchor; the first
+   tick after the v3.4 migration reports `halted: false`, `deltaUsd −0.24`, `costsSinceAnchorUsd 50.86`
+   (all inside tolerance). The live files were never opened for writing (verified by size/mtime and a
+   temp-dir copy only).
+6. **Cohort assignment/migration.** 30 agents → `{aggressive:12, balanced:13, conservative:5}`,
+   deterministic and day-first (all 12 aggressive day; 9 balanced day + 4 balanced swing + 5
+   conservative swing), baskets 6/4 aggressive, 4/3 balanced, 3/2 conservative; 5 agents → 2/2/1 with
+   the aggressive cohort day-only. Aggression disabled keeps v3.3 balanced genomes and 4/3 baskets and
+   writes no v3.4 markers; it passes the operator `config.portfolio` limits and a neutral executor
+   profile. Profiles/funding are one-time markers (`aggression-v34.json`, `aggression-capital-v34.json`,
+   `growth-v34.json`); restart and stale skipped markers are idempotent/no double top-up. Migration keeps
+   held positions' opening `specId` (and their position) while the profile entry basket applies; flat
+   agents lose the stale cached spec so the builder recompiles with profile multipliers.
+7. **Aggressive capital funding.** The top-up ($17.50 × 12 = $210 toward 1.35 × $50 = $67.50 per
+   aggressive bot) moves cash only from the unallocated treasury pool (`pool 370.82 → 160.82` on the
+   live copy), respects the 92% allocation cap, never mints (pool + allocated conserved exactly), is
+   recorded as a `v3.4 aggressive capital allocation` transfer (contributed capital), never reward
+   capital and never P&L; accepted only for the aggressive cohort; the marker records per-agent
+   allocations; `registry.endowmentUsd` becomes the funded basis. Status exposes
+   `capital.aggressiveCapitalUsd` (17.5) so the UI can show the contributed amount.
+8. **Builder/executor profile (`src/builder.js`, `src/executor.js`).** Builder applies entryZ ×0.70,
+   sizePct ×1.35, stopPct ×0.80, targetPct ×1.20, maxHoldBars ×0.75 **after** hint/genome values and
+   **before** the hard `PARAM_BOUNDS` clamp (over-bound values clamp; balanced/unknown profiles compile
+   byte-identical v3.3 params and the same `specId`; unknown names never guess; symbol/family/lookback/
+   exitZ are untouched). Executor aggressive floor raises a cautious 0.2 factor to 0.8 (a $100 bid
+   becomes $400 on the test mandate); balanced/conservative keep legacy sizing; `respectStandDown:false`
+   turns a `stand_down` stance into a floored cautious entry while `true`/absent keeps the legacy block;
+   a converted stand-down with the bot-agent default `sizeMultiplier: 1` is still capped at the 0.8
+   floor (not a full-size entry); research ALERT still vetoes a converted entry and the D6 daily-order
+   brake still denies it (the aggressive profile is a policy/multiplier, never a brake bypass).
+9. **Annual-return target (`src/orchestrator.js` status).** `targetAnnualReturnPct 0.50`,
+   `requiredDailyReturnPct = (1.5)^(1/365)−1 = 0.00111148` (~0.111%/day), one-time
+   `growth-v34.json` baseline (broker equity + trading P&L at first start), `baselineAt`,
+   `daysElapsed`, `tradingPnlSinceBaselineUsd`, annualized trading return, `targetProgressPct` in
+   **percent points (100 = on target)** and informational `onTrack` were verified with crafted
+   baselines: +$1,000 over 30 days on $100k = 12.1667%/yr = 24.33 points `onTrack:false`; +$5,000 =
+   `121.67` points `onTrack:true`; a <1-day history keeps annualized/progress/onTrack `null` (never
+   fabricated) while trading P&L since baseline is still reported. `accountEquityUsd`,
+   `accountCapitalBase` (Σ contributed capital + treasury pool) and `tradingPnlTotalUsd` are exposed on
+   both `engine.performance` and top-level `performance`.
+10. **Status/activity contract + UI JSON.** `engine.aggression` (enabled/percentages/multiplier/
+    profiles/counts), `engine.activity` (ordersToday, tradesTotal, positionsTotal, last-cycle
+    executions/orders, activeProfiles, haltReasons, halted) and per-agent `aggression`,
+    `aggressionProfile` limits, `activity {ordersToday,trades,positions}` and
+    `capital.aggressiveCapitalUsd` are present, consistent and served by a **stopped** engine and by
+    `marketView`; the target is status-only (the mandate is still min(`maxOrderNotionalUsd`,
+    `maxOrderPctOfEquity` × equity) with a target far behind, and a source scan shows no sizing/trading
+    module reads the target).
+11. **Security (adversarial).** The v3.4 path adds **no broker/order/transfer/tool surface**: the
+    top-up is a virtual `ledger.transfer` from the treasury record, `TOOL_NAMES` is still 10 with no
+    capital/aggression/target/transfer tool, no broker order is submitted during migration, and the
+    costs allowance mints nothing. The kill switch still denies a converted aggressive entry before any
+    broker call (D11), the daily-order cap still denies it (D6 `RATE_FORBIDDEN`), `brakes.js`/`ledger.js`/
+    `treasurer.js`/`rewards.js`/`rankings.js`/brokers still contain no aggression execution override,
+    the reward basis remains `trading-performance` with 0 reward capital and 0 P&L from the top-up, and
+    the v3.4 status/`marketView` fields carry no credential values.
+12. **Docs.** `docs/AGGRESSIVE-GROWTH.md` (counts 12/13/5 including the conservative rounding note,
+    percent-point progress, opt-in/disabled default, capital top-up from pool/cap, risk caps, 50% as
+    target not guarantee, held-spec vs entry-basket wording), `docs/RUNBOOK.md` §8h (live numbers:
+    ~$261 headroom, $210 top-up, pool → ~$160), `README.md` and `CHANGELOG.md` v3.4.0 are consistent
+    with the code verified here (one doc-code mismatch — §6 held baskets — was reported and fixed by
+    the Lead before the freeze).
+
+### 12.4 Defects found by this verification
+
+All five were reported to the Lead with repros; the Lead fixed them in `src/orchestrator.js` /
+`src/executor.js` / `docs/AGGRESSIVE-GROWTH.md` **before the code freeze**, and each now has a
+regression test in the verifier suites (all green).
+
+1. **D-V34-1 (behavioural, fixed) — disabled aggression ignored the operator portfolio limits.**
+   With `aggression.enabled=false` and `portfolio {maxOpenPositionsDay:2, maxOpenPositionsSwing:1,
+   maxOrdersPerCycle:1}`, the orchestrator passed the balanced **profile** limits
+   (`maxOpenPositions:5`, `maxOrdersPerCycle:2`) to `executor.run` instead of `config.portfolio`
+   (captured by wrapping `executor.run`), contradicting the "disabled keeps v3.3 behaviour" intent.
+   Repro was a 3-agent sim tick; fixed: disabled now passes `config.portfolio` limits and a neutral
+   profile `{aggression:'balanced', policySizeFloor:0, respectStandDown:true}`. Regression: integration
+   "disabled aggression passes the OPERATOR portfolio limits…".
+2. **D-V34-2 (behavioural, fixed) — a disabled first run permanently blocked later enablement.**
+   With the code-default disabled config the migration wrote `aggression-v34.json` /
+   `aggression-capital-v34.json` as `{version:1, skipped:true}`; a later start with
+   `aggression.enabled=true` short-circuited on `already?.version === 1`, so the population stayed
+   0/3/0 balanced and no top-up ever ran (operator would have had to delete markers manually,
+   undocumented). Repro: two successive inits on the same state dir; fixed: disabled runs write no
+   markers and stale skipped markers are ignored/overwritten by a real migration, with no double
+   top-up. Regression: integration "a skipped-marker legacy state can still be migrated…".
+3. **D-V34-3 (behavioural, fixed) — converted stand-down sized above the floor.** Executor profile
+   `{aggression:'aggressive', policySizeFloor:0.8, respectStandDown:false}` with the bot policy
+   `{stance:'stand_down', sizeMultiplier:1}` produced a **full-size** entry ($500.25 on the test
+   mandate) instead of the contract's "cautious at the floor" $400, because it used
+   `max(policyFactor, floor)`. This is reachable because `bot-agent.js` stores `sizeMultiplier: 1`
+   when the model omits it. Fixed: a converted stand-down sizes exactly at the floor (0.8; floor 0
+   falls back to the bot multiplier capped at 1); regular trade/cautious still use the max. Regression:
+   integration "executor converts stand_down at the floor…" (sizeMultiplier 1 case).
+4. **D-V34-4 (UI contract, fixed) — aggressive capital was never exposed to the UI.** `status.agents[]`
+   carried no aggressive-capital amount, while `client.js` renders the "Aggressive capital
+   (contributed)" row only when `capital.aggressiveCapitalUsd`/fallbacks exist — so that classification
+   row could never render (contract §5 / CHANGELOG claim "aggressive capital shown as contributed
+   capital"). The aggregate `contributedUsd` was already correct and it was never reward/P&L. Fixed:
+   the top-up is recorded per agent in the genome and exposed in status `capital.aggressiveCapitalUsd`
+   (verified: 17.5 per aggressive bot; marker writes `allocations`). Regression: integration cohort
+   funding test + security top-up surface test.
+5. **D-V34-5 (docs, fixed) — AGGRESSIVE-GROWTH §6 contradicted the code on held baskets.** §6 said
+   "basket sizes updated to profile sizes (flat agents)", but the migration (deliberately) gives every
+   agent the profile ENTRY basket while held positions keep their opening spec/exits. Repro: live-copy
+   migration had four held agents grow 4→6-symbol baskets with their opening `specId` retained. Fixed
+   by updating §6 (and the internal balance formula wording to match the implemented conservative
+   rounding). No code change needed.
+
+No other behavioural defect was found after the fixes; no assertion was weakened.
+
+### 12.5 Remaining gaps (explicit — NOT verified)
+
+1. **Live Alpaca was not restarted.** This round proves the halt fix and the full v3.4 migration on a
+   **read-only copy** of `automaton-data` (fake broker with the live account equity, no network). At
+   verification time the running Host is still pre-v3.4 and the live state dir has no `aggression-v34.json`/
+   `growth-v34.json`; real order placement, real Alpaca fills and the real post-restart reconciliation
+   were not exercised. The first live tick must be operator-checked against RUNBOOK §8h.
+2. **Browser/visual UI not verified.** The builder-owned plugin suite is 52/52 green (re-run here) and
+   this round verified the JSON contract, the scaling (progress points vs UI fractions) and the
+   fallback/caveat hooks (`performanceLegacyNote`, `annualTargetNotGuarantee`, `aggressionCapitalNote`
+   exist; `capital.aggressiveCapitalUsd` is served); the rendered target card/badges/filters/detail
+   rows were not inspected in a browser, and the installed Host needs a restart to serve the v3.4
+   bundle.
+3. **Aggressive capital consumes treasury/reward headroom.** The top-up moved the live-copy pool from
+   ~$370.82 to ~$160.82. Weekly reward budget is `10%` of the pool, so reward capital shrinks until
+   winners rebuild it; the interaction between the smaller pool, reward payouts, replication surplus
+   gates and the 92% allocation cap was not measured over time.
+4. **Drawdown / 50%-annual target are not guaranteed.** Aggressive bots use 1.35× size with 0.80×
+   stops and up to 8 open positions; the target is explicitly informational and its 50%/yr ambition is
+   not a promise. No market-regime or multi-day drawdown study was performed, and the target/`onTrack`
+   fields never force risk (verified structure, not performance).
+5. **No long-run cohort/selection study.** One deterministic cohort assignment, one top-up, one
+   restart are verified; the multi-week effect of the cohort mix on mortality, replication, capital
+   rotation and reward distribution was not simulated or measured.
+6. **Legacy baseline residual.** The live ledger is a legacy anchored ledger with no `anchorCostsUsd`,
+   so the fix allows back **all** recorded costs, including any pre-anchor costs that the original
+   anchor had already folded into the pool seed. On the live copy this residual is −$0.24 (inside the
+   $39.93 tolerance and stable), but a hypothetical legacy ledger with large pre-anchor costs (>2% of
+   equity) could halt with a negative delta; no such state exists here and the field is persisted
+   normally going forward.
+7. **Reconciliation tolerance is unchanged (2% of equity).** A real unbooked fill smaller than ~$40 on
+   the ~$2k live account is inside tolerance (pre-existing behaviour, not introduced or worsened by
+   the costs allowance; the allowance itself was proven not to hide >tolerance mismatches).
+8. **Costs of synthetic/untracked ledger records.** `totalCostsUsd()` sums every ledger record
+   (including `__treasury__` and dead agents), while the reconciliation's allocated total covers
+   `registry.all()`; today the treasury record books no costs and every ledger record belongs to a
+   registry agent, so no divergence exists, but a future charge to an untracked record would
+   over-credit the expectation.
+9. **First-start assumptions.** The top-up scales down permanently if the pool/allocation headroom is
+   short at the first v3.4 start (live headroom is ample: ~$261 vs $210); if the account is restricted
+   or the broker unavailable at that moment, `init` fails and the migration retries on the next start
+   (correct but not exercised against real Alpaca).
+10. **Option-path profile sizing.** Executor profile tests use stock-only worlds for deterministic
+   notional comparisons; the option/spread sizing path multiplies the same size factors and remains
+   under the unchanged D2/D15–D18 walls, but its floored notional was not exercised.
+11. **`marketView`/plugin tool contract only.** No new tool/route was added for v3.4 (TOOL_NAMES 10,
+   route and control paths unchanged); this round verified the JSON they expose, not every render
+   branch (see gap 2).
+
+### 12.6 Verdict (v3.4)
+
+The reconciliation fix is real and correct on the actual live state: the six-day
+`reconciliation_mismatch` halt is explained by $50.8 of virtual metabolism costs the paper broker
+never paid (legacy delta $50.62 vs $39.93 tolerance) and clears on the first tick of a read-only live
+copy (`halted: false`, delta −$0.24, `costsSinceAnchorUsd 50.86`) while genuine ±fill mismatches still
+halt, no cash or capital is minted, the allocation cap is untouched and the conservation identity
+holds to the cent. The aggressive cohort is deterministic and day-first (30 → 12/13/5; baskets 6/4,
+4/3, 3/2; profile multipliers applied before hard bounds with balanced byte-compatible), funded by a
+one-time **$210 contributed-capital** transfer from the treasury pool (endowments 50 → 67.5, pool
+370.82 → 160.82, exactly conserved, never P&L/reward, idempotent across restarts, held positions keep
+their opening specs). Executor floors/stand-down conversion are deterministic and cannot exceed
+mandate/portfolio caps or bypass research/brake gates; the kill switch and D6 still deny converted
+aggressive entries. The 50%-annual target is honest and informational (0.111148%/day required pace,
+percent-point progress with 100 = on target, nulls under one day, no sizing path). Five defects were
+found this round — disabled-aggression portfolio limits, skipped-marker gating, over-floor stand-down
+conversion, missing aggressive-capital status field and a doc/code held-basket mismatch — all fixed by
+the Lead before the freeze and re-verified; 446/446 tests pass (integration 99, security 71) and the
+independent live-copy dry run is 37/37. **Verified as a paper/sim v3.4 capability; the running live
+process has not yet executed the migration/restart, browser rendering is unverified, and the 50% target
+and the aggressive cohort's drawdown/reward trade-off remain expectations, not guarantees.**

@@ -876,3 +876,86 @@ describe('v3.2 strategy mix and basket portfolios', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// v3.4: aggressive growth cohort + annual return target
+// ---------------------------------------------------------------------------
+
+describe('v3.4 aggressive growth cohort and return target', () => {
+  it('assigns a day-first 40/45/15 cohort, funds it from the pool and reports target pace', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-v34growth-'));
+    try {
+      const clock = makeClock(Date.parse('2026-11-23T15:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 10, cap: 20 },
+          endowmentUsd: 5000,
+          strategyMix: { dayPct: 0.5 },
+          aggression: { enabled: true, aggressivePct: 0.4, balancedPct: 0.45, capitalMultiplier: 1.35 },
+          targets: { enabled: true, annualReturnPct: 0.5 },
+          research: { enabled: false },
+          rewards: { enabled: false },
+          agents: { enabled: false },
+        },
+      }).config;
+      const broker = createSimBroker(config, { seed: 31, accountEquityUsd: 100000 });
+      const automaton = await createAutomaton({ config, broker, clock });
+      await automaton.init();
+      const status = await automaton.status();
+      assert.equal(status.engine.aggression.enabled, true);
+      assert.equal(status.engine.aggression.capitalMultiplier, 1.35);
+      const counts = status.engine.aggression.counts;
+      assert.equal(counts.aggressive, 4, '40% of 10 bots are aggressive');
+      assert.equal(counts.conservative, 2, '15% rounded is conservative');
+      assert.equal(counts.balanced, 4);
+      assert.equal(counts.aggressive + counts.balanced + counts.conservative, 10);
+
+      const aggressive = status.agents.filter((agent) => agent.aggression === 'aggressive');
+      const balanced = status.agents.filter((agent) => agent.aggression === 'balanced');
+      const conservative = status.agents.filter((agent) => agent.aggression === 'conservative');
+      assert.equal(aggressive.length, 4);
+      assert.equal(balanced.length, 4);
+      assert.equal(conservative.length, 2);
+      assert.ok(aggressive.every((agent) => agent.tier === 'day'), 'aggressive cohort is day-first');
+      assert.ok(aggressive.every((agent) => agent.symbols.length === 6), 'aggressive day basket is 6 symbols');
+      for (const agent of balanced) {
+        assert.equal(agent.symbols.length, agent.tier === 'day' ? 4 : 3);
+      }
+      assert.ok(conservative.every((agent) => agent.symbols.length === 2), 'conservative swing basket is 2 symbols');
+
+      // Aggressive capital is funded from the treasury pool as contributed capital, never P&L.
+      for (const agent of aggressive) {
+        assert.equal(agent.endowmentUsd, 6750);
+        assert.equal(agent.capital.contributedUsd, 6750);
+        assert.equal(agent.pnl.tradingUsd, 0);
+      }
+      const pool = status.engine.rewards.poolUsd;
+      assert.ok(pool < 50000, 'aggressive top-up must come out of the pool');
+      assert.ok(status.agents.filter((agent) => agent.aggression !== 'aggressive').every((agent) => agent.endowmentUsd === 5000));
+
+      assert.equal(status.engine.performance.enabled, true);
+      assert.equal(status.engine.performance.targetAnnualReturnPct, 0.5);
+      assert.ok(status.engine.performance.requiredDailyReturnPct > 0);
+      assert.equal(status.engine.performance.baselineAt !== null, true);
+      assert.equal(status.engine.performance.baselineAccountEquityUsd, 100000);
+      assert.equal(status.engine.performance.annualizedReturnPct, null, 'short history must not fabricate an annualized return');
+      assert.equal(status.engine.performance.onTrack, null);
+      assert.equal(typeof status.engine.activity.activeProfiles, 'object');
+      assert.equal(status.engine.activity.activeProfiles.aggressive, 4);
+      assert.equal(status.engine.activity.halted, false);
+
+      const tick = await automaton.tick();
+      assert.equal(tick.halted, false);
+      const after = await automaton.status();
+      assert.equal(after.agents.length, 10);
+      assert.ok(after.agents.every((agent) => agent.aggressionProfile && agent.activity));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

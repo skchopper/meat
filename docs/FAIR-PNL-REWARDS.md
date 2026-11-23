@@ -2,8 +2,8 @@
 
 > **Status:** implemented (v3.3) and independently verified: ledger capital accounting + migration,
 > trading-only rankings, performance-gated capital rewards, status/API, plugin UI + reward history, and
-> 404/404 tests across 10 suites (integration 78, security 63, mortality 88, market 50, plugin 49,
-> research 13, rankings 29, control 18, bot-agent 9, instruments 7). Live Host still needs a restart to
+> 446/446 tests across 10 suites (integration 99, security 71, mortality 91, market 56, plugin 52,
+> research 13, rankings 29, control 19, bot-agent 9, instruments 7). Live Host still needs a restart to
 > load v3.3; the migration dry-run on a copy of the real paper state produced 30/30 capitalVersion2,
 > $129.18 lifetime rewards across 6 bots and GapFade META trading P&L −$1.70 (not +$56.86).
 
