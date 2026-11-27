@@ -483,6 +483,13 @@ export async function createAutomaton(options = {}) {
     const genome = genomeForSpec(agent);
     const basket = basketSymbols(agent);
     if (!genome || basket.length === 0) return { __noMatch: true };
+    const profile = resolveAggressionProfile(config, genome?.aggression);
+    // v3.5: aggressive bots may take the best proven setup on a basket symbol when their own
+    // family/symbol has no fresh hypothesis. The spec is marked `fallback` and is still a real
+    // dated-proof strategy; balanced/conservative bots never use this path.
+    const allowOpportunisticFallback = config.aggression?.enabled === true
+      && genome?.aggression === 'aggressive'
+      && profile.allowOpportunisticFallback === true;
     const ranked = [...(hypotheses ?? [])].sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
     if (ranked.length === 0) return { __noMatch: true };
     const existing = isPlainObject(agent.specIds) ? agent.specIds : {};
@@ -506,7 +513,7 @@ export async function createAutomaton(options = {}) {
         ?? (agent.specId && state.specs.get(agent.specId)?.symbol === symbol ? agent.specId : null);
       const cached = cachedId ? state.specs.get(cachedId) : null;
       const hasPosition = positionSymbols.has(symbol);
-      if (cached && cached.symbol === symbol && cached.family === genome.family) {
+      if (cached && cached.symbol === symbol && (cached.family === genome.family || allowOpportunisticFallback)) {
         const proofAgeMs = clock.now() - (Date.parse(cached.createdAt ?? '') || 0);
         if (hasPosition || !Number.isFinite(proofAgeMs) || proofAgeMs <= maxSpecAgeMs) {
           specIds[symbol] = cached.specId;
@@ -519,40 +526,59 @@ export async function createAutomaton(options = {}) {
         specs.push(cached);
         continue;
       }
-      const hypothesis = ranked.find((entry) => String(entry?.symbol).toUpperCase() === symbol && entry?.family === genome.family);
-      if (!hypothesis) continue;
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        const compiled = await builder.compile({
-          hypothesis,
-          agentId: agent.id,
-          cycleBudgetUsd,
-          genome,
-        });
-        const spec = compiled?.spec ?? compiled;
-        if (!spec?.specId || spec.family !== genome.family || String(spec.symbol).toUpperCase() !== symbol) continue;
-        // eslint-disable-next-line no-await-in-loop
-        await ensureDir(paths.specsDir);
-        // eslint-disable-next-line no-await-in-loop
-        await writeJsonAtomic(path.join(paths.specsDir, `${spec.specId}.json`), spec);
-        state.specs.set(spec.specId, spec);
-        specIds[symbol] = spec.specId;
-        specs.push(spec);
-        usedPairs.add(`${symbol}:${spec.family}`);
-      } catch (error) {
-        firstError = firstError ?? errorInfo(error);
+      // Exact own-family hypothesis first. Aggressive opportunistic fallback tries other proven
+      // families for this exact basket symbol ONLY if the exact one is absent or fails D9; candidates
+      // are attempted in rank order so a stale top candidate cannot mask a fresh lower one.
+      const exactHypothesis = ranked.find((entry) => String(entry?.symbol).toUpperCase() === symbol && entry?.family === genome.family) ?? null;
+      const fallbackHypotheses = allowOpportunisticFallback
+        ? ranked.filter((entry) => String(entry?.symbol).toUpperCase() === symbol && entry !== exactHypothesis)
+        : [];
+      const candidates = exactHypothesis ? [exactHypothesis, ...fallbackHypotheses] : fallbackHypotheses;
+      for (const hypothesis of candidates) {
+        const familyMatches = hypothesis?.family === genome.family;
+        if (!familyMatches && !allowOpportunisticFallback) continue;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const compiled = await builder.compile({
+            hypothesis,
+            agentId: agent.id,
+            cycleBudgetUsd,
+            // For a cross-family fallback use the proven family's default/specsHint parameters
+            // (this is the measured setup); keep only the aggression profile marker from the genome.
+            // Own-family specs keep the inherited genome parameters exactly as before.
+            genome: familyMatches ? genome : { aggression: genome.aggression, symbol: genome.symbol },
+          });
+          const compiledSpec = compiled?.spec ?? compiled;
+          if (!compiledSpec?.specId
+            || String(compiledSpec.symbol).toUpperCase() !== symbol
+            || (!familyMatches && !allowOpportunisticFallback)) continue;
+          const spec = familyMatches
+            ? compiledSpec
+            : { ...compiledSpec, fallback: true, genomeFamily: genome.family };
+          // eslint-disable-next-line no-await-in-loop
+          await ensureDir(paths.specsDir);
+          // eslint-disable-next-line no-await-in-loop
+          await writeJsonAtomic(path.join(paths.specsDir, `${spec.specId}.json`), spec);
+          state.specs.set(spec.specId, spec);
+          specIds[symbol] = spec.specId;
+          specs.push(spec);
+          usedPairs.add(`${symbol}:${spec.family}`);
+          break;
+        } catch (error) {
+          firstError = firstError ?? errorInfo(error);
+        }
       }
     }
     if (specs.length === 0) {
       return firstError ? { __compileError: firstError } : { __noMatch: true };
     }
     const genomeSpec = specs.find((spec) => String(spec.symbol).toUpperCase() === String(genome.symbol).toUpperCase()) ?? null;
-    // `specId`/status `spec` stay tied to the bot's PRIMARY genome symbol for coherence. If only
-    // basket siblings have proven hypotheses this cycle, they still trade via specIds/specs but the
-    // primary spec view stays empty until its own symbol is proven.
+    // `specId`/status `spec` stay tied to the bot's PRIMARY genome symbol, exactly as in v3.2.
+    // If only basket siblings have specs, they still trade via specIds/specs but the primary spec
+    // view stays null. A cross-family aggressive spec on the primary symbol IS shown (flagged).
     const primary = genomeSpec ?? specs[0];
     await registry.update(agent.id, { specIds, specId: genomeSpec?.specId ?? null });
-    return { specs, primary, specIds, genomeSpec };
+    return { specs, primary, specIds, genomeSpec, opportunisticFallback: allowOpportunisticFallback };
   }
 
   /** Charge one cycle of metabolism to one agent, attributed by role. */
@@ -2142,6 +2168,8 @@ export async function createAutomaton(options = {}) {
               family: compiledSpec.family,
               params: compiledSpec.params ?? {},
               createdAt: compiledSpec.createdAt ?? null,
+              fallback: compiledSpec.fallback === true,
+              genomeFamily: compiledSpec.genomeFamily ?? null,
             });
           }
           return specsOut;
@@ -2155,6 +2183,8 @@ export async function createAutomaton(options = {}) {
               family: spec.family,
               params: spec.params ?? {},
               createdAt: spec.createdAt ?? null,
+              fallback: spec.fallback === true,
+              genomeFamily: spec.genomeFamily ?? null,
             }
           : null,
         equityUsd,
@@ -2177,6 +2207,7 @@ export async function createAutomaton(options = {}) {
           maxHoldBarsMultiplier: aggressionProfile.maxHoldBarsMultiplier,
           policySizeFloor: aggressionProfile.policySizeFloor,
           respectStandDown: aggressionProfile.respectStandDown,
+          allowOpportunisticFallback: aggressionProfile.allowOpportunisticFallback === true,
         },
         activity: {
           ordersToday: Number(dayStat?.ordersCount) || 0,

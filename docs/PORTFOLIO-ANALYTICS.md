@@ -3,8 +3,8 @@
 > **Status:** implemented (v3.2): strategyMix/portfolio config, 70/30 genesis + one-time migrations,
 > registry baskets/specIds, per-symbol spec compilation, portfolio executor, broker getSnapshots,
 > engine.marketView + Host `GET /automaton/market`, Google-Analytics-style live dashboard.
-> Tests: 446/446 across 10 suites (current; mortality 91, market 56, plugin 52, integration 99, security 71,
-> research 13, rankings 29, control 19, bot-agent 9, instruments 7).
+> Tests: 462 tests (461 pass, 1 env-gated skip) across 10 suites (current; mortality 91, market 56,
+> plugin 52, integration 110, security 76, research 13, rankings 29, control 19, bot-agent 9, instruments 7).
 
 User request: bots are too inactive; some/all should manage **multiple company stocks** instead of one
 symbol; **70% of the population day/short-term**; and the plugin UI should become a **Google-Analytics

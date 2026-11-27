@@ -1,4 +1,4 @@
-# MEAT v3.4 — AGGRESSIVE GROWTH COHORT, RETURN TARGET, AND RECONCILIATION-BURN FIX (contract)
+# MEAT v3.4–v3.5 — AGGRESSIVE GROWTH, RETURN TARGET, SIZING AND ACTIVITY FIXES (contract)
 
 User request (2026-11-23): trading is too slow; make some bots more aggressive; target a **minimum 50%+
 annual return on account capital**. This document is the authoritative v3.4 contract.
@@ -165,7 +165,58 @@ On first v3.4 start, after registry/ledger/rewards/reconciliation load:
    mortality owner and independent verifier: legacy delta ~50.4 → costsSinceAnchor ~50.7 → fixed delta
    inside tolerance → halted false, 30 agent views.
 
-## 7. Acceptance/tests
+## 7. v3.5 sizing and idle-aggressive fixes
+
+**Why orders were tiny.** A new entry was `spec.sizePct × mandate.sizeBudgetUsd`, where the mandate cap
+is `min(maxOrderNotional, maxOrderPctOfEquity × equity)`. With genome sizePct 0.12–0.40 and a $50–$67.5
+bot, typical orders were **$2–$10 (4–15% of capital)**; the live account's gross exposure was only
+~$50 (2.5% of equity).
+
+**v3.5 sizing changes:**
+- `config.risk.sizePctMultiplier` (code default **1.0**, live profile **3.0**) multiplies
+  `spec.sizePct` in the executor, then clamps the effective percentage to ≤1 **before** every
+  mandate/max-order/equity/cash/position/brake cap. Live `risk.maxOrderNotionalUsd` is **$120**.
+- Typical new entry sizes become **~18–50% of the bot's equity** (e.g. a $65 aggressive bot uses roughly
+  $20–$33 per order; the smallest balanced spec still lands near 18%; the largest is capped at 50%).
+  Every hard cap still applies (cash, D5 open positions, position %, order notional, daily orders,
+  margin/options, kill switch). Default multiplier 1.0 is byte-compatible with v3.4.
+- Existing tiny positions are **not force-resized**; they close on their rules, and new entries use the
+  larger sizing. The account's gross exposure is expected to rise materially once signals fire.
+
+**Why some aggressive bots were idle.** Three compounding causes: (1) the engine was halted six days, so
+the Prospector was skipped and hypotheses went stale; (2) day families `breakout`/`gapfade` have sparse
+proven edges (**for the day families only gapfade:SOFI and breakout:AMZN were proven**; the queue's 24
+  positive-edge family:symbol pairs were all stale from 2026-11-17), so many aggressive day
+bots had no exact family/symbol hypothesis and therefore no spec; (3) the market was closed/premarket
+(Thanksgiving and the morning of 2026-11-27).
+
+**v3.5 idle fix — opportunistic proven fallback (aggressive only):**
+- `aggression.profiles.aggressive.allowOpportunisticFallback: true`. When a basket symbol has no
+  compilable hypothesis for the bot's own genome family, the orchestrator tries the **rank-ordered
+  proven hypotheses for that exact basket symbol** from other families until Builder D9 accepts one
+  (a stale top-ranked candidate cannot mask a fresh lower one). The spec is marked `fallback: true` and
+  `genomeFamily`, cached in `specIds`, and executed normally under the same profile/brakes. For a
+  cross-family fallback the builder uses the **hypothesis family's default/specsHint parameters** (the
+  measured setup), keeping only the aggression profile marker from the genome; own-family specs keep the
+  inherited genome parameters.
+- `specId`/status `spec` remain tied to the bot's **primary genome symbol**: a fallback spec on the
+  primary symbol is shown (flagged); if only basket siblings have specs, the primary `spec` stays null
+  while those specs still trade via `specIds`/`specs`.
+- It is **not** a fabricated/synthetic setup: Builder D9 proof/freshness still applies. Balanced and
+  conservative bots never cross families. Fallback specs are clearly flagged in status
+  (`spec.fallback`, `spec.genomeFamily`) so the operator can see the opportunistic strategy drift; this
+  is an explicit aggressive-cohort exception to the normal family/symbol coherence rule.
+- Prospector still runs only when the engine is unhalted and market data is available; fresh hypotheses
+  plus the fallback should give the aggressive day cohort tradable proven setups once the market opens.
+  If no positive-edge/valid hypothesis exists anywhere in a bot's basket, it correctly stays flat.
+  The last live hypothesis queue had **24 positive-edge family:symbol pairs but all dated 2026-11-17
+  (9.8 days stale > maxProofAgeDays=7)**, which is why the halted engine had no compilable specs.
+
+**Sizing caveat:** a single order larger than `risk.maxPositionPct × equity` is DENIED by D5 rather than
+silently clamped. The live `maxPositionPct` is 0.6, safely above the 50%-equity maximum order; if you
+lower it below the intended order size, entries will be denied.
+
+## 8. Acceptance/tests
 
 - Reconciliation: costsSinceAnchor clears the 6-day halt; real fill mismatch still halts; conservation.
 - Profiles: 12/13/5 assignment, aggressive all day where possible; basket/limits/multipliers; capital
@@ -173,4 +224,5 @@ On first v3.4 start, after registry/ledger/rewards/reconciliation load:
 - Builder/executor profile changes (market tests); no brakes bypass; balanced unchanged.
 - Status target math (annualized, required pace, progress, short-history nulls); activity; UI mappings.
 - Target 50% documented as ambition; no guarantee; paper/live gates unchanged.
-- Full suites + independent verifier; docs/AGGRESSIVE-GROWTH.md, RUNBOOK §8h, README, CHANGELOG v3.4.
+- Full suites + independent verifier; docs/AGGRESSIVE-GROWTH.md (§7 = v3.5 sizing/fallback), RUNBOOK §8i,
+  README and CHANGELOG v3.4/v3.5.

@@ -633,6 +633,43 @@ managed normally.
   a mismatch, compare `deltaUsd` with `costsSinceAnchorUsd` and check for unbooked fills before raising
   tolerances.
 
+## 8i. Why orders looked tiny and some aggressive bots stayed idle (v3.5)
+
+**Tiny orders — root cause:** an entry is `spec.sizePct × mandate.sizeBudgetUsd`, capped by
+`min(maxOrderNotional, maxOrderPctOfEquity × equity)`. With sizePct 0.12–0.40 and a $50–$67.5 bot,
+orders were typically **$2–$10 (4–15% of capital)**; live gross exposure was only ~$50 (2.5% of the
+~$2,000 account). The same tiny positions were visible in the agent detail.
+
+**v3.5 fix:** `risk.sizePctMultiplier` (code default 1.0, live **3.0**) scales spec sizePct before every
+cap; `risk.maxOrderNotionalUsd` is now **$120**. New entries are expected to be **~18–50% of the bot's
+capital** (aggressive $65 bot ≈ $20–$33/order; smallest balanced ≈18%; caps at 50%). All mandate, cash,
+D5/position, daily-order, margin/option and kill-switch limits still apply. Existing tiny positions are
+not force-resized — they close by their own stop/target/hold and new entries use the larger size.
+Tune with `risk.sizePctMultiplier` (2–4), `risk.maxOrderPctOfEquity`, and `risk.maxOrderNotionalUsd`;
+lower them if cash/position caps start binding or drawdowns grow.
+
+**Aggressive bots idle — root cause:** the engine was halted for six days so the Prospector was skipped
+and hypotheses went stale; for the day families only gapfade:SOFI and breakout:AMZN were proven (the
+queue's 24 positive-edge family:symbol pairs were all stale from 2026-11-17), so many day bots had
+no exact family/symbol hypothesis and no spec; and the market was closed/premarket (Thanksgiving and the
+morning after).
+
+**v3.5 fix:** aggressive bots get `allowOpportunisticFallback: true`. If their own family/symbol has no
+fresh hypothesis, they may compile the highest-ranked **proven** hypothesis on an exact basket symbol
+from another family (Builder D9 proof/freshness still enforced). The spec is flagged
+`fallback:true`/`genomeFamily` in status and cached like any other; execution/brakes are unchanged.
+Balanced/conservative bots never cross families, and a bot with no proven edge in its basket correctly
+stays flat. Prospector still runs only while unhalted with fresh market data; after the restart and at
+market open the aggressive cohort should have tradable proven setups rather than sitting idle. This is an
+**explicit aggressive-only exception** to family/symbol coherence; watch for strategy drift and use the
+fallback flag in the UI/status when evaluating performance.
+
+**Verification checkpoints:** after restart/market open, confirm `engine.activity.ordersToday` and
+`lastCycleOrders` rise, new fills are roughly 20–50% of each bot's equity (ledger fill notional), and
+aggressive bots with no fallback show either a valid spec or a clear no-hypothesis reason. If orders
+remain tiny, check `risk.sizePctMultiplier` loaded from the workspace config; if aggressive bots remain
+flat, inspect `builds[].skipped` and hypothesis freshness (`data.maxProofAgeDays`) before assuming a bug.
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

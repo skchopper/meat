@@ -2833,5 +2833,243 @@ describe('v3.4 aggressive growth cannot bypass the kill switch or the risk caps'
   });
 });
 
+// ===========================================================================
+// v3.5 — the sizing multiplier and the proved-fallback path add no bypass
+// (docs/AGGRESSIVE-GROWTH.md §7). Adversarial checks:
+//   * only validated config/executor/orchestrator code may read the new keys
+//   * a 3x (or absurdly over-configured) multiplier can never beat the kill
+//     switch, the daily-order brake, the mandate/equity caps or D5
+//   * a fallback-marked spec is still subject to Builder D9: no proof or stale
+//     proof is denied before any broker call, and the broker order surface is
+//     unchanged (no spec/proof/fallback metadata is sent to the broker)
+// ===========================================================================
+
+const V35_DAY_MS = 24 * HOUR_MS;
+
+function v35SecurityWorld({ multiplier = 3, equityUsd = 67.5, risk = {}, kill = false } = {}) {
+  const env = makeEnv({
+    mode: 'sim',
+    endowmentUsd: equityUsd,
+    replication: { childEndowmentUsd: 25 },
+    instruments: {
+      enabled: true,
+      allowOptions: false,
+      allowSpreads: false,
+      allowCoveredCalls: false,
+      allowShort: false,
+      allowMargin: false,
+    },
+    risk: {
+      sizePctMultiplier: multiplier,
+      maxOrderNotionalUsd: 120,
+      maxOrderPctOfEquity: 0.5,
+      maxPositionPct: 0.6,
+      maxOpenPositions: 10,
+      maxDailyOrders: 40,
+      maxSpreadBps: 100,
+      ...risk,
+    },
+  });
+  const clock = makeClock();
+  const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+  // Normalize the synthetic fill price to the fixed test quote (100.05) so the notional the
+  // executor/ledger books is exactly the notional the sizing logic computed; the sim broker's own
+  // price series is irrelevant to the cap checks.
+  const simSubmitOrder = broker.submitOrder.bind(broker);
+  broker.submitOrder = async (order) => {
+    const filled = await simSubmitOrder(order);
+    if (filled && typeof filled === 'object') {
+      const qty = Number(filled.filledQty ?? filled.qty ?? order?.qty ?? 0);
+      filled.filledQty = qty;
+      filled.avgFillPriceUsd = 100.05;
+      filled.filledAvgPriceUsd = 100.05;
+    }
+    return filled;
+  };
+  const harness = brakeHarness(env, clock);
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  ledger.ensureAgent('atm-1', { endowmentUsd: equityUsd, at: clock.iso() });
+  ledger.grant('atm-1', equityUsd, { reason: 'genesis-endowment', at: clock.iso() });
+  if (kill) lockSwitchOn(env.paths);
+  const executor = createExecutor({ broker, brakes: harness.brakes, ledger, config: env.config, clock });
+  const cap = round2(Math.min(
+    Number(env.config.risk.maxOrderNotionalUsd),
+    Number(env.config.risk.maxOrderPctOfEquity) * equityUsd,
+  ));
+  const mandate = {
+    ...baseMandate(),
+    sizeBudgetUsd: cap,
+    maxOrderNotionalUsd: cap,
+    maxDailyOrdersRemaining: 6,
+    equityUsd,
+    allocatedEquityUsd: equityUsd,
+  };
+  return { env, clock, broker, brakes: harness.brakes, ledger, executor, mandate, cap };
+}
+
+function v35SecuritySpec(overrides = {}) {
+  const base = baseSpec();
+  return { ...base, params: { ...base.params, sizePct: 0.4 }, ...overrides };
+}
+
+async function v35SecurityRun(world, { spec = null, mandate = null } = {}) {
+  return world.executor.run({
+    agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbol: 'AAPL', family: 'breakout' } },
+    spec: spec ?? v35SecuritySpec(),
+    mandate: mandate ?? world.mandate,
+    quotes: { AAPL: { bid: 100, ask: 100.1, last: 100 } },
+    bars: { AAPL: breakoutBars() },
+    dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 67.5, pnlUsd: 0 },
+    now: world.clock.now(),
+  });
+}
+
+describe('v3.5 sizing/fallback security: validated config, no brake/cap bypass, unchanged surfaces', () => {
+  it('validates sizePctMultiplier and allowOpportunisticFallback (range/type) with safe defaults', () => {
+    assert.equal(defaultConfig().risk.sizePctMultiplier, 1, 'legacy default is 1');
+    assert.equal(defaultConfig().aggression.profiles.aggressive.allowOpportunisticFallback, true);
+    assert.equal(defaultConfig().aggression.profiles.balanced.allowOpportunisticFallback, undefined);
+    assert.equal(defaultConfig().aggression.profiles.conservative.allowOpportunisticFallback, undefined);
+    for (const bad of [0, 11, -0.5, Number.NaN, '3']) {
+      assert.throws(
+        () => makeEnv({ risk: { sizePctMultiplier: bad } }),
+        (error) => error?.code === 'CONFIG_INVALID',
+        'multiplier ' + String(bad) + ' must be rejected',
+      );
+    }
+    assert.equal(makeEnv({ risk: { sizePctMultiplier: 3 } }).config.risk.sizePctMultiplier, 3);
+    assert.throws(
+      () => makeEnv({ aggression: { profiles: { aggressive: { allowOpportunisticFallback: 'yes' } } } }),
+      (error) => error?.code === 'CONFIG_INVALID',
+    );
+  });
+
+  it('the kill switch and the daily-order brake still deny a 3x-sized entry before any broker call', async () => {
+    const killed = v35SecurityWorld({ kill: true });
+    const killRun = await v35SecurityRun(killed);
+    assert.equal(killRun.orders.length, 0, 'D11 must win regardless of size');
+    assert.equal(killRun.denied[0].code, 'KILL_SWITCH', JSON.stringify(killRun.denied));
+    assert.equal(killed.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(killed.ledger.snapshot('atm-1').cashUsd, 67.5, 'no fill may be booked');
+
+    const rate = v35SecurityWorld();
+    const rateRun = await v35SecurityRun(rate, { mandate: { ...rate.mandate, maxDailyOrdersRemaining: 0 } });
+    assert.equal(rateRun.orders.length, 0);
+    assert.equal(rateRun.denied[0].code, 'RATE_FORBIDDEN', JSON.stringify(rateRun.denied));
+    assert.equal(rate.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+  });
+
+  it('3x sizing stays inside the mandate/equity caps, D5 denies over-position entries, and the multiplier clamp holds', async () => {
+    const capped = v35SecurityWorld();
+    const normal = await v35SecurityRun(capped);
+    assert.equal(normal.orders.length, 1, JSON.stringify(normal.denied));
+    const order = normal.orders[0];
+    const notional = round2(order.qty * order.avgFillPriceUsd);
+    assert.ok(notional <= capped.cap + 0.05, 'order ' + notional + ' must stay at/below mandate cap ' + capped.cap);
+    assert.ok(notional <= 0.5 * 67.5 + 0.05, 'equity cap');
+    assert.ok(notional >= 0.17 * 67.5, 'the 3x order must be meaningful, not tiny: ' + notional);
+
+    // D5: a 50%-equity order is DENIED when the position cap is 0.25 (brake, never a silent resize).
+    const tight = v35SecurityWorld({ risk: { maxPositionPct: 0.25 } });
+    const denied = await v35SecurityRun(tight);
+    assert.equal(denied.orders.length, 0);
+    assert.equal(denied.denied[0].code, 'SIZE_FORBIDDEN', JSON.stringify(denied.denied));
+    assert.equal(tight.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(tight.ledger.snapshot('atm-1').cashUsd, 67.5);
+
+    // An over-configured executor-level multiplier is clamped to the documented [0.1, 10] range,
+    // then the percentage is clamped <=1, so it still cannot exceed the mandate/equity caps.
+    const raw = v35SecurityWorld();
+    const unvalidatedConfig = { ...raw.env.config, risk: { ...raw.env.config.risk, sizePctMultiplier: 100 } };
+    const clampedExecutor = createExecutor({
+      broker: raw.broker,
+      brakes: raw.brakes,
+      ledger: raw.ledger,
+      config: unvalidatedConfig,
+      clock: raw.clock,
+    });
+    const clampedRun = await clampedExecutor.run({
+      agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbol: 'AAPL', family: 'breakout' } },
+      spec: v35SecuritySpec(),
+      mandate: raw.mandate,
+      quotes: { AAPL: { bid: 100, ask: 100.1, last: 100 } },
+      bars: { AAPL: breakoutBars() },
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 67.5, pnlUsd: 0 },
+      now: raw.clock.now(),
+    });
+    assert.equal(clampedRun.orders.length, 1, JSON.stringify(clampedRun.denied));
+    const clampedNotional = round2(clampedRun.orders[0].qty * clampedRun.orders[0].avgFillPriceUsd);
+    assert.ok(clampedNotional <= raw.cap + 0.05, 'clamped multiplier order ' + clampedNotional + ' vs cap ' + raw.cap);
+  });
+
+  it('a fallback-marked spec is still subject to D9: missing/stale proof never reaches the broker', async () => {
+    const fresh = v35SecurityWorld();
+    const fallbackSpec = v35SecuritySpec({ fallback: true, genomeFamily: 'gapfade' });
+    const freshRun = await v35SecurityRun(fresh, { spec: fallbackSpec });
+    assert.equal(freshRun.orders.length, 1, JSON.stringify(freshRun.denied));
+    const order = freshRun.orders[0];
+    for (const forbidden of ['fallback', 'genomeFamily', 'proofRef', 'proof', 'spec', 'hypothesisId']) {
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(order, forbidden),
+        false,
+        'the broker order surface must not carry ' + forbidden,
+      );
+    }
+
+    const unproven = v35SecurityWorld();
+    const noProof = v35SecuritySpec({ fallback: true, genomeFamily: 'gapfade' });
+    delete noProof.proofRef;
+    delete noProof.proof;
+    const noProofRun = await v35SecurityRun(unproven, { spec: noProof });
+    assert.equal(noProofRun.orders.length, 0);
+    assert.equal(noProofRun.denied[0].code, 'NO_PROOF', JSON.stringify(noProofRun.denied));
+    assert.equal(unproven.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(unproven.ledger.snapshot('atm-1').trades, 0);
+
+    const stale = v35SecurityWorld();
+    const staleSpec = v35SecuritySpec({
+      fallback: true,
+      genomeFamily: 'gapfade',
+      proof: { ...baseSpec().proof, observedAt: new Date(T0 - 8 * V35_DAY_MS).toISOString() },
+    });
+    const staleRun = await v35SecurityRun(stale, { spec: staleSpec });
+    assert.equal(staleRun.orders.length, 0);
+    assert.equal(staleRun.denied[0].code, 'PROOF_STALE', JSON.stringify(staleRun.denied));
+    assert.equal(stale.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(stale.ledger.snapshot('atm-1').trades, 0);
+  });
+
+  it('the new switches are read only by config/executor/orchestrator and add no tool or broker surface', () => {
+    const srcDir = path.join(PKG_ROOT, 'src');
+    // `sizePctMultiplier` also exists as a v3.4 aggression PROFILE key (builder), so the scan for
+    // the v3.5 risk scaler is anchored to the `risk.` path; the fallback switch is new-only.
+    const riskScaler = /risk\.sizePctMultiplier/;
+    const fallbackSwitch = /allowOpportunisticFallback/;
+    for (const file of [
+      'brakes.js', 'ledger.js', 'treasurer.js', 'rewards.js', 'rankings.js', 'reaper.js',
+      'reaper-process.js', 'broker-alpaca.js', 'broker-sim.js', 'journal.js', 'replicator.js',
+      'instruments.js', 'research.js', 'bot-agent.js', 'prospector.js', 'builder.js',
+    ]) {
+      const source = fs.readFileSync(path.join(srcDir, file), 'utf8');
+      assert.equal(riskScaler.test(source), false, file + ' must not interpret risk.sizePctMultiplier');
+      assert.equal(fallbackSwitch.test(source), false, file + ' must not interpret allowOpportunisticFallback');
+    }
+    const configSource = fs.readFileSync(path.join(srcDir, 'config.js'), 'utf8');
+    const executorSource = fs.readFileSync(path.join(srcDir, 'executor.js'), 'utf8');
+    const orchestratorSource = fs.readFileSync(path.join(srcDir, 'orchestrator.js'), 'utf8');
+    assert.equal(riskScaler.test(configSource) && riskScaler.test(executorSource), true);
+    assert.equal(fallbackSwitch.test(configSource) && fallbackSwitch.test(orchestratorSource), true);
+    assert.equal(TOOL_NAMES.length, 10, 'v3.5 adds no operator tool');
+    assert.equal(TOOL_NAMES.some((name) => /sizing|fallback|multiplier/i.test(name)), false);
+
+    const env = makeEnv({ mode: 'sim', risk: { sizePctMultiplier: 3 } });
+    const view = publicConfig(env.config);
+    assert.equal(view.risk.sizePctMultiplier, 3, 'config view exposes the sizing scaler');
+    assert.equal(view.aggression.profiles.aggressive.allowOpportunisticFallback, true);
+    assert.equal('credentials' in view, false);
+    assert.equal(JSON.stringify(view).includes('ALPACA_API_SECRET_KEY'), false);
+  });
+});
+
 
 

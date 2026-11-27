@@ -12,6 +12,40 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v3.5.0 — 2026-11-27 — meaningful position sizes and the idle-aggressive fix
+
+The bots were technically trading but at amounts far below their capital, and several aggressive bots
+never got a setup. This release fixes the sizing formula and gives the aggressive cohort a proven-setup
+fallback.
+
+- **Position sizes now meaningful.** A new entry was `spec.sizePct × mandate.sizeBudgetUsd` where the
+  mandate is capped at 50% of bot equity; with sizePct 0.12–0.40 on a $50–$67.5 bot, orders were only
+  **$2–$10 (4–15% of capital)** and live gross exposure was ~$50 on a ~$2,000 account.
+  `risk.sizePctMultiplier` (code default 1 for backward compatibility, live **3.0**) scales sizePct and
+  clamps ≤1 before every mandate/order/equity/cash/position/brake cap; `maxOrderNotionalUsd` is raised
+  to **$120** live. New entries target **~18–50% of each bot's equity**; existing tiny positions are not
+  force-resized and close by their own rules. All brakes/risk caps still bind.
+- **Idle aggressive bots fixed — with a proof requirement.** Root causes: the six-day halt skipped the
+  Prospector and left hypotheses stale; day families breakout/gapfade had only two proven live setups
+  (for the day families only gapfade:SOFI and breakout:AMZN were proven; all 24 positive-edge family:symbol
+  pairs in the queue were stale from 2026-11-17), so many aggressive day bots had no exact hypothesis/spec; and the
+  market was closed/premarket (Thanksgiving). Aggressive bots now enable
+  `allowOpportunisticFallback`: if their own family/symbol has no fresh hypothesis, they may fallback through **rank-ordered dated-proof** hypotheses on an exact basket symbol from
+  another family until Builder D9 accepts one. The
+  spec is marked `fallback:true`/`genomeFamily` in status and cached/executed normally; Builder D9 proof
+  and freshness still apply and every brake remains. Balanced/conservative bots never cross families and
+  bots with no proven edge in their basket stay flat rather than fabricate a trade. This is an explicit
+  aggressive-only exception to family/symbol coherence; strategy drift is visible via the fallback flag.
+- **Status:** `spec.fallback`/`genomeFamily` on basket specs, `aggressionProfile.allowOpportunisticFallback`,
+  `risk.sizePctMultiplier` in config; existing v3.4 target/cohort/status and v3.3 fair P&L/rewards kept.
+- **Tests/docs:** **462 tests, 461 pass, 1 env-gated live-copy skip, 0 fail** (integration 110, security 76,
+  mortality 91=90p+1s, market 56, plugin 52, research 13, rankings 29, control 19, bot-agent 9,
+  instruments 7), including independent v3.5 sizing/fallback regressions; docs/AGGRESSIVE-GROWTH.md §7, RUNBOOK §8i, README/CHANGELOG.
+- **Compatibility/risk:** default sizing multiplier is 1 (old behavior/tests unchanged); the live
+  profile opts into 3.0. Larger orders increase exposure/drawdown risk and may hit cash/position caps;
+  fallback specs are proven but may differ from the bot's genome family. Paper default/live triple gate
+  unchanged; the 50% annual target remains a target, not a guarantee.
+
 ## v3.4.0 — 2026-11-23 — aggressive growth cohort, 50% annual target, and the halt root cause
 
 Trading had effectively stopped because the paper engine was **dark for six days**. This release fixes

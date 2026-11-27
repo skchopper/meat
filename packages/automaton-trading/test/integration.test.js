@@ -35,7 +35,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadConfig, statePaths, defaultConfig } from '../src/config.js';
+import { loadConfig, statePaths, defaultConfig, publicConfig } from '../src/config.js';
 import { createBroker as createSimBroker } from '../src/broker-sim.js';
 import { createAutomaton, genesisGenome } from '../src/orchestrator.js';
 import { createReaper } from '../src/reaper.js';
@@ -5455,6 +5455,651 @@ describe('v3.4 annual-return target and activity status', () => {
       Number(world.config.risk.maxOrderPctOfEquity) * mandateAfter.equityUsd,
     ));
     assert.ok(Math.abs(mandateAfter.sizeBudgetUsd - expectedCap) <= 0.01, 'sizeBudget ' + mandateAfter.sizeBudgetUsd + ' expectedCap ' + expectedCap + ' equity ' + mandateAfter.equityUsd);
+  });
+});
+
+// ===========================================================================
+// v3.5 — meaningful position sizing and the opportunistic proven fallback
+// (docs/AGGRESSIVE-GROWTH.md §7). Independent regression coverage:
+//   * the sizing multiplier scales spec.sizePct before every mandate/order/
+//     equity/cash/brake cap; the default 1 is exactly the v3.4 formula
+//   * a 3x entry on the live-shaped $50/$67.5/$126 bots is ~18-50% of equity
+//   * fallback compiles/marks/caches a proven cross-family hypothesis only for
+//     aggressive bots whose own family/symbol has no compilable hypothesis, uses
+//     the measured (hypothesis-family) parameters, and executes under brakes
+//   * stale/unproven candidates are rejected (D9); balanced/conservative never
+//     cross families; primary `spec` stays tied to the genome symbol
+//   * the narrow-queue coverage gain is measured on a 30-bot cohort (12/13/5)
+//
+// The tick-level tests use one TEST-ONLY seam: `_internals.prospector.run()` is
+// replaced with a deterministic hypothesis list because `ensureSpecs()` is a
+// closure that is not exported (docs/VERIFICATION.md §13 records this gap).
+// ===========================================================================
+
+const V35_LIVE_RISK = Object.freeze({
+  maxOrderNotionalUsd: 120,
+  maxOrderPctOfEquity: 0.5,
+  maxOpenPositions: 10,
+  maxDailyOrders: 40,
+  maxPositionPct: 0.6,
+  maxSpreadBps: 100,
+  sizePctMultiplier: 3,
+});
+
+const V35_STOCK_ONLY = Object.freeze({
+  enabled: true,
+  allowOptions: false,
+  allowSpreads: false,
+  allowCoveredCalls: false,
+  allowShort: false,
+  allowMargin: false,
+});
+
+/** Layered config at the live v3.5 risk shape, with a 3-bot deterministic population. */
+function v35Env({ risk = {}, aggression = {}, instruments = {}, ...overrides } = {}) {
+  return makeEnv({
+    population: { initial: 3, cap: 4 },
+    endowmentUsd: 50,
+    deathFloorUsd: 1,
+    deathFloorPct: 0.05,
+    replication: { childEndowmentUsd: 25, surplus7dUsd: 3, minRunwayHours: 72 },
+    aggression: { enabled: true, ...aggression },
+    risk: { ...V35_LIVE_RISK, ...risk },
+    account: { allocationCapPct: 0.92 },
+    instruments: { ...V35_STOCK_ONLY, ...instruments },
+    ...overrides,
+  });
+}
+
+/** Dated-proof (or deliberately unproven) hypothesis for the patched Prospector. */
+function v35Hypothesis(symbol, family, { ageHours = 1, rank = 0.5, proof = true, specsHint = { sizePct: 0.2 } } = {}) {
+  const hypothesis = {
+    id: 'hyp-v35-' + family + '-' + symbol + '-' + String(rank).replace('.', '_') + '-' + ageHours,
+    symbol,
+    family,
+    rankScore: rank,
+    specsHint,
+  };
+  if (proof) {
+    hypothesis.proof = {
+      vendor: 'alpaca',
+      url: 'https://data.alpaca.markets/v2/stocks/bars?symbols=' + symbol,
+      observedAt: new Date(T0 - ageHours * 60 * 60 * 1000).toISOString(),
+      metric: 'meanBps',
+      sampleSize: 20,
+      stats: { meanBps: 25 },
+    };
+  }
+  return hypothesis;
+}
+
+/** Full automaton world with a patched Prospector queue (test-only seam, see header). */
+async function v35MarketWorld({ hypotheses = [], risk = {}, aggression = {} } = {}) {
+  const env = v35Env({ risk, aggression });
+  const clock = makeClock(T0);
+  const broker = createSimBroker(env.config, { seed: 6, accountEquityUsd: 100000, clock });
+  const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+  await automaton.init();
+  const internals = automaton._internals;
+  internals.prospector.run = async () => ({ hypotheses, spentUsd: 0, dataCalls: 0, rejected: [] });
+  const agents = internals.registry.alive();
+  return {
+    env,
+    config: env.config,
+    paths: env.paths,
+    clock,
+    broker,
+    automaton,
+    internals,
+    agents,
+    aggressive: agents.find((agent) => agent.genome.aggression === 'aggressive') ?? null,
+    nonAggressive: agents.filter((agent) => agent.genome.aggression !== 'aggressive'),
+  };
+}
+
+/** Flat bars then a -1% opening gap: gapfade longEntry, deterministic last close. */
+function v35GapDownBars(basePrice, { count = 40 } = {}) {
+  const bars = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    bars.push({
+      t: T0 - (count - i) * 60 * 60 * 1000,
+      o: basePrice,
+      h: basePrice * 1.001,
+      l: basePrice * 0.999,
+      c: basePrice,
+      v: 1000,
+    });
+  }
+  bars.push({
+    t: T0,
+    o: basePrice * 0.99,
+    h: basePrice * 1.001,
+    l: basePrice * 0.985,
+    c: basePrice * 0.999,
+    v: 5000,
+  });
+  return bars;
+}
+
+/** Pin one symbol's bars + quote so a spec has a deterministic entry signal. */
+function v35PinMarket(broker, symbol, basePrice, barsOverride = null) {
+  const originalGetBars = broker.getBars.bind(broker);
+  broker.getBars = async (args = {}) => {
+    const out = await originalGetBars(args);
+    const requested = (args.symbols ?? []).map((value) => String(value).toUpperCase());
+    if (requested.includes(symbol)) out[symbol] = barsOverride ?? v35GapDownBars(basePrice);
+    return out;
+  };
+  const originalGetQuote = broker.getLatestQuote.bind(broker);
+  broker.getLatestQuote = async (requested, ...rest) => {
+    const quote = await originalGetQuote(requested, ...rest);
+    if (String(requested).toUpperCase() !== symbol) return quote;
+    return {
+      ...quote,
+      bid: round2(basePrice * 0.999),
+      ask: round2(basePrice),
+      last: round2(basePrice * 0.999),
+      ts: quote?.ts ?? null,
+    };
+  };
+}
+
+/** Flat bars then a close above the prior range: breakout longEntry. */
+function v35BreakoutBars(basePrice, { count = 40 } = {}) {
+  const bars = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    bars.push({
+      t: T0 - (count - i) * 60 * 60 * 1000,
+      o: basePrice,
+      h: basePrice * 1.001,
+      l: basePrice * 0.999,
+      c: basePrice,
+      v: 1000,
+    });
+  }
+  bars.push({
+    t: T0,
+    o: basePrice,
+    h: basePrice * 1.06,
+    l: basePrice,
+    c: basePrice * 1.05,
+    v: 5000,
+  });
+  return bars;
+}
+
+/**
+ * Stock-only executor world whose mandate is built with the REAL live risk formula
+ * (`min(maxOrderNotionalUsd, maxOrderPctOfEquity * equity)`) for a small bot.
+ */
+function v35SizingWorld({ equityUsd = 67.5, multiplier = 3, risk = {}, cashCharge = 0 } = {}) {
+  const world = makeInstrumentWorld({
+    endowmentUsd: equityUsd,
+    overrides: {
+      risk: { ...V35_LIVE_RISK, ...(multiplier === null ? {} : { sizePctMultiplier: multiplier }), ...risk },
+      instruments: { ...V35_STOCK_ONLY },
+    },
+  });
+  if (cashCharge > 0) {
+    world.ledger.charge(world.id, cashCharge, { category: 'hosting', role: 'treasurer', at: world.clock.iso() });
+  }
+  const cap = round2(Math.min(
+    Number(world.config.risk.maxOrderNotionalUsd),
+    Number(world.config.risk.maxOrderPctOfEquity) * equityUsd,
+  ));
+  const mandate = {
+    ...world.mandate,
+    sizeBudgetUsd: cap,
+    maxOrderNotionalUsd: cap,
+    equityUsd,
+    allocatedEquityUsd: equityUsd,
+    issuedAt: world.clock.iso(),
+    expiresAt: new Date(world.clock.now() + 10 * 60 * 1000).toISOString(),
+  };
+  return { world, cap, mandate };
+}
+
+function v35SizingSpec(world, sizePct) {
+  return instrumentSpec(world, {
+    params: {
+      lookback: 60,
+      entryZ: 1,
+      exitZ: 0.5,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 12,
+      sizePct,
+      sessionFilter: 'any',
+    },
+  });
+}
+
+/** Run one momentum-long entry and return the resulting order/notional (null when denied). */
+async function v35Enter(worldInfo, sizePct, { overrides = {} } = {}) {
+  const { world, mandate } = worldInfo;
+  const quote = world.broker.getLatestQuote(world.symbol);
+  const result = await world.executor.run({
+    agent: world.registry.get(world.id),
+    spec: v35SizingSpec(world, sizePct),
+    mandate,
+    quotes: { [world.symbol]: quote },
+    bars: { [world.symbol]: instrumentBars(quote.last, 1) },
+    dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 },
+    now: world.clock.now(),
+    ...overrides,
+  });
+  const order = result.orders[0] ?? null;
+  return { result, order, notional: order ? round2(order.qty * order.avgFillPriceUsd) : null, quote };
+}
+
+describe('v3.5 meaningful position sizing (executor, live-shaped caps)', () => {
+  it('default risk.sizePctMultiplier is 1 and reproduces the v3.4 order size exactly', async () => {
+    assert.equal(defaultConfig().risk.sizePctMultiplier, 1, 'code default must stay legacy-compatible');
+    for (const sizePct of [0.12, 0.2, 0.4]) {
+      const explicit = await v35SizingWorld({ equityUsd: 67.5, multiplier: 1 });
+      assert.equal(explicit.world.config.risk.sizePctMultiplier, 1);
+      const run = await v35Enter(explicit, sizePct);
+      assert.equal(run.result.denied.length, 0, JSON.stringify(run.result.denied));
+      assert.ok(run.order, 'a 1x sizing spec must still enter: ' + JSON.stringify(run.result.actions));
+      assert.ok(
+        Math.abs(run.notional - round2(sizePct * explicit.cap)) <= 0.06,
+        'sizePct ' + sizePct + ': ' + run.notional + ' vs legacy ' + round2(sizePct * explicit.cap),
+      );
+    }
+    // An executor whose config omits the field behaves identically: absent multiplier == explicit 1.
+    const absent = await v35SizingWorld({ equityUsd: 67.5, multiplier: 1 });
+    const configWithoutKey = { ...absent.world.config, risk: { ...absent.world.config.risk } };
+    delete configWithoutKey.risk.sizePctMultiplier;
+    absent.world.executor = createExecutor({
+      broker: absent.world.broker,
+      brakes: absent.world.brakes,
+      ledger: absent.world.ledger,
+      config: configWithoutKey,
+      clock: absent.world.clock,
+    });
+    const legacyRun = await v35Enter(absent, 0.2);
+    const explicitRun = await v35Enter(await v35SizingWorld({ equityUsd: 67.5, multiplier: 1 }), 0.2);
+    assert.ok(legacyRun.order && explicitRun.order);
+    assert.equal(legacyRun.notional, explicitRun.notional, 'absent multiplier == explicit 1');
+  });
+
+  it('3x sizing produces ~18-50% orders on $50/$67.5/$126 bots (legacy 6-20%)', async () => {
+    const rows = [];
+    for (const equityUsd of [50, 67.5, 126]) {
+      const cap = round2(Math.min(120, 0.5 * equityUsd));
+      for (const sizePct of [0.12, 0.2, 0.4]) {
+        const legacy = await v35Enter(await v35SizingWorld({ equityUsd, multiplier: 1 }), sizePct);
+        const live = await v35Enter(await v35SizingWorld({ equityUsd, multiplier: 3 }), sizePct);
+        assert.equal(live.result.denied.length, 0, JSON.stringify(live.result.denied));
+        assert.ok(legacy.order && live.order, 'both runs must enter');
+        const legacyPct = legacy.notional / equityUsd;
+        const livePct = live.notional / equityUsd;
+        assert.ok(
+          Math.abs(legacy.notional - round2(sizePct * cap)) <= 0.06,
+          'legacy $' + equityUsd + ' sizePct ' + sizePct + ': ' + legacy.notional,
+        );
+        assert.ok(
+          Math.abs(live.notional - round2(Math.min(1, sizePct * 3) * cap)) <= 0.06,
+          'live $' + equityUsd + ' sizePct ' + sizePct + ': ' + live.notional,
+        );
+        assert.ok(
+          livePct >= 0.17 && livePct <= 0.51,
+          'live order must be meaningful, not tiny: $' + equityUsd + ' sizePct ' + sizePct + ' -> ' + round2(livePct * 100) + '%',
+        );
+        assert.ok(legacyPct <= 0.21, 'legacy orders stay tiny: ' + round2(legacyPct * 100) + '%');
+        rows.push({ equityUsd, sizePct, legacyPct, livePct });
+      }
+    }
+    // The documented band and the 50%-equity clamp, across all three bot sizes.
+    assert.ok(rows.every((row) => row.livePct >= 0.17 && row.livePct <= 0.51));
+    assert.ok(rows.every((row) => Math.abs(row.livePct - Math.min(1, row.sizePct * 3) * 0.5) <= 0.012));
+    assert.ok(rows.some((row) => row.sizePct === 0.4 && row.livePct >= 0.49), 'largest spec clamps at 50% of equity');
+  });
+
+  it('the multiplier is applied before every cap: mandate/order/equity/cash and D5 still bind', async () => {
+    // Mandate / order-notional cap: the real mandate is min(maxOrderNotional, 50% equity).
+    const tiny = await v35SizingWorld({ equityUsd: 67.5, multiplier: 3, risk: { maxOrderNotionalUsd: 10 } });
+    assert.equal(tiny.cap, 10);
+    const tinyRun = await v35Enter(tiny, 0.4);
+    assert.ok(tinyRun.notional <= 10.05, 'mandate cap: ' + tinyRun.notional);
+
+    // Hard account cap: at $500 equity the 120 hard max binds before 50% ($250).
+    const big = await v35SizingWorld({ equityUsd: 500, multiplier: 3 });
+    assert.equal(big.cap, 120);
+    const bigRun = await v35Enter(big, 0.4);
+    assert.ok(bigRun.notional <= 120.1 && bigRun.notional >= 119.8, 'hard cap: ' + bigRun.notional);
+
+    // Cash cap: only $2 of virtual cash left, so the fill is <= $2 and cash never goes negative.
+    const poor = await v35SizingWorld({ equityUsd: 67.5, multiplier: 3, cashCharge: 65.5 });
+    const poorRun = await v35Enter(poor, 0.4);
+    assert.ok(poorRun.order && poorRun.notional <= 2.05, 'cash cap: ' + poorRun.notional);
+    const cashAfter = poor.world.ledger.snapshot(poor.world.id).cashUsd;
+    assert.ok(cashAfter >= 0, 'cash must never go negative: ' + cashAfter);
+
+    // D5 position cap: a >25%-equity order with the default cap is DENIED (a brake, not a clamp),
+    // which is why the live profile raises maxPositionPct to 0.6 (documented caveat).
+    const tight = await v35SizingWorld({ equityUsd: 67.5, multiplier: 3, risk: { maxPositionPct: 0.25 } });
+    const tightRun = await v35Enter(tight, 0.4);
+    assert.equal(tightRun.result.orders.length, 0);
+    assert.equal(tightRun.result.denied[0].code, 'SIZE_FORBIDDEN', JSON.stringify(tightRun.result.denied));
+    assert.ok(tightRun.result.denied[0].reason.includes('0.25'), JSON.stringify(tightRun.result.denied[0]));
+    assert.equal(tight.world.ledger.snapshot(tight.world.id).cashUsd, 67.5, 'a denied order books no cash');
+
+    // The daily-order brake still binds regardless of size.
+    const rate = await v35SizingWorld({ equityUsd: 67.5, multiplier: 3 });
+    const rateRun = await v35Enter(rate, 0.4, { overrides: { mandate: { ...rate.mandate, maxDailyOrdersRemaining: 0 } } });
+    assert.equal(rateRun.result.orders.length, 0);
+    assert.equal(rateRun.result.denied[0].code, 'RATE_FORBIDDEN', JSON.stringify(rateRun.result.denied));
+  });
+
+  it('existing tiny positions are not force-resized; only new entries use the larger size', async () => {
+    const worldInfo = await v35SizingWorld({ equityUsd: 67.5, multiplier: 3 });
+    brokerFill(worldInfo.world, { side: 'buy', qty: 0.01 });
+    const symbol = worldInfo.world.symbol;
+    const before = worldInfo.world.ledger.snapshot(worldInfo.world.id).positions[symbol].qty;
+    assert.ok(before > 0 && before < 0.5, 'seeded a tiny existing position: ' + before);
+    const quote = worldInfo.world.broker.getLatestQuote(symbol);
+    const result = await worldInfo.world.executor.run({
+      agent: worldInfo.world.registry.get(worldInfo.world.id),
+      spec: v35SizingSpec(worldInfo.world, 0.2),
+      mandate: worldInfo.mandate,
+      quotes: { [symbol]: quote },
+      bars: { [symbol]: instrumentBars(quote.last, 1) },
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 67.5, pnlUsd: 0 },
+      now: worldInfo.world.clock.now(),
+      riskOnly: true,
+    });
+    assert.equal(result.orders.length, 0, 'risk-only passes never size or resize a position');
+    const after = worldInfo.world.ledger.snapshot(worldInfo.world.id).positions[symbol].qty;
+    assert.equal(after, before, 'an existing position is left alone (no forced resize)');
+  });
+});
+
+describe('v3.5 aggressive opportunistic fallback (proven cross-family specs)', () => {
+  it('aggressive fallback compiles the measured cross-family setup, flags it, and trades it under brakes', async () => {
+    const world = await v35MarketWorld({
+      hypotheses: [
+        v35Hypothesis('MSFT', 'gapfade', { rank: 0.6 }),
+        v35Hypothesis('NVDA', 'gapfade', { rank: 0.9 }),
+      ],
+    });
+    assert.ok(world.aggressive, 'the cohort must contain one aggressive bot');
+    assert.equal(world.aggressive.genome.family, 'breakout', 'genesis index 2 is the aggressive breakout bot');
+    assert.equal(world.aggressive.genome.symbol, 'NVDA');
+    const quote = world.broker.getLatestQuote('NVDA');
+    v35PinMarket(world.broker, 'NVDA', round2(Number(quote.ask) || Number(quote.last)));
+
+    const trace = await world.automaton.tick();
+    assert.equal(trace.halted, false, JSON.stringify(trace.haltReasons));
+    const build = trace.builds.find((entry) => entry.agentId === world.aggressive.id);
+    assert.ok(build && build.specId, JSON.stringify(trace.builds));
+    assert.equal(build.family, 'gapfade', 'fallback uses the other proven family');
+    assert.equal(build.symbol, 'NVDA', 'fallback stays on an EXACT basket symbol');
+    assert.equal(build.basket.includes('NVDA'), true);
+
+    // Balanced bots had a gapfade hypothesis on MSFT in their baskets but must not cross families.
+    for (const agent of world.nonAggressive) {
+      const row = trace.builds.find((entry) => entry.agentId === agent.id);
+      assert.ok(!row || row.skipped === 'no_matching_hypothesis', agent.name + ': ' + JSON.stringify(row));
+    }
+
+    const status = await world.automaton.status();
+    const row = status.agents.find((agent) => agent.id === world.aggressive.id);
+    assert.equal(row.specId, build.specId, 'a fallback spec on the PRIMARY genome symbol is the primary spec');
+    assert.ok(row.spec);
+    assert.equal(row.spec.fallback, true);
+    assert.equal(row.spec.genomeFamily, 'breakout');
+    assert.equal(row.spec.family, 'gapfade');
+    assert.equal(row.spec.symbol, 'NVDA');
+    // The measured setup: hypothesis-family defaults + hint + aggression multipliers, NOT the
+    // breakout genome's lookback/entryZ/stop values.
+    assert.equal(row.spec.params.lookback, 30, 'gapfade family default lookback');
+    assert.equal(row.spec.params.entryZ, 0.7, 'gapfade default 1.0 x 0.70');
+    assert.equal(row.spec.params.exitZ, 0.5);
+    assert.equal(row.spec.params.stopPct, 0.012, 'gapfade 0.015 x 0.80');
+    assert.equal(row.spec.params.targetPct, 0.03, 'gapfade 0.025 x 1.20');
+    assert.equal(row.spec.params.maxHoldBars, 5, 'gapfade 6 x 0.75 rounded');
+    assert.equal(row.spec.params.sizePct, 0.27, 'hint 0.2 x 1.35 profile');
+    assert.equal(row.aggressionProfile.allowOpportunisticFallback, true);
+
+    const specFile = readJsonFile(path.join(world.paths.specsDir, build.specId + '.json'));
+    assert.equal(specFile.hypothesisId, 'hyp-v35-gapfade-NVDA-0_9-1');
+    assert.equal(specFile.proofRef, 'https://data.alpaca.markets/v2/stocks/bars?symbols=NVDA');
+    assert.equal(specFile.fallback, true);
+    assert.equal(specFile.genomeFamily, 'breakout');
+
+    // Executor: same profile/brakes, meaningful size, attribution to the fallback spec.
+    const execution = trace.executions.find((entry) => entry.agentId === world.aggressive.id);
+    assert.ok(execution, JSON.stringify(trace.executions));
+    assert.equal(execution.specId, build.specId);
+    assert.equal(execution.orders, 1, JSON.stringify(execution));
+    assert.equal(execution.denied, 0, JSON.stringify(execution.denied));
+    const orders = world.broker.getOrders({ status: 'all', limit: 50 });
+    assert.equal(orders.length, 1);
+    const order = orders[0];
+    assert.equal(order.clientOrderId.includes(build.specId), true);
+    const notional = round2(order.filledQty * order.avgFillPriceUsd);
+    assert.ok(
+      notional >= 0.3 * row.equityUsd && notional <= 0.51 * row.equityUsd,
+      'fallback order $' + notional + ' vs equity $' + row.equityUsd,
+    );
+    // No new order surface: the broker order carries no spec/fallback/proof metadata.
+    for (const forbidden of ['fallback', 'genomeFamily', 'proofRef', 'proof', 'hypothesisId', 'spec']) {
+      assert.equal(Object.prototype.hasOwnProperty.call(order, forbidden), false, 'order must not carry ' + forbidden);
+    }
+    const book = world.internals.ledger.snapshot(world.aggressive.id);
+    assert.equal(Object.keys(book.positions).includes('NVDA'), true);
+    assert.ok(book.cashUsd >= 0, 'cash after entry: ' + book.cashUsd);
+    assert.deepEqual(trace.errors, [], JSON.stringify(trace.errors));
+
+    // Cached fallback reuse: a second cycle with the same fresh queue reuses the specIds cache,
+    // keeps the fallback/genomeFamily markers, and does not fork a duplicate spec.
+    const specCountAfterFirst = fs.readdirSync(world.paths.specsDir).length;
+    world.clock.advance(CYCLE_MS);
+    const secondTrace = await world.automaton.tick();
+    const secondStatus = await world.automaton.status();
+    const secondRow = secondStatus.agents.find((agent) => agent.id === world.aggressive.id);
+    assert.equal(secondRow.specId, build.specId, 'cached primary fallback spec is reused');
+    assert.equal(secondRow.spec.fallback, true);
+    assert.equal(secondRow.spec.genomeFamily, 'breakout');
+    assert.equal(fs.readdirSync(world.paths.specsDir).length, specCountAfterFirst, 'no duplicate spec on cache reuse');
+    assert.equal(secondTrace.halted, false);
+    assert.equal(secondTrace.errors.length, 0, JSON.stringify(secondTrace.errors));
+
+    // Balanced/conservative status rows never carry fallback specs or the flag.
+    for (const agent of status.agents.filter((entry) => entry.aggression !== 'aggressive')) {
+      for (const spec of agent.specs) assert.equal(spec.fallback, false);
+      assert.equal(agent.aggressionProfile.allowOpportunisticFallback, false);
+    }
+    assert.equal(status.engine.aggression.profiles.aggressive.allowOpportunisticFallback, true);
+  });
+
+  it('a basket-sibling spec never becomes the primary spec (v3.2 primary coherence preserved)', async () => {
+    // D-V35-1 regression: the aggressive fallback change must not point agent.specId / status
+    // `spec` at an own-family SIBLING basket spec. The sibling still trades via specIds/specs.
+    const world = await v35MarketWorld({ hypotheses: [v35Hypothesis('F', 'breakout', { rank: 0.8 })] });
+    assert.equal(world.aggressive.genome.symbol, 'NVDA', 'primary symbol has no hypothesis');
+    assert.equal(world.aggressive.symbols.includes('F'), true, 'F is a basket sibling');
+    const quote = world.broker.getLatestQuote('F');
+    const base = round2(Number(quote.ask) || Number(quote.last));
+    v35PinMarket(world.broker, 'F', base, v35BreakoutBars(base));
+    const trace = await world.automaton.tick();
+    assert.equal(trace.halted, false);
+    const status = await world.automaton.status();
+    const row = status.agents.find((agent) => agent.id === world.aggressive.id);
+    assert.equal(row.specId, null, 'no spec on the genome symbol -> no primary specId');
+    assert.equal(row.spec, null, 'status spec stays tied to the primary genome symbol');
+    const sibling = row.specs.find((spec) => spec.symbol === 'F');
+    assert.ok(sibling, JSON.stringify(row.specs));
+    assert.equal(sibling.family, 'breakout', 'the sibling is the own family, not a fallback');
+    assert.equal(sibling.fallback, false);
+    const registryAgent = world.internals.registry.get(world.aggressive.id);
+    assert.equal(registryAgent.specId, null);
+    assert.equal(registryAgent.specIds.F, sibling.specId, 'the sibling spec is still cached and tradable');
+    const execution = trace.executions.find((entry) => entry.agentId === world.aggressive.id);
+    assert.ok(execution && execution.orders === 1, 'the executor still trades the sibling spec: ' + JSON.stringify(execution));
+    assert.equal(execution.specId, sibling.specId);
+    assert.equal(world.broker.getOrders({ status: 'all', limit: 50 })[0].symbol, 'F');
+  });
+
+  it('disabling allowOpportunisticFallback leaves aggressive bots idle on the same queue', async () => {
+    const world = await v35MarketWorld({
+      hypotheses: [v35Hypothesis('NVDA', 'gapfade', { rank: 0.9 })],
+      aggression: { profiles: { aggressive: { allowOpportunisticFallback: false } } },
+    });
+    const quote = world.broker.getLatestQuote('NVDA');
+    v35PinMarket(world.broker, 'NVDA', round2(Number(quote.ask) || Number(quote.last)));
+    const trace = await world.automaton.tick();
+    const build = trace.builds.find((entry) => entry.agentId === world.aggressive.id);
+    assert.ok(build && build.skipped === 'no_matching_hypothesis', JSON.stringify(build));
+    assert.equal(trace.executions.some((entry) => entry.agentId === world.aggressive.id), false);
+    const status = await world.automaton.status();
+    const row = status.agents.find((agent) => agent.id === world.aggressive.id);
+    assert.equal(row.specs.length, 0);
+    assert.equal(row.spec, null);
+    assert.equal(row.aggressionProfile.allowOpportunisticFallback, false);
+    assert.equal(status.engine.aggression.profiles.aggressive.allowOpportunisticFallback, false);
+    assert.equal(world.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    for (const agent of status.agents.filter((entry) => entry.aggression !== 'aggressive')) {
+      assert.equal(agent.specs.length, 0, 'balanced bots never fall back: ' + agent.name);
+    }
+  });
+
+  it('fallback never trades a stale or unproven hypothesis (Builder D9 still binds)', async () => {
+    const stale = await v35MarketWorld({ hypotheses: [v35Hypothesis('NVDA', 'gapfade', { ageHours: 8 * 24 })] });
+    const staleTrace = await stale.automaton.tick();
+    const staleBuild = staleTrace.builds.find((entry) => entry.agentId === stale.aggressive.id);
+    assert.equal(staleBuild.error, 'PROOF_STALE', JSON.stringify(staleBuild));
+    const staleStatus = await stale.automaton.status();
+    const staleRow = staleStatus.agents.find((agent) => agent.id === stale.aggressive.id);
+    assert.equal(staleRow.specs.length, 0);
+    assert.equal(staleRow.spec, null);
+    assert.equal(stale.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(fs.readdirSync(stale.paths.specsDir).length, 0, 'no spec may be persisted for a stale proof');
+
+    const unproven = await v35MarketWorld({ hypotheses: [v35Hypothesis('NVDA', 'gapfade', { proof: false })] });
+    const unprovenTrace = await unproven.automaton.tick();
+    const unprovenBuild = unprovenTrace.builds.find((entry) => entry.agentId === unproven.aggressive.id);
+    assert.equal(unprovenBuild.error, 'NO_PROOF', JSON.stringify(unprovenBuild));
+    assert.equal(unproven.broker.getOrders({ status: 'all', limit: 50 }).length, 0);
+    assert.equal(fs.readdirSync(unproven.paths.specsDir).length, 0, 'no spec may be persisted for an unproven hypothesis');
+  });
+
+  it('own-family specs win over fallback and a stale top fallback cannot mask a fresh lower one', async () => {
+    const world = await v35MarketWorld({
+      hypotheses: [
+        v35Hypothesis('NVDA', 'breakout', { rank: 0.2 }), // own family, lower rank: still preferred
+        v35Hypothesis('F', 'gapfade', { rank: 0.95, ageHours: 8 * 24 }), // stale top fallback candidate
+        v35Hypothesis('F', 'gapfade', { rank: 0.9 }), // fresh same-family lower-ranked candidate
+        v35Hypothesis('F', 'meanrev', { rank: 0.5 }), // other family, lower rank
+      ],
+    });
+    const trace = await world.automaton.tick();
+    const status = await world.automaton.status();
+    const row = status.agents.find((agent) => agent.id === world.aggressive.id);
+    assert.ok(row.spec, JSON.stringify(row));
+    assert.equal(row.spec.symbol, 'NVDA', 'primary spec stays tied to the genome symbol');
+    assert.equal(row.spec.family, 'breakout');
+    assert.equal(row.spec.fallback, false, 'own-family specs are not flagged as fallback');
+    assert.equal(row.specId, row.spec.specId);
+    const fSpec = row.specs.find((spec) => spec.symbol === 'F');
+    assert.ok(fSpec, JSON.stringify(row.specs));
+    assert.equal(fSpec.family, 'gapfade', 'highest-ranked FRESH other-family candidate is used');
+    assert.equal(fSpec.fallback, true);
+    assert.equal(fSpec.genomeFamily, 'breakout');
+    const fFile = readJsonFile(path.join(world.paths.specsDir, fSpec.specId + '.json'));
+    assert.equal(fFile.hypothesisId, 'hyp-v35-gapfade-F-0_9-1');
+    const execution = trace.executions.find((entry) => entry.agentId === world.aggressive.id);
+    assert.ok(execution && execution.specs === 2, JSON.stringify(execution));
+    assert.equal(trace.builds.some((entry) => entry.error === 'PROOF_STALE'), false, JSON.stringify(trace.builds));
+  });
+
+  it('narrow proven-edge queue: fallback covers most aggressive bots, balanced/conservative stay coherent', async () => {
+    async function coverageWorld(allowFallback) {
+      const env = v35Env({
+        population: { initial: 30, cap: 60 },
+        strategyMix: { dayPct: 0.7 },
+        aggression: allowFallback
+          ? { enabled: true }
+          : { enabled: true, profiles: { aggressive: { allowOpportunisticFallback: false } } },
+      });
+      const clock = makeClock(T0);
+      const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+      const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+      await automaton.init();
+      automaton._internals.prospector.run = async () => ({
+        hypotheses: [v35Hypothesis('SOFI', 'gapfade', { rank: 1 }), v35Hypothesis('AMZN', 'breakout', { rank: 0.4 })],
+        spentUsd: 0,
+        dataCalls: 0,
+        rejected: [],
+      });
+      const trace = await automaton.tick();
+      const status = await automaton.status();
+      const aggressive = status.agents.filter((agent) => agent.aggression === 'aggressive');
+      return {
+        trace,
+        status,
+        aggressive,
+        covered: aggressive.filter((agent) => agent.specs.length > 0),
+        expectedCovered: aggressive.filter((agent) => agent.symbols.includes('SOFI') || agent.symbols.includes('AMZN')),
+      };
+    }
+
+    const enabled = await coverageWorld(true);
+    assert.equal(enabled.trace.halted, false);
+    assert.equal(enabled.aggressive.length, 12);
+    assert.deepEqual(enabled.status.engine.aggression.counts, { aggressive: 12, balanced: 13, conservative: 5 });
+    assert.deepEqual(
+      enabled.covered.map((agent) => agent.name).sort(),
+      enabled.expectedCovered.map((agent) => agent.name).sort(),
+      'every aggressive bot with a proven setup on a basket symbol gets a spec',
+    );
+    assert.ok(
+      enabled.covered.some((agent) => agent.specs.some((spec) => spec.fallback)),
+      'the narrow queue is covered partly by cross-family fallback specs',
+    );
+    for (const agent of enabled.status.agents.filter((entry) => entry.aggression !== 'aggressive')) {
+      for (const spec of agent.specs) {
+        assert.equal(spec.family, agent.genome.family, agent.name + ' must not cross families');
+        assert.equal(spec.fallback, false);
+      }
+    }
+
+    const disabled = await coverageWorld(false);
+    const disabledExpected = disabled.covered.filter((agent) => (
+      agent.genome.family === 'gapfade'
+        ? agent.symbols.includes('SOFI')
+        : agent.symbols.includes('AMZN')
+    ));
+    assert.deepEqual(
+      disabled.covered.map((agent) => agent.name).sort(),
+      disabledExpected.map((agent) => agent.name).sort(),
+      'without fallback only own-family matches compile',
+    );
+    assert.equal(disabled.covered.some((agent) => agent.specs.some((spec) => spec.fallback)), false);
+    assert.ok(
+      enabled.covered.length > disabled.covered.length,
+      'fallback coverage ' + enabled.covered.length + ' must exceed ' + disabled.covered.length,
+    );
+    assert.equal(disabled.status.engine.aggression.profiles.aggressive.allowOpportunisticFallback, false);
+    assert.equal(enabled.status.engine.aggression.profiles.aggressive.allowOpportunisticFallback, true);
+  });
+
+  it('v3.5 status/config contract exposes the sizing scaler and fallback flags (no secrets)', async () => {
+    const world = await v35MarketWorld({ hypotheses: [] });
+    const status = await world.automaton.status();
+    assert.equal(status.engine.aggression.profiles.aggressive.allowOpportunisticFallback, true);
+    assert.equal(status.engine.aggression.profiles.balanced.allowOpportunisticFallback, undefined);
+    assert.equal(status.engine.aggression.profiles.conservative.allowOpportunisticFallback, undefined);
+    for (const agent of status.agents) {
+      assert.equal(typeof agent.aggressionProfile.allowOpportunisticFallback, 'boolean');
+      assert.equal(Array.isArray(agent.specs), true);
+    }
+    const view = publicConfig(world.config);
+    assert.equal(view.risk.sizePctMultiplier, 3);
+    assert.equal(view.risk.maxOrderNotionalUsd, 120);
+    assert.equal(view.aggression.profiles.aggressive.allowOpportunisticFallback, true);
+    assert.equal(JSON.stringify(view).includes('ALPACA_API_SECRET_KEY'), false);
   });
 });
 

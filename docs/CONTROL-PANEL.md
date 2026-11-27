@@ -132,8 +132,8 @@ strategyMix: {
 agents: [{
   ...existing,
   symbols: [SYMBOL, ...],                    // v3.2 multi-symbol basket
-  specs: [{symbol, specId, family, params, createdAt}], // one spec per basket symbol
-  spec: {symbol, specId, family, params} | null,       // primary-symbol spec only
+  specs: [{symbol, specId, family, params, createdAt, fallback, genomeFamily}], // v3.5 fallback flag
+  spec: {symbol, specId, family, params, fallback, genomeFamily} | null, // primary spec
   equityUsd,                                  // TOTAL equity (includes reward capital)
   tradingPnlUsd, tradingPnlPct,               // v3.3 trading-only P&L; pct is a fraction
   capital: {contributedUsd, baseUsd, rewardCapitalUsd, rewardSharePct, capitalVersion},
@@ -141,7 +141,8 @@ agents: [{
   aggressionProfile: {name, basketSizeDay, basketSizeSwing, maxOpenPositionsDay,
                       maxOpenPositionsSwing, maxOrdersPerCycle, entryZMultiplier,
                       sizePctMultiplier, stopPctMultiplier, targetPctMultiplier,
-                      maxHoldBarsMultiplier, policySizeFloor, respectStandDown}, // v3.4
+                      maxHoldBarsMultiplier, policySizeFloor, respectStandDown,
+                      allowOpportunisticFallback}, // v3.4/v3.5
   activity: {ordersToday, trades, positions}, // v3.4
   rewards: {lifetimeUsd, count, lastAt, history:[{period, periodKey, at, rank, amountUsd,
             share, periodTradingPnlUsd, periodTradingPnlPct}]},  // v3.3

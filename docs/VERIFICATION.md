@@ -1532,3 +1532,240 @@ the Lead before the freeze and re-verified; 446/446 tests pass (integration 99, 
 independent live-copy dry run is 37/37. **Verified as a paper/sim v3.4 capability; the running live
 process has not yet executed the migration/restart, browser rendering is unverified, and the 50% target
 and the aggressive cohort's drawdown/reward trade-off remain expectations, not guarantees.**
+
+## 13. v3.5 meaningful position sizing + idle-aggressive fallback — independent verification (2026-11-27)
+
+This round verifies `docs/AGGRESSIVE-GROWTH.md` §7 (the v3.5 changes): `risk.sizePctMultiplier`
+(default 1, live 3.0, `maxOrderNotionalUsd` 120) and the aggressive-only opportunistic proven
+fallback (`aggression.profiles.aggressive.allowOpportunisticFallback`). The verifier did **not** edit
+`src/`, config, orchestrator, executor or client; the only changed files are
+`test/integration.test.js`, `test/security.test.js` and this section. Two real defects found during
+the round were fixed by the Lead while verification was in progress (tree re-frozen at
+`orchestrator.js` 2026-11-27 21:05 local) and re-verified here; the fixes are covered by pass-only
+regression tests.
+
+### 13.1 Reproduce
+
+```powershell
+cd packages/automaton-trading
+node test/integration.test.js
+node test/security.test.js
+node test/mortality.test.js      # live-copy proof remains env-gated (set AUTOMATON_LIVE_DRY_RUN=1)
+node test/market.test.js
+node test/plugin.test.js
+node test/research.test.js
+node test/rankings.test.js
+node test/control.test.js
+node test/bot-agent.test.js
+node test/instruments.test.js
+```
+The sandbox still blocks `node --test <file>` (spawn EPERM), so files run directly. The v3.5 fallback
+tests drive the **real** tick path (`ensureSpecs` → builder → executor → brakes → registry/status);
+because `ensureSpecs` is a closure that is not exported, the tests replace
+`automaton._internals.prospector.run()` with a deterministic hypothesis queue (test-only seam — see
+gap 13.6.8). Sizing tests drive the real executor/brakes/ledger with a stock-only instrument world and
+a mandate built by the real live formula `min(risk.maxOrderNotionalUsd, risk.maxOrderPctOfEquity ×
+equity)`.
+
+### 13.2 Results (fresh runs, 2026-11-27; every process exit code 0)
+
+| suite | tests | pass | skip | fail |
+| --- | --- | --- | --- | --- |
+| integration (`test/integration.test.js`) | 110 | 110 | 0 | 0 |
+| security (`test/security.test.js`) | 76 | 76 | 0 | 0 |
+| mortality (`test/mortality.test.js`) | 91 | 90 | 1 | 0 |
+| market (`test/market.test.js`) | 56 | 56 | 0 | 0 |
+| plugin (`test/plugin.test.js`) | 52 | 52 | 0 | 0 |
+| research (`test/research.test.js`) | 13 | 13 | 0 | 0 |
+| rankings (`test/rankings.test.js`) | 29 | 29 | 0 | 0 |
+| control (`test/control.test.js`) | 19 | 19 | 0 | 0 |
+| bot-agent (`test/bot-agent.test.js`) | 9 | 9 | 0 | 0 |
+| instruments (`test/instruments.test.js`) | 7 | 7 | 0 | 0 |
+| **total** | **462** | **461** | **1** | **0** |
+
+The pre-existing 446-test baseline (before this verifier's additions) was reproduced exactly at the
+start of the round: 445 pass + 1 env-gated live-copy skip, 0 fail (integration 99, security 71,
+mortality 90p/1s, market 56, plugin 52, research 13, rankings 29, control 19, bot-agent 9,
+instruments 7). This round adds **16 pass-only tests** (11 integration, 5 security); nothing is
+`todo`/skipped except the unchanged `AUTOMATON_LIVE_DRY_RUN` mortality live-copy gate.
+
+### 13.3 Sizing verification (executor, live-shaped caps)
+
+The mandate cap at these bot sizes is `min(120, 0.5 × equity)`: **$25** on a $50 bot, **$33.75** on
+$67.5, **$63** on $126. The executor order is `min(1, spec.sizePct × multiplier) × mandate cap` before
+the mandate/hard/equity/cash/D5/brake caps. Measured on the real executor (entry notional, rounding
+tolerance ±$0.06; 3x entries include the 4-decimal qty rounding):
+
+| sizePct | 1x (v3.4) | 3x (v3.5 live) |
+| --- | --- | --- |
+| 0.12 | $3.00 / $4.05 / $7.56 → **6.0%** of equity | $9.00 / $12.16 / $22.68 → **18.0%** |
+| 0.20 | $5.00 / $6.75 / $12.60 → **10.0%** | $15.00 / $20.26 / $37.80 → **30.0%** |
+| 0.40 | $10.00 / $13.50 / $25.20 → **20.0%** | $25.00 / $33.77 / $63.00 → **50.0%** (percent clamp at 1) |
+
+Per-bot sizes computed with the live config/genomes/equity (market closed, so not executed):
+**aggressive 12 bots: $19.65–$61.03 = 27.9%–50.0% of equity** (the documented "$65 aggressive bot
+$20–$33" holds: live $65 aggressive bots project $19.65–$32.70), **balanced 13: $12.79–$29.21 =
+26.5%–48.8%**, **conservative 5: $7.58–$16.32 = 15.7%–33.8%**.
+
+Verified claims:
+- **Default compatibility:** `defaultConfig().risk.sizePctMultiplier === 1`; an executor whose config
+  omits the field produces the *identical* order as an explicit 1 (both = `sizePct × cap`). No
+  v3.4/v3.3 assertion was weakened; balanced/legacy builder byte-compatibility tests still pass.
+- **Caps:** mandate max-order $10 → order $10.01; at $500 equity the $120 hard/equity cap binds
+  ($119.8–$120.1); with only $2 virtual cash the order is $2.00 and cash never goes negative; a
+  50%-equity order under the default `maxPositionPct` 0.25 is **denied (D5 `SIZE_FORBIDDEN`, not
+  silently clamped)** — the live `maxPositionPct` 0.6 is safely above the 50% maximum order (documented
+  caveat); the daily-order brake still denies `RATE_FORBIDDEN`.
+- **No resize of existing positions:** a risk-only pass over a seeded tiny position leaves its qty
+  untouched (only new entries use the larger size; exits follow their own rules).
+- **No negative cash, no cap bypass:** covered above and by the security round.
+
+### 13.4 Idle-aggressive fallback verification
+
+Through the real tick path (3-bot world: one aggressive `Breakout NVDA`, endowment $50 → $67.5 after
+the v3.4 top-up; two balanced bots):
+
+- **Compiles the measured setup and trades it:** queue `gapfade:NVDA` with no own-family hypothesis →
+  spec `family: gapfade`, `fallback: true`, `genomeFamily: breakout`, `symbol: NVDA`,
+  `proofRef` = the hypothesis proof URL, and the **hypothesis-family parameters** (`lookback 30,
+  entryZ 0.70, exitZ 0.50, stopPct 0.012, targetPct 0.03, maxHoldBars 5, sizePct 0.27` = gapfade
+  defaults/hint × aggression profile multipliers), not the breakout genome values. The executor
+  placed exactly one order attributed to that spec, **40.5% of the bot's equity**, with 0 brake
+  denials/errors, non-negative cash and no spec/proof/fallback metadata on the broker order.
+- **Primary/status contract:** because the fallback spec is on the *primary genome symbol*, status
+  `spec`/`specId` show it and flag `fallback: true`/`genomeFamily: breakout`; a **basket-sibling**
+  spec never becomes the primary spec (`specId`/`spec` stay null, exactly v3.2), while it remains in
+  `specIds`/`specs` and the executor still trades it (D-V35-1 regression).
+- **Balanced/conservative:** given a proven other-family hypothesis on a symbol in their baskets they
+  stayed `no_matching_hypothesis`, zero specs, zero orders; no non-aggressive status row ever carries
+  a fallback spec/flag.
+- **Disabled switch A/B:** with `allowOpportunisticFallback: false` the same queue leaves the
+  aggressive bot idle (skip reason `no_matching_hypothesis`, no spec, no order); coverage falls from
+  11/12 to 6/12 aggressive bots in the deterministic 30-bot cohort test.
+- **Proof/freshness (D9) still binds:** an 8-day-old hypothesis is rejected by the Builder
+  (`PROOF_STALE`), an unproven one by `NO_PROOF`; no spec is persisted, no order is placed. A
+  fallback-marked spec with missing proof is denied by the executor (`NO_PROOF`) and one with stale
+  proof by the brake wall (`PROOF_STALE`); the broker is never called.
+- **Rank/freshness selection:** the exact own-family hypothesis wins even at a lower rank; for a
+  symbol with no compilable own family, the builder tries the other-family candidates in rank order —
+  a stale rank-0.95 top candidate was rejected and the fresh rank-0.90 candidate compiled (D-V35-2
+  regression), with the lower-ranked meanrev candidate not used.
+- **Cache:** a second cycle reuses `specIds`, keeps `fallback`/`genomeFamily`, and does not fork a
+  duplicate spec file.
+- **Narrow-queue cohort (30 bots, 12/13/5 profiles):** with only `gapfade:SOFI` + `breakout:AMZN`
+  proven, fallback-enabled coverage exceeds fallback-disabled (11/12 vs 6/12 in the deterministic
+  test; every aggressive bot whose basket contained either pair compiled, consumed partly by 5
+  fallback specs). Balanced/conservative remain family-coherent (no fallback specs).
+
+**Live-state root-cause evidence (read-only):** the last open-market trace in
+`automaton-data/traces.jsonl` is **2026-11-25T20:59:14.244Z, halted: true** (reconciliation),
+`prospector: null`, all 30 `builds` skipped `no_matching_hypothesis`, 0 executions. The hypothesis
+queue file has 200 entries across **24 positive-edge family:symbol pairs, all observed
+2026-11-17 (9.8 days old)**, and the Builder rejects the latest one at today's clock with
+`PROOF_STALE (9.80 days > maxProofAgeDays 7)`; a fresh copy of the same hypothesis compiles. The
+v3.4 restart cleared the halt (`state.json`: halted false, 311 ticks, last tick 13:09:57Z) but there
+has been **no open-market cycle since 11/25** (Thanksgiving 11/26, premarket 11/27: last trace
+`marketOpen: false, tradingSkipped: true`), so no fresh hypotheses exist yet. Idle aggressive bots
+today are therefore expected, not a fallback failure. If the fresh queue were the narrow two-pair
+queue, fallback would cover **7/8 currently idle aggressive bots and 10/12 aggressive bots overall**
+(own-family-only: 6/12); `GapFade AMD` (basket has neither SOFI nor AMZN) would correctly stay flat.
+
+**Live config/status:** `automaton.config.json` loads as `risk.sizePctMultiplier: 3`,
+`risk.maxOrderNotionalUsd: 120`, `risk.maxOrderPctOfEquity: 0.5`, `risk.maxPositionPct: 0.6`, and the
+aggressive profile defaults to `allowOpportunisticFallback: true`; code default multiplier is 1.
+`publicConfig`/`engine.configView` expose the scaler and the fallback switch without credentials.
+The **running engine process still predates v3.5** (latest `state.json` at 13:09:58Z has no
+`allowOpportunisticFallback` in the status profile and no `fallback` fields on spec rows), so the
+v3.5 sizing/fallback are not live until a Host restart. The plugin suite is 52/52 green, but
+`client.js` renders neither a fallback badge nor `risk.sizePctMultiplier` (only the v3.4 profile
+`sizePctMultiplier` e.g. ×1.35) — UI gap, not a blocker.
+
+### 13.5 Defects found this round (fixed by the Lead, re-verified)
+
+1. **D-V35-1 (status/UI contract, medium) — aggressive primary-spec drift.** The first v3.5 diff set
+   `agent.specId` to `genomeSpec ?? specs[0]` for every aggressive bot, so a basket-**sibling**
+   own-family spec became the primary `spec` (unflagged) even when the genome symbol had no spec.
+   Repro (fixed-code regression now in integration): `Breakout NVDA` with only `breakout:F` → status
+   `spec` was `F/breakout`, `fallback:false`; v3.2 requires the primary spec to stay on the genome
+   symbol. Fixed: `specId` is genome-symbol-only again; a sibling still trades via `specIds`/`specs`,
+   and a fallback **on the primary symbol** is shown and flagged. Re-verified by
+   `a basket-sibling spec never becomes the primary spec` and the fallback e2e test.
+2. **D-V35-2 (fallback selection, low-medium) — a stale top candidate masked a fresh proven one.**
+   The first v3.5 diff picked only the top-ranked any-family hypothesis; if it failed D9 the symbol
+   was aborted instead of trying the next candidate. Repro: `[gapfade:NVDA rank 2.0 stale,
+   meanrev:NVDA rank 0.4 fresh]` → `PROOF_STALE`, no spec/no order; control with only the fresh
+   hypothesis compiled. Fixed: exact-family first, then other-family candidates for the same symbol in
+   rank order, each attempted until the Builder accepts one. Re-verified by
+   `own-family specs win over fallback and a stale top fallback cannot mask a fresh lower one`.
+3. **D-V35-3 (fallback semantics, low-medium) — measured edge was traded with the wrong parameters.**
+   The first diff passed the bot's whole genome into `builder.compile` for a cross-family fallback, so
+   a `gapfade` proof compiled with the breakout genome's `lookback/entryZ/stopPct` (genome precedence
+   over `specsHint`): the proven setup and the traded setup differed. Fixed: cross-family fallback
+   passes only `{aggression, symbol}` (hypothesis-family defaults/hint + profile multipliers), while
+   own-family specs keep the inherited genome parameters exactly. Re-verified by the fallback e2e
+   parameter assertions (gapfade family defaults, not breakout genome) and the own-family test.
+
+No behavioural defect was found after those fixes; the sizing arithmetic, cap ordering and brake wall
+behaved exactly as documented, and no assertion was weakened.
+
+### 13.6 Remaining gaps (explicit — NOT verified)
+
+1. **The live Host has not been restarted with v3.5.** The running process is pre-v3.5 (status lacks
+   the new fields) and the market has been closed since 11/25. Real paper sizing (15–50% orders),
+   real Prospector freshness, real fallback compilation and real fills were not exercised. The first
+   live tick needs operator checks per RUNBOOK §8i.
+2. **Fresh hypothesis availability is unmeasured.** The current queue is 100% stale (all 11/17); how
+   many positive-edge families/symbols the next open-market Prospector run produces — and therefore
+   how much fallback is actually needed — cannot be known until it runs. The two-pair coverage numbers
+   above are a what-if using the documented narrow queue.
+3. **UI fallback visibility is missing.** `spec.fallback`/`genomeFamily` and
+   `risk.sizePctMultiplier` are served in status/config but not rendered by `client.js`; the browser
+   view was not verified (plugin suite only).
+4. **Fallback strategy drift risk is real and unmeasured.** A proven other-family setup is executed by
+   a bot of a different tier/family (day-vs-swing timeframe, hold/exit management, bot policy); the
+   measured edge may not survive. Only the status flag surfaces it; no multi-day attribution study.
+5. **The 15–50% target is not guaranteed.** It depends on signal frequency, cash/position caps,
+   existing positions (a bot with several open positions may be capped by D5/cash before reaching
+   50%), and on the option path — `sizePctMultiplier` scales **stock** entries only; option/spread
+   entries remain capped by `maxOptionPremiumUsd`/pct (not exercised as raised sizes).
+6. **Existing tiny positions are not force-resized (by design).** The account's gross exposure rises
+   only from new entries after exits; no live evidence of the expected exposure lift yet.
+7. **Short-stock sizing not exercised** (same expression, but whole-share truncation can still skip a
+   sub-price-cap short) and option/spread sizing is outside the multiplier path.
+8. **`ensureSpecs` is not exported.** Fallback selection is verified through the full tick with a
+   monkey-patched Prospector queue; there is no direct unit seam for the selection closure. A future
+   pure helper would make this testable without patching.
+9. **`maxPositionPct` interaction at larger equity** was not run live: below $240 equity the mandate
+   cap is 50% of equity; at larger equity the $120 hard cap dominates (max order 120/equity shrinks).
+   The D5-denial caveat if an operator lowers `maxPositionPct` is documented and tested, not lived.
+10. **No multi-day cohort/performance study** of 3x sizing or fallback: mortality, drawdown,
+    replication, reward rotation and the 50%-annual target effect remain expectations.
+11. **Docs residual inconsistencies (minor):** `docs/AGGRESSIVE-GROWTH.md` title still says
+    "MEAT v3.4" and §8's last acceptance bullet still cites RUNBOOK §8h / CHANGELOG v3.4 (v3.5 lives
+    in §7 / RUNBOOK §8i / CHANGELOG v3.5). §7's idle root-cause sentence still says "current live
+    hypotheses had only gapfade:SOFI and breakout:AMZN" while the same section later (correctly)
+    says 24 stale pairs — the queue file has 24 positive-edge pairs, so two-pair wording appears in
+    §7, README, RUNBOOK §8i and CHANGELOG and should be reworded (the *narrow-queue* coverage
+    analysis remains valid as a what-if).
+12. **Mortality live-copy proof stays env-gated** (`AUTOMATON_LIVE_DRY_RUN=1`); v3.5 does not touch
+    reconciliation, and the 1-skip total is unchanged from the baseline.
+
+### 13.7 Verdict (v3.5)
+
+The v3.5 sizing change is real and behaves exactly as documented in the executor: with the live
+multiplier 3.0 every new stock entry is `min(1, sizePct × 3) × min($120, 50% equity)` — 18%/30%/50%
+of a $50/$67.5/$126 bot's equity for sizePct 0.12/0.2/0.4 instead of the old 6%/10%/20% — while the
+default multiplier 1 is byte-compatible with v3.4 and every mandate/order/equity/cash/position/budget/
+daily-order/kill-switch cap still binds (D5 can deny rather than clamp, documented). The
+aggressive-only opportunistic fallback compiles, flags and executes a dated-proof other-family
+hypothesis on an exact basket symbol with the *measured* family parameters, only when the bot's own
+family has no compilable hypothesis; balanced/conservative never cross families; stale/unproven
+hypotheses are rejected by Builder D9 (no spec persisted, no order); own-family and rank order are
+preserved; specs are cached and reused; the narrow-queue cohort test shows a real coverage gain
+(11/12 vs 6/12 aggressive bots). Three defects found by this verification (primary-spec drift, stale
+top candidate masking, and fallback-parameter mismatch) were fixed by the Lead and re-verified with
+pass-only regressions: **462 tests, 461 pass, 1 skip (env-gated live-copy), 0 fail; integration 110,
+security 76, plugin 52.** **Verified as a paper/sim v3.5 capability: the running live process still
+predates v3.5 (restart pending), the market has been closed since 11/25 so no fresh hypotheses/sizing
+have fired live, the UI does not render the fallback flag, and fallback strategy drift, the 15–50%
+order target and the 50%-annual return remain measured expectations, not guarantees.**

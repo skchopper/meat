@@ -1,4 +1,4 @@
-/**
+﻿/**
  * EXECUTOR — the only role that presses the button.
  *
  * Stopline (architecture §2): the Executor never reads account equity or cash (that is
@@ -590,6 +590,11 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   const minOrderNotionalUsd = Number.isFinite(risk.minOrderNotionalUsd) ? risk.minOrderNotionalUsd : 1;
   const hardMaxNotionalUsd = Number.isFinite(risk.maxOrderNotionalUsd) ? risk.maxOrderNotionalUsd : Infinity;
   const maxOrderPctOfEquity = Number.isFinite(risk.maxOrderPctOfEquity) ? risk.maxOrderPctOfEquity : 0.25;
+  // v3.5 meaningful sizing: scale the spec's sizePct before every mandate/order/equity/cash cap.
+  // The live profile uses 3.0; 1.0 preserves legacy behavior and makes tests/old configs identical.
+  const sizePctMultiplier = Number.isFinite(Number(risk.sizePctMultiplier))
+    ? Math.max(0.1, Math.min(10, Number(risk.sizePctMultiplier)))
+    : 1;
   const defaultTimeframe = config.data?.timeframe ?? '1Hour';
   // Research influence is opt-in and gated by config.research (shadow mode = influence:false).
   const researchConfig = config.research && typeof config.research === 'object' ? config.research : {};
@@ -1790,7 +1795,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 
       async function enterLongStockEntry({ symbol, quote, signal, reason, activeSpec = spec }) {
         const price = round4(quote.ask ?? quote.last);
-        const caps = [(activeSpec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        const caps = [Math.min(1, (activeSpec.params?.sizePct ?? 0.2) * sizePctMultiplier) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
         if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
         if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
         if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -1831,7 +1836,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           return false;
         }
         const price = round4(quote.bid ?? quote.last);
-        const caps = [(activeSpec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        const caps = [Math.min(1, (activeSpec.params?.sizePct ?? 0.2) * sizePctMultiplier) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
         if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
         if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
         if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -2404,4 +2409,5 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 }
 
 export default createExecutor;
+
 

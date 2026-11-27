@@ -215,12 +215,26 @@ the operating config).
   labeled *target, not guarantee*), cohort counts and profile badges/limits/activity. The target is
   informational and never increases order size automatically; all 18 brakes still apply. Contract
   `docs/AGGRESSIVE-GROWTH.md`; ops `docs/RUNBOOK.md` §8h.
+- **Meaningful position sizing + idle-aggressive fix (v3.5):** entries were only ~4–15% of each bot's
+  capital because `sizePct` multiplied a 50%-of-equity mandate cap; live gross exposure was ~$50 on a
+  ~$2,000 account. `risk.sizePctMultiplier` (live **3.0**, default 1.0 for compatibility) now scales
+  spec sizing before every mandate/order/equity/cash/position/brake cap, with `maxOrderNotionalUsd`
+  raised to $120, so new entries target **~18–50% of the bot's equity** (existing tiny positions close
+  by their own rules and are not force-resized). Idle aggressive bots were caused by stale/narrow
+  hypotheses after the six-day halt and sparse day-family edges (**for the day families only
+  gapfade:SOFI and breakout:AMZN were proven; the queue's 24 positive-edge family:symbol pairs were all
+  stale from 2026-11-17**); aggressive bots now use an **opportunistic proven fallback** when their own
+  family/symbol has no fresh hypothesis — the highest-ranked dated-proof setup on an exact basket
+  symbol (any family), marked `fallback`/`genomeFamily` in status and still subject to Builder D9 and
+  every brake. Balanced/conservative never cross families; bots with no proven edge in their basket
+  correctly stay flat. All market/paper gates remain; see `docs/AGGRESSIVE-GROWTH.md` §7 and
+  RUNBOOK §8i.
 
 ## Status (this build)
 
-- 10 test suites: mortality 91, market 56, plugin 52, independent integration 99, security 71,
-  research 13, rankings 29, control 19, bot-agent 9 and instruments 7 — **446 tests, 446 pass,
-  0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
+- 10 test suites: mortality 91 (90 pass, 1 env-gated live-copy skip), market 56, plugin 52,
+  independent integration 110, security 76, research 13, rankings 29, control 19, bot-agent 9 and
+  instruments 7 — **462 tests, 461 pass, 1 skipped, 0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
   `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live
   reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/

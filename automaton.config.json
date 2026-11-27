@@ -27,7 +27,7 @@
     "maxDailyOrders": 40,
     "maxDailyLossPct": 0.2,
     "maxOrderPctOfEquity": 0.5,
-    "maxOrderNotionalUsd": 60,
+    "maxOrderNotionalUsd": 120,
     "minOrderNotionalUsd": 1,
     "allowShort": true,
     "allowMargin": true,
@@ -38,7 +38,8 @@
       "15:50"
     ],
     "maxOrdersPerCycle": 4,
-    "maxBuildSpendPct": 0.4
+    "maxBuildSpendPct": 0.4,
+    "sizePctMultiplier": 3
   },
   "data": {
     "timeframe": "1Min",

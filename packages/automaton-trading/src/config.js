@@ -64,6 +64,8 @@ export function defaultConfig() {
       maxDailyLossPct: 0.05,
       maxOrderPctOfEquity: 0.25,
       maxOrderNotionalUsd: 2500,
+      // v3.5: scales spec.sizePct before mandate/order/cash/brake caps (1 = legacy).
+      sizePctMultiplier: 1,
       minOrderNotionalUsd: 1,
       maxSpreadBps: 25,
       minPriceUsd: 5,
@@ -165,6 +167,9 @@ export function defaultConfig() {
           maxHoldBarsMultiplier: 0.75,
           policySizeFloor: 0.8,
           respectStandDown: false,
+          // v3.5: if no proven hypothesis exists for this bot's own family/symbol, an aggressive
+          // bot may use the best proven setup available on a basket symbol (marked fallback).
+          allowOpportunisticFallback: true,
         },
         balanced: {
           basketSizeDay: 4,
@@ -477,6 +482,11 @@ export function validateConfig(config) {
   assertNumber(risk.maxOpenPositions, 'risk.maxOpenPositions', { min: 1, max: 100 });
   assertNumber(risk.maxDailyOrders, 'risk.maxDailyOrders', { min: 1, max: 1000 });
   assertNumber(risk.maxOrderNotionalUsd, 'risk.maxOrderNotionalUsd', { min: 0 });
+  // v3.5: position-size scaler (1 = legacy). Applied to spec.sizePct, then capped by the same
+  // mandate/order/equity/cash/brake limits; the live profile uses 3.0 for meaningful orders.
+  if (risk.sizePctMultiplier !== undefined) {
+    assertNumber(risk.sizePctMultiplier, 'risk.sizePctMultiplier', { min: 0.1, max: 10 });
+  }
   assertNumber(risk.minOrderNotionalUsd, 'risk.minOrderNotionalUsd', { min: 0 });
   assertNumber(risk.maxSpreadBps, 'risk.maxSpreadBps', { min: 0 });
   assertNumber(risk.minPriceUsd, 'risk.minPriceUsd', { min: 0 });
@@ -603,6 +613,9 @@ export function validateConfig(config) {
     assertPct(profile.policySizeFloor, `aggression.profiles.${name}.policySizeFloor`);
     if (typeof profile.respectStandDown !== 'boolean') {
       fail('CONFIG_INVALID', `aggression.profiles.${name}.respectStandDown must be boolean`);
+    }
+    if (profile.allowOpportunisticFallback !== undefined && typeof profile.allowOpportunisticFallback !== 'boolean') {
+      fail('CONFIG_INVALID', `aggression.profiles.${name}.allowOpportunisticFallback must be boolean`);
     }
   }
 
